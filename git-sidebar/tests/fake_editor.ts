@@ -38,7 +38,14 @@ export const WIDGET_CALLS = new Set([
   "unmountFloatingWidget",
   "widgetMutate",
   "floatingPanelControl",
+  "mountFloatingWidget",
 ]);
+
+/** Which panel and widget a `widget_event` comes from. */
+interface WidgetFrom {
+  panel?: number;
+  widgetKey?: string;
+}
 
 interface Pending {
   at: number;
@@ -58,8 +65,18 @@ export class FakeEditor {
   returns = new Map<string, unknown[]>();
   files = new Set<string>();
   dirs = new Set<string>();
+  /** What `readFile` returns for a path in `files` (default ""). Fresh
+   *  0.5.9 gives `undefined` for a file that is not valid UTF-8, although
+   *  its type file says null. */
+  contents = new Map<string, string | null | undefined>();
+  /** `fileStat().size` for a path (default: the length of its contents). */
+  sizes = new Map<string, number>();
+  /** When set, `createCompositeBuffer` settles only after this does. */
+  compositeGate: Promise<void> | null = null;
   calls: Call[] = [];
   procs: ProcCall[] = [];
+  /** Every process started, never cleared. */
+  allProcs: ProcCall[] = [];
   kills = 0;
   script: (call: ProcCall) => ProcOutcome = () => ({ code: 127, stdout: "", stderr: "not scripted" });
 
@@ -70,6 +87,14 @@ export class FakeEditor {
   private nextTimer = 1;
   private seq = 0;
   private realNow = Date.now;
+  private open = new Set<number>();
+  /** Composite state the host keeps per composite buffer, apart from the
+   *  buffer: only `closeCompositeBuffer` drops it, not `closeBuffer`
+   *  (`composite_buffer_actions.rs:217-222`). */
+  private composites = new Set<number>();
+  private nextBuffer = 100;
+  private commands = new Map<string, string>();
+  private contexts = new Set<string>();
 
   /** Installs `getEditor`, `registerHandler` and the clock as globals. */
   install(): void {
@@ -105,6 +130,49 @@ export class FakeEditor {
     return this.procs.filter((p) => p.program === "git");
   }
 
+  /** Buffers the plugin created and has not closed. */
+  openBuffers(): Set<number> {
+    return new Set(this.open);
+  }
+
+  /** Composite buffers whose host state has not been dropped. */
+  compositeStates(): Set<number> {
+    return new Set(this.composites);
+  }
+
+  /** Commands registered now, by name, and whether each is listed (its
+   *  context, if any, is set). */
+  palette(): Map<string, boolean> {
+    const out = new Map<string, boolean>();
+    for (const [name] of this.commands) out.set(name, this.listed(name));
+    return out;
+  }
+
+  private contextOf = new Map<string, string | null>();
+
+  private listed(name: string): boolean {
+    const ctx = this.contextOf.get(name) ?? null;
+    return ctx === null || this.contexts.has(ctx);
+  }
+
+  contextOn(name: string): boolean {
+    return this.contexts.has(name);
+  }
+
+  /** Run a palette command as the user would. */
+  async command(name: string): Promise<void> {
+    const handler = this.commands.get(name);
+    if (handler === undefined) throw new Error(`no command ${name}`);
+    await this.globals.get(handler)?.();
+    await this.flush();
+  }
+
+  /** The user closes a buffer's tab. */
+  async closeTab(id: number): Promise<void> {
+    if (!this.open.delete(id)) return;
+    await this.emit("buffer_closed", { buffer_id: id, window_id: this.window });
+  }
+
   armedTimers(): number {
     return this.timers.size;
   }
@@ -119,8 +187,9 @@ export class FakeEditor {
     await this.flush();
   }
 
-  async widget(event_type: string, payload: Record<string, unknown> = {}): Promise<void> {
-    await this.emit("widget_event", { window_id: 1, panel_id: 1, widget_key: "git", event_type, payload, focus_key: "git" });
+  async widget(event_type: string, payload: Record<string, unknown> = {}, from: WidgetFrom = {}): Promise<void> {
+    const widget_key = from.widgetKey ?? "git";
+    await this.emit("widget_event", { window_id: 1, panel_id: from.panel ?? 1, widget_key, event_type, payload, focus_key: widget_key });
   }
 
   async flush(): Promise<void> {
@@ -162,9 +231,31 @@ export class FakeEditor {
     return p;
   }
 
+  /** A new buffer id, open from `ms` from now (in `advance` order). */
+  private newBuffer(): Promise<number> {
+    return new Promise<number>((r) =>
+      this.later(0, () => {
+        const id = this.nextBuffer++;
+        this.open.add(id);
+        r(id);
+      }),
+    );
+  }
+
+  private closeBuffer(id: number): boolean {
+    if (!this.open.has(id)) return true;
+    // Fire-and-forget, like the host: the close and its event come later.
+    this.later(0, () => {
+      if (!this.open.delete(id)) return;
+      for (const h of this.handlers.get("buffer_closed") ?? []) void h({ buffer_id: id, window_id: this.window });
+    });
+    return true;
+  }
+
   private spawn(via: "target" | "host", program: string, args: string[], cwd: string) {
     const call = { via, program, args: [...args], cwd };
     this.procs.push(call);
+    this.allProcs.push(call);
     const shape = (r: ProcResult) =>
       via === "target" ? { code: r.code, stdout: r.stdout, stderr: r.stderr } : { exit_code: r.code, stdout: r.stdout, stderr: r.stderr };
     let resolve!: (v: unknown) => void;
@@ -218,8 +309,11 @@ export class FakeEditor {
       },
       fileExists: rec("fileExists", (p: string) => this.files.has(p) || this.dirs.has(p)),
       fileStat: rec("fileStat", (p: string) =>
-        this.files.has(p) || this.dirs.has(p) ? { isFile: this.files.has(p), isDir: this.dirs.has(p), size: 0, readonly: false } : null,
+        this.files.has(p) || this.dirs.has(p)
+          ? { isFile: this.files.has(p), isDir: this.dirs.has(p), size: this.sizes.get(p) ?? (this.contents.get(p) ?? "").length, readonly: false }
+          : null,
       ),
+      readFile: rec("readFile", (p: string) => (this.files.has(p) ? (this.contents.has(p) ? this.contents.get(p)! : "") : null)),
       openFile: rec("openFile", () => true),
       setStatus: rec("setStatus", () => undefined),
       debug: rec("debug", () => undefined),
@@ -235,6 +329,55 @@ export class FakeEditor {
       unmountFloatingWidget: rec("unmountFloatingWidget", () => true),
       widgetMutate: rec("widgetMutate", () => true),
       floatingPanelControl: rec("floatingPanelControl", () => true),
+      mountFloatingWidget: rec("mountFloatingWidget", () => true),
+      createVirtualBuffer: (opts: unknown) => {
+        this.record("createVirtualBuffer", [opts]);
+        return this.newBuffer().then((bufferId) => ({ bufferId, splitId: null }));
+      },
+      createCompositeBuffer: (opts: unknown) => {
+        this.record("createCompositeBuffer", [opts]);
+        const gate = this.compositeGate ?? Promise.resolve();
+        return gate.then(() => this.newBuffer()).then((id) => {
+          this.composites.add(id);
+          return id;
+        });
+      },
+      // As the host tokenises (`fresh-core/src/diff.rs:36-55`): lines keep
+      // their `\n`, and a final unterminated segment is a line, so a change
+      // to the final newline alone is a hunk. One hunk over everything
+      // between the common prefix and suffix: enough for the plugin, which
+      // passes the hunks on as they are.
+      computeLineDiff: rec("computeLineDiff", (a: string, b: string) => {
+        const lines = (t: string) => t.match(/[^\n]*\n|[^\n]+$/g) ?? [];
+        const x = lines(a);
+        const y = lines(b);
+        let pre = 0;
+        while (pre < x.length && pre < y.length && x[pre] === y[pre]) pre++;
+        let suf = 0;
+        while (suf < x.length - pre && suf < y.length - pre && x[x.length - 1 - suf] === y[y.length - 1 - suf]) suf++;
+        const oldCount = x.length - pre - suf;
+        const newCount = y.length - pre - suf;
+        return oldCount === 0 && newCount === 0 ? [] : [{ oldStart: pre, oldCount, newStart: pre, newCount }];
+      }),
+      showBuffer: rec("showBuffer", () => true),
+      closeBuffer: rec("closeBuffer", (id: number) => this.closeBuffer(id)),
+      // As in Fresh 0.5.9: drops the composite's state, not the buffer
+      // (INV §9.4, P9 c). Only closeBuffer closes it.
+      closeCompositeBuffer: rec("closeCompositeBuffer", (id: number) => {
+        this.composites.delete(id);
+        return true;
+      }),
+      defineMode: rec("defineMode", () => true),
+      registerCommand: rec("registerCommand", (name: string, _d: string, handler: string, context?: string | null) => {
+        this.commands.set(name, handler);
+        this.contextOf.set(name, context ?? null);
+        return true;
+      }),
+      setContext: rec("setContext", (name: string, on: boolean) => {
+        if (on) this.contexts.add(name);
+        else this.contexts.delete(name);
+        return true;
+      }),
       setTimeout: rec("setTimeout", (ms: number, name: string) => {
         const id = this.nextTimer++;
         this.timers.set(id, this.pending(ms, () => this.globals.get(name)?.()));

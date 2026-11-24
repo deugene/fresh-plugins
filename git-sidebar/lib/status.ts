@@ -14,6 +14,13 @@ export interface Entry {
    *  repository (which git lists as `dir/`, trailing slash, even with
    *  `-uall`). */
   dir?: true;
+  /** The two-letter state of an unresolved merge conflict (a `u` record):
+   *  one of `DD AU UD UA DU AA UU`. Only conflicted entries carry it. */
+  conflict?: string;
+  /** A Changes entry whose working-tree mode (`mW` of a `1`, `2` or `u`
+   *  record) is 120000: the file on disk is a symbolic link. `?` records
+   *  carry no mode, so an untracked link never has it (R14). */
+  link?: true;
 }
 
 export interface Status {
@@ -54,6 +61,14 @@ function entry(path: string, m: Marker, orig: string | undefined, dir: boolean):
   return e;
 }
 
+/** Field `n` (0-based) of a record, for the fields before its path. */
+function field(record: string, n: number): string {
+  return record.split(" ", n + 1)[n] ?? "";
+}
+
+/** The working-tree mode of a symbolic link. */
+const LINK_MODE = "120000";
+
 /** The `<sub>` field of a `1`, `2` or `u` record (`N...`, or `S<c><m><u>`
  *  for a submodule) says whether the path is a submodule. */
 function isSubmodule(record: string): boolean {
@@ -92,9 +107,18 @@ export function parseStatus(raw: string): Status {
       const orig = kind === "2" ? tokens[++i] : undefined;
       const dir = isSubmodule(t);
       if (x !== ".") s.staged.push(entry(path, marker(x), orig, dir));
-      if (y !== ".") s.changes.push(entry(path, marker(y), orig, dir));
+      if (y !== ".") {
+        const e = entry(path, marker(y), orig, dir);
+        // `1 XY sub mH mI mW …`, `2 XY sub mH mI mW …`.
+        if (field(t, 5) === LINK_MODE) e.link = true;
+        s.changes.push(e);
+      }
     } else if (kind === "u") {
-      s.changes.push(entry(pathAfter(t, 10), "!", undefined, isSubmodule(t)));
+      // `u XY sub m1 m2 m3 mW h1 h2 h3 path`: the path follows 10 fields.
+      const e = entry(pathAfter(t, 10), "!", undefined, isSubmodule(t));
+      e.conflict = t.slice(2, 4);
+      if (field(t, 6) === LINK_MODE) e.link = true;
+      s.changes.push(e);
     } else if (kind === "?") {
       const path = t.slice(2);
       s.changes.push(entry(path, "U", undefined, path.endsWith("/")));
@@ -104,6 +128,14 @@ export function parseStatus(raw: string): Status {
   s.staged.sort(byPath);
   s.changes.sort(byPath);
   return s;
+}
+
+/** Status output is decoded lossily (INV §8, Review fixes): a path that
+ *  is not valid UTF-8 comes back with U+FFFD in place of its bad bytes, so
+ *  it names no file git knows, and one such path fails a whole `git add`
+ *  (P13 iii). Whether `p` is such a name. */
+export function unpassable(p: string): boolean {
+  return p.includes("\uFFFD");
 }
 
 /** `Git · <branch>` plus ` ↑A ↓B` when the branch has an upstream (R2). */

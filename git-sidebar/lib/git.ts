@@ -12,8 +12,29 @@ export type Mode = "local" | "bind" | "volume";
 
 /** Never takes `index.lock` (R11). `-uall` lists untracked files one by one. */
 export const STATUS_ARGS = ["--no-optional-locks", "status", "--porcelain=v2", "--branch", "-z", "-uall"];
+/** Takes no lock: rev-parse reads no index. */
 export const TOPLEVEL_ARGS = ["rev-parse", "--show-toplevel"];
+/** A diff side's object id, then its size, then its content (R14). Reads
+ *  only, so they take no lock either (R11). `spec` is `:0:<p>` or
+ *  `HEAD:<p>`; the size and the content are read by the id, so a write
+ *  landing between the two reads cannot pair one blob's size with another
+ *  blob's text (INV §8 P24). */
+export const blobIdArgs = (spec: string): string[] => ["rev-parse", spec];
+export const blobSizeArgs = (oid: string): string[] => ["--no-optional-locks", "cat-file", "-s", oid];
+export const blobArgs = (oid: string): string[] => ["--no-optional-locks", "cat-file", "blob", oid];
+
+/** The object id `rev-parse` printed (SHA-1 or SHA-256), or null. Without
+ *  `--verify` it echoes an argument that names a file instead, with rc 0;
+ *  with it, a missing path's error is only "Needed a single revision"
+ *  (INV §8 P24). */
+export function objectId(stdout: string): string | null {
+  const id = stdout.trim();
+  return /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(id) ? id : null;
+}
 const GIT_TIMEOUT_MS = 10_000;
+/** How long a stage or unstage may take before the user is told git is
+ *  still running. Writes are never killed (see `run`). */
+export const WRITE_TIMEOUT_MS = 60_000;
 
 const CONTAINER_PREFIX = "Container:";
 
@@ -107,6 +128,31 @@ export interface GitResult {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  /** Timed out and left to finish by itself, not killed (a write): its
+   *  result once git exits. It never rejects. */
+  finished?: Promise<GitResult>;
+}
+
+/** git's first non-blank line (stderr, else stdout), trimmed and without
+ *  its `fatal:` or `error:` tag, or `git exited with N` when it printed
+ *  nothing: the reason a failed run gives the user. The message around it
+ *  already says what failed, and the status bar cuts a long one. So with
+ *  `root` (the repository top level git ran in), a path inside it is shown
+ *  relative to it, as the section shows paths: a held lock reads
+ *  `Unable to create '.git/index.lock': File exists.`. A path outside it,
+ *  such as a linked worktree's git dir, stays absolute. */
+export function gitReason(r: GitResult, root?: string): string {
+  const line = (r.stderr || r.stdout)
+    .split("\n")
+    .map((l) => l.trim())
+    .find((l) => l !== "");
+  if (line === undefined) return `git exited with ${r.code}`;
+  const reason = line.replace(/^(?:fatal|error): +/, "");
+  if (root === undefined) return reason;
+  // Only where the root starts a path (the line's start, or after a space,
+  // a quote or a bracket): `/x/repo/f` is not inside the root `/repo`.
+  const inside = `${trimSlash(root)}/`.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return reason.replace(new RegExp(`(^|[\\s'"\`(])${inside}`, "g"), "$1");
 }
 
 /** A failure that will not go away by retrying: not a repository or
@@ -141,13 +187,27 @@ export interface Runner {
   delay(ms: number): Promise<void>;
 }
 
+/** What a run does at its timeout: `kill` the process (reads), or `leave`
+ *  it to finish by itself (writes). In 0.5.9 a kill is a SIGKILL, for
+ *  `runOnTarget` on this machine and for `spawnHostProcess` alike (INV §8,
+ *  Review fixes), so a killed `git add` cannot remove its
+ *  `.git/index.lock`, and every later git write fails until someone
+ *  deletes it. */
+export type OnTimeout = "kill" | "leave";
+
 /**
- * Run a command for `mode`, racing it against `timeoutMs`. Never rejects. On
- * timeout the process is killed and the call waits for it to really settle
- * (so the scheduler's duration covers the whole run), for at most another
- * `timeoutMs`, before resolving with `timedOut`. In a container `kill` does
- * nothing and the run goes to completion; its result is still discarded,
- * and one that never settles no longer holds the caller.
+ * Run a command for `mode`, racing it against `timeoutMs`. Never rejects.
+ *
+ * On timeout with `kill` (the default, for reads) the process is killed and
+ * the call waits for it to really settle (so the scheduler's duration covers
+ * the whole run), for at most another `timeoutMs`, before resolving with
+ * `timedOut`. In a container `kill` does nothing and the run goes to
+ * completion; its result is still discarded, and one that never settles no
+ * longer holds the caller.
+ *
+ * With `leave` (writes) it resolves at once with `timedOut`, and the
+ * process goes on to finish by itself; `finished` is its eventual result
+ * (`runWrite` waits for it).
  */
 export function run(
   runner: Runner,
@@ -156,14 +216,18 @@ export function run(
   args: string[],
   cwd: string,
   timeoutMs = GIT_TIMEOUT_MS,
+  onTimeout: OnTimeout = "kill",
 ): Promise<GitResult> {
-  return runOn(runner, mode === "local" ? "target" : "host", program, args, cwd, timeoutMs);
+  return runOn(runner, mode === "local" ? "target" : "host", program, args, cwd, timeoutMs, onTimeout);
 }
 
 /** A run that could not start, or whose handle rejected. */
 function spawnFailure(e: unknown): GitResult {
   return { code: -1, stdout: "", stderr: String(e), timedOut: false };
 }
+
+/** Whole seconds, for a message. */
+const seconds = (ms: number): string => `${Math.round(ms / 1000)} s`;
 
 /** `run` on an explicit side: the window's machine (`target`, in a
  *  container when attached) or the host. */
@@ -174,6 +238,7 @@ export async function runOn(
   args: string[],
   cwd: string,
   timeoutMs = GIT_TIMEOUT_MS,
+  onTimeout: OnTimeout = "kill",
 ): Promise<GitResult> {
   let handle: Handle;
   try {
@@ -186,6 +251,9 @@ export async function runOn(
   // would keep the result (its stdout) alive for the whole timeout.
   const inTime = await Promise.race([settled.then(() => true), runner.delay(timeoutMs).then(() => false)]);
   if (inTime) return await settled;
+  if (onTimeout === "leave") {
+    return { code: -1, stdout: "", stderr: `still running after ${seconds(timeoutMs)}`, timedOut: true, finished: settled };
+  }
   try {
     await handle.kill();
   } catch {
@@ -195,4 +263,24 @@ export async function runOn(
   // ends (a hung docker daemon) would otherwise stop every later refresh.
   await Promise.race([settled.then(() => undefined), runner.delay(timeoutMs)]);
   return { code: -1, stdout: "", stderr: `timed out after ${timeoutMs} ms`, timedOut: true };
+}
+
+/**
+ * Run a stage or unstage in `cwd`, never killed (see `OnTimeout`), and
+ * resolve with git's own result once it exits. One that outlives
+ * `WRITE_TIMEOUT_MS` first calls `onSlow` with the left-running result
+ * (`stderr`: `still running after 60 s`), so the user hears it (R15), and
+ * is then awaited to its end. Anything chained on the returned promise, as
+ * the write queue is, so waits until git lets go of `index.lock`: one write
+ * at a time (INV §9.5).
+ */
+export async function runWrite(runner: Runner, mode: Mode, args: string[], cwd: string, onSlow: (left: GitResult) => void): Promise<GitResult> {
+  const r = await run(runner, mode, "git", args, cwd, WRITE_TIMEOUT_MS, "leave");
+  if (r.finished === undefined) return r;
+  try {
+    onSlow(r);
+  } catch {
+    // Only the message is lost: the wait below is what keeps writes apart.
+  }
+  return await r.finished;
 }

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { containerId, detectMode, isDefinitiveFailure, normalise, run, within, STATUS_ARGS, type Handle, type Runner } from "../lib/git.ts";
+import { containerId, detectMode, isDefinitiveFailure, normalise, objectId, run, runWrite, within, STATUS_ARGS, WRITE_TIMEOUT_MS, type GitResult, type Handle, type Runner } from "../lib/git.ts";
 import { GS_VOLUME as VOLUME, inspectResult as mounts, pwdResult as pwd } from "./helpers.ts";
 
 const ROOT = "/Users/me/src/repo";
@@ -180,4 +180,71 @@ test("a timed-out run whose kill does nothing (a container) still resolves, afte
   const r = await p;
   assert.equal(r.timedOut, true);
   assert.equal(r.code, -1);
+});
+
+test("a run left to finish (a write) resolves at its timeout with its eventual result, and is never killed (F0)", async () => {
+  const fires: (() => void)[] = [];
+  let kills = 0;
+  let release!: (v: unknown) => void;
+  const proc = new Promise((r) => (release = r));
+  const runner: Runner = {
+    runOnTarget: () => handle(proc, () => kills++),
+    spawnHostProcess: () => handle(proc, () => kills++),
+    delay: () => new Promise<void>((r) => fires.push(r)),
+  };
+  const left: GitResult[] = [];
+  for (const mode of ["local", "bind"] as const) {
+    const p = run(runner, mode, "git", ["add"], "/", WRITE_TIMEOUT_MS, "leave");
+    await new Promise((r) => setTimeout(r, 1));
+    fires.shift()!();
+    const r = await p;
+    const { finished, ...rest } = r;
+    assert.deepEqual(rest, { code: -1, stdout: "", stderr: "still running after 60 s", timedOut: true });
+    assert.ok(finished instanceof Promise);
+    left.push(r);
+    assert.equal(fires.length, 0, "no second wait");
+  }
+  assert.equal(kills, 0);
+  assert.equal(WRITE_TIMEOUT_MS, 60_000);
+  release({ code: 0, stdout: "", stderr: "" });
+  for (const r of left) assert.deepEqual(await r.finished, { code: 0, stdout: "", stderr: "", timedOut: false });
+});
+
+test("runWrite: past its timeout it says so once, then resolves only when git exits, with git's result (R15, F0)", async () => {
+  const fires: (() => void)[] = [];
+  let kills = 0;
+  let release!: (v: unknown) => void;
+  const proc = new Promise((r) => (release = r));
+  const runner: Runner = {
+    runOnTarget: () => handle(proc, () => kills++),
+    spawnHostProcess: () => handle(proc, () => kills++),
+    delay: () => new Promise<void>((r) => fires.push(r)),
+  };
+  const slow: string[] = [];
+  let settled = false;
+  const p = runWrite(runner, "local", ["add", "--", "big"], "/r", (left) => slow.push(left.stderr)).then((r) => {
+    settled = true;
+    return r;
+  });
+  await new Promise((r) => setTimeout(r, 1));
+  fires.shift()!();
+  await new Promise((r) => setTimeout(r, 1));
+  assert.deepEqual(slow, ["still running after 60 s"]);
+  assert.equal(settled, false, "still waiting for git: the next write must not start");
+  release({ code: 128, stdout: "", stderr: "fatal: unable to write new index file\n" });
+  assert.deepEqual(await p, { code: 128, stdout: "", stderr: "fatal: unable to write new index file\n", timedOut: false });
+  assert.equal(kills, 0);
+  // In time: no message, git's result.
+  const quick: Runner = { ...runner, runOnTarget: () => handle(Promise.resolve({ code: 0, stdout: "", stderr: "" }), () => kills++) };
+  const calls: string[] = [];
+  assert.deepEqual(await runWrite(quick, "local", ["add"], "/r", () => calls.push("slow")), { code: 0, stdout: "", stderr: "", timedOut: false });
+  assert.deepEqual(calls, []);
+});
+
+test("objectId takes only an object id from rev-parse's output", () => {
+  assert.equal(objectId(`${"a".repeat(40)}\n`), "a".repeat(40));
+  assert.equal(objectId(`${"0".repeat(64)}\n`), "0".repeat(64));
+  // Without --verify, rev-parse echoes an argument that names a file, with rc 0.
+  assert.equal(objectId("HEAD:absent\n"), null);
+  assert.equal(objectId(""), null);
 });

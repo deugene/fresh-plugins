@@ -421,4 +421,323 @@ Fixture `fixture.sh v --volume` (host folder is the acceptance repo with its own
 
 ### Found during live acceptance (S11)
 
-- **A click on the already-selected group row does nothing.** With `toggleOnClick:true`, a row-body click toggles a group only when that click also moves the selection onto it. Clicking the selected group row again emits no `widget_event` at all and does not toggle (probe log: `expand {"index":2,"key":"g:c","expanded":false}` for the first click on `Changes`, nothing for the second; `focus` only, for a first click that lands on the selected row while the section is blurred). The disclosure column of a selected row draws the selection bar `▌`, so there is no glyph to click either. Keyboard Left/Right/Enter/Space always work. Host behaviour in 0.5.9; the plugin receives nothing to act on.
+- **A click on the already-selected group row does nothing.** With `toggleOnClick:true`, a row-body click toggles a group only when that click also moves the selection onto it. Clicking the selected group row again emits no `widget_event` at all and does not toggle (probe log: `expand {"index":2,"key":"g:c","expanded":false}` for the first click on `Changes`, nothing for the second; `focus` only, for a first click that lands on the selected row while the section is blurred). The disclosure column of a selected row draws the selection bar `▌`, so there is no glyph to click either. Keyboard Left/Right/Enter/Space always work. Host behaviour in 0.5.9; the plugin receives nothing to act on. Cause and fix: P21.
+
+### P9–P13: diff, menu, palette and staging edges (2026-11-24)
+
+Same harness as above: a throwaway probe package (`/tmp/gs-probe/gs-probe/gs_probe.ts`, not in the repo) symlinked into `HOME=/tmp/gs-live/home`, Fresh 0.5.9 in a tmux pane on `GS_LIVE_BASE=/tmp/gs-live/fix tests/live/fixture.sh acceptance`, mouse as SGR escapes. The probe mounts a section with the plugin's real options (`closable:false`, `startBlurred:true`, `scope:{window}`): a group `g:a` and leaves `f:one` (`action:"+"`), `f:two` (`action:"−"`), `f:three`. It logs every `widget_event` and `buffer_closed` with `getActiveSplitId()` and `listBuffers()`. A click or Enter on a leaf builds the git-review style view: two hidden read-only virtual buffers, `computeLineDiff`, `createCompositeBuffer` (mode from `defineMode(…, [], true)`), `showBuffer`, then closes the previous view.
+
+**P9: diff from a focused section.**
+
+| # | Check | Result |
+|---|---|---|
+| a | Which split gets the tab | **Pass.** Two splits (0 left, 3 right, via `splitWindow`), focus in the right one, then a click on `f:one`: `focus {previous:"(re-focus)"}`, `select {index:1, key:"f:one", col:5, row:24, via:"click"}`. `getActiveSplitId()` was 3 before and after; the diff tab opened in split 3. |
+| b | Focus after `showBuffer` | **Pass.** Down then logged `select {index:2, key:"f:two"}` on the section, so focus stayed in it. No `"focus"` call needed. |
+| c | A replace keeps the tab count | **Fail as planned, pass with `closeBuffer` on the composite.** Enter on `f:two` built a second view (`activate` with no `via`). `closeCompositeBuffer(5)` plus `closeBuffer(src, true)` for both sources fired `buffer_closed` for the two sources only. Buffer 5 stayed in `listBuffers()` (name `""`, not virtual) and in the split's tabs as `[No Name] 2`: one tab more. The host's `close_composite_buffer` only drops the composite's state and metadata, not the buffer (`SRC/fresh-editor/src/app/composite_buffer_actions.rs:217-222`). Re-run with `closeBuffer(5, true)` after `closeCompositeBuffer(5)`: `buffer_closed` for 5 and both sources, the same three tabs, and the same buffer count as after the first view. |
+| d | A user close leaves nothing | **Pass for the user close.** A click on the tab's `×` fired `buffer_closed` for the composite. After `closeBuffer(src, true)` for both sources (each fired `buffer_closed`), `listBuffers()` was `[Welcome, [No Name]]`, the list before the first click. In the run without the (c) fix, the stray buffer 5 from the replace was still listed. |
+| e | A re-click on the selected file row | **Fail.** With the section blurred, a click on the selected `f:two` gave `focus` only. With it focused, it gave no event at all. Same as S11 for group rows. Cause and fix: P21. |
+
+**P10: anchored menu from the section. Pass.**
+
+- **Right-click.** A right-click on `f:one` (SGR cell 8,25) gave `context {index:1, key:"f:one", col:7, row:24}`, 0-based screen cells. The selection stayed on `f:two`.
+- **Mount.** `mountFloatingWidget(2, col(3 bare buttons), 30, 20, false, false, "", false, false, "", "left")` and `floatingPanelControl(2, "anchor", (24+1)*65536 + 7)` both returned true. The popup's frame was drawn with its top-left corner at column 7, row 25, right under the pointer.
+- **Esc.** `cancel` on panel 2 (`widget_key` `m:diff`), nothing on panel 1. Down then logged a panel 1 `select`.
+- **A click outside** (an empty row of the section). `cancel` on panel 2; Down then logged a panel 1 `select`.
+- **A choice.** Down then Enter gave panel 2 `focus {previous:"m:diff"}` and `activate` with `widget_key` `m:file`, payload `{}`. A mouse click on an item gave `activate` with `widget_key` `m:stage`, payload `{via:"click"}`. After `unmountFloatingWidget(2)`, Up/Down logged panel 1 `select`.
+- **The section.** Its header row, title and collapsed state did not change. Focus came back without a `"focus"` call.
+
+**P11: palette. Pass.** `registerCommand("Probe Zeta: Show Sel", "probe", "gsProbeShowSel", "gs-probe-rows")` with `setContext("gs-probe-rows", true)`: listed under Ctrl+P. Run with `f:two` selected, its handler logged `selectedKey=f:two`. After `setContext(…, false)` it was no longer listed; the context-free commands still were.
+
+**P12: real double-click.** Not run: it needs a real mouse (manual, by the user).
+
+**P13: git edges** (scratch repos under `/tmp/gs-p13.*`, git 2.50.1; what it means for staging is in §9.5).
+
+| # | Command | Result |
+|---|---|---|
+| i | `git --literal-pathspecs reset -q -- s.txt` during a merge, with `s.txt` staged and an unrelated `UU uu.txt` | rc 0, stderr `uu.txt: needs merge`. `s.txt` unstaged (` M`), `UU` kept, `MERGE_HEAD` kept |
+| ii | `git --literal-pathspecs add -A -- d.txt`, `d.txt` tracked and deleted | rc 0, `D  d.txt` |
+| iii | `git --literal-pathspecs add -A -- vanished.txt u.txt`, with `vanished.txt` absent | rc 128, `fatal: pathspec 'vanished.txt' did not match any files`, and **nothing is staged**: `u.txt` stays `??`. Plain `add --` behaves the same |
+| iv | `git --no-optional-locks cat-file -s HEAD:absent.txt` | rc 128, `fatal: path 'absent.txt' does not exist in 'HEAD'` |
+| v | `cat-file -s :0:ita.txt` and `cat-file blob :0:ita.txt` for an intent-to-add path | rc 0, size `0`, empty blob |
+| vi | the (i) argv during a conflicted cherry-pick, a revert and a rebase stop | rc 0 with `uu.txt: needs merge` in each. `CHERRY_PICK_HEAD`, `REVERT_HEAD` and `.git/rebase-merge` stay, and `UU` stays |
+
+### Found during the live checks of R14–R18 (2026-11-24)
+
+The plugin itself, installed in the same isolated home, on the acceptance fixture and on scratch repositories with a merge in progress, a PNG, `a*` and `ab` on an unborn branch, and a held `.git/index.lock`.
+
+- **`hunks: null` draws nothing.** A composite created with `hunks: null` showed both pane headers and no lines, for an `R100` rename whose two sides are equal. Without hunks the host sets no line alignment (`SRC/fresh-editor/src/app/composite_buffer_actions.rs:1190-1231`). An empty list aligns the equal lines. git-review passes `null`, so it has the same problem.
+- **`readFile` gives `undefined` for a file that is not UTF-8**, a PNG here, although the DTS says `string | null`. P8 saw the same for a missing file.
+- **No `TextEncoder`.** The plugin runtime has no `TextEncoder` (`ReferenceError` at load), although `tsc` accepts it through `@types/node`. UTF-8 lengths are counted by hand.
+- **A synchronous throw in an `async` function** that the caller awaits inside `try` still logs `ERROR … Unhandled Promise rejection` from QuickJS before the `catch` runs. The plugin kept working afterwards (a later Space still staged).
+
+### P14–P20: review fixes (2026-11-24)
+
+Run for the code review's fixes, cited as F0–F14 in the code's comments. Git probes in scratch repos under `/tmp/gs-rev-f1.*` (git 2.50.1, script `/tmp/gs-rev/probe/f1.sh`, not in the repo). Live probes used the same kind of harness as P9–P13 with its own isolated home (`HOME=/tmp/gs-rev/home`, tmux sessions `gsrev-f5` and `gsrev-acc`, both killed afterwards) and a throwaway package `/tmp/gs-rev/probe-pkg/gs_rev_probe.ts` that logs `GSREV` lines (log `fresh-25458.log`). The live repository `/tmp/gs-rev/f5repo` has a Latin-1 blob `latin1.txt` (`caf\xe9\n`, 5 bytes), a UTF-8 file `utf8.txt` (`naïve → 😀`, 23 bytes), `plain.txt`, and an index-only path `bad\xff.txt` (APFS refuses that name on disk, so it shows as ` D`).
+
+**P14: staging a deletion with `rm --cached` (F1).** Every command is `git --literal-pathspecs rm --cached -q -- <p>`.
+
+| # | State | Result |
+|---|---|---|
+| a | ` D f` | rc 0, `D  f` |
+| b | `AD n` | rc 0, nothing left for `n` (it was never in HEAD) |
+| c | `MD f` | rc 0, `D  f` |
+| d | ` D foo`, with `foo/` now a directory holding untracked `foo/x` and a nested repository `foo/sub` (status v2: `1 .D … foo`, `? foo/sub/`, `? foo/x`) | rc 0, `D  foo`, `?? foo/sub/`, `?? foo/x`; the index holds only the other files, and a tar of `foo/` is byte-identical before and after. The same state with `add -- foo` (the old command): rc 0, `D  foo`, `A  foo/sub` as a 160000 gitlink ("adding embedded git repository"), `A  foo/x` |
+| d′ | (d) without the nested repository, `update-index --remove -- foo` | rc 0, `D  foo`, `?? foo/x`. Not needed then; adopted later, because `rm --cached` drops a restored file's entry too (P23) |
+| e | Stage all on (d) without the nested repository | `rm --cached -- foo` then `add -A -- foo/x`: both rc 0, `D  foo`, `A  foo/x`. The other order: `add -A -- foo/x` rc 0 (it replaces `foo` in the index), then `rm --cached -- foo` rc 128, `fatal: not removing 'foo' recursively without -r`. So deletions run first |
+| f | ` D a*` and ` D ab` | rc 0, `D  a*`; ` D ab` unchanged |
+| g | `p` already removed from the index, ` D q` | rc 128, `fatal: pathspec 'p' did not match any files`, and `q` is not staged either (as P13 iii for `add`) |
+| h | Unborn branch, `AD p` | rc 0, nothing left |
+| i | Intent-to-add path deleted | rc 0, nothing left |
+| j | Staged `D foo` and staged `A foo/bar`, then `reset -q -- foo` | rc 0, ` D foo`, `?? foo/bar`: unstaging `foo` also unstaged `foo/bar`, because the index cannot hold both |
+
+**P15: unstaging a copy (F2).** `C  orig.txt -> copy.txt` with `M  orig.txt` (status with `status.renames=copies`), then `git --literal-pathspecs reset -q -- copy.txt`: rc 0, `M  orig.txt` and `?? copy.txt`. The source keeps its own staged change.
+
+**P16: what `kill()` does (F0).** From the source:
+- **`runOnTarget`.** `kill()` calls `_killHostProcess(callbackId)` (`SRC/fresh-plugin-runtime/src/backend/quickjs_backend.rs:10658-10669`). That sends `KillHostProcess`, whose handler fires the run's oneshot (`SRC/fresh-editor/src/app/plugin_dispatch.rs:5353-5366`; registered in `SRC/fresh-editor/src/app/plugin_commands.rs:3776-3780`). The local spawner's `spawn_cancellable` then calls `child.start_kill()` (`SRC/fresh-editor/src/services/remote/spawner.rs:354-367`). The docker spawner keeps the default `spawn_cancellable`, which ignores the kill (`spawner.rs:186-199`), so in a container the run goes on (§7).
+- **`spawnHostProcess`.** Its wrapper's `kill()` calls `_killHostProcess` too (`quickjs_backend.rs:10574-10607`), and the spawn task's `select!` calls `child.start_kill()` (`plugin_dispatch.rs:3933-3945`).
+- **`start_kill()` is a SIGKILL on Unix** (`plugin_dispatch.rs:7792-7794`, the test of that path).
+- **Live.** `sh -c "trap '' TERM INT HUP; sleep 3; echo survived > <mark>"`, killed after 500 ms. Both `runOnTarget` and `spawnHostProcess`: `kill()` true, settled with code -1, and no mark after 4.5 s. A signal the script ignores would have let it write the mark.
+
+A git write killed this way cannot remove `.git/index.lock`, so every later write fails until someone deletes it. Writes are therefore never killed (§9.5).
+
+**P17: stdout that is not UTF-8 (F5, F6).** Live, the same command through both runners:
+
+| Command | `runOnTarget` | `spawnHostProcess` |
+|---|---|---|
+| `cat-file -s :0:latin1.txt` | `5` | `5` |
+| `cat-file blob :0:latin1.txt` | rc 0, `caf\uFFFD\n` (lossy) | rc 0, `""` |
+| `cat-file blob :0:utf8.txt` (23 bytes) | the text, 18 UTF-16 units, 23 UTF-8 bytes | the same |
+| `status --porcelain=v2 -z …` with `bad\xff.txt` in the index | rc 0, the full output, the path as `bad\uFFFD.txt` | rc 0, `""`: the whole status |
+
+The source agrees. The local spawner decodes stdout with `String::from_utf8_lossy` (`SRC/fresh-editor/src/services/remote/spawner.rs:380-384`). The host spawn reads it with tokio's `read_to_string`, which leaves the string empty on invalid UTF-8, and the error is ignored (`plugin_dispatch.rs:3915-3921`). So a blob side is binary unless its text is exactly `cat-file -s` bytes of UTF-8. And a status path with U+FFFD names no file git knows: per P13 iii, one such path fails a whole `add` with rc 128.
+
+**P18: the line diff and one text per side (F3).**
+- **`computeLineDiff`.** It keeps each line's `\n` as part of the token, and a final unterminated segment is a line. So a change to the final newline alone is a hunk, and the hunk indices are those of the text split on `\n` with a trailing empty segment dropped (`SRC/fresh-core/src/diff.rs:36-55`).
+- **git-review** passes the same text to its buffer entry and to `computeLineDiff` (`GR:443-479`). It first appends a final newline to a text that lacks one (`normalizedContent`, `GR:389-392`), which would make `a` and `a\n` equal.
+- **audit_mode** builds the buffer with `contentToEntries(content)` from the file's own text (`EP/audit_mode.ts:5304-5311`, `8165-8166`).
+- **The plugin** passes each side's text, as read, to `computeLineDiff`, and the same text through `contentToEntries` (one final newline dropped) to its buffer. Stripping before both, as before, lost the change: `a\n` vs `a\n\n` showed one line on each side, and `a` vs `a\n` was an empty diff.
+
+**P19: composite state (F9).** `close_composite_buffer` is the only place that removes an entry from `composite_buffers` in `SRC/fresh-editor/src/` (`app/composite_buffer_actions.rs:217-222`). Closing the composite's buffer does not remove it. git-review's `buffer_closed` handler calls `closeDiff`, which calls `closeCompositeBuffer` and then closes both sources (`GR:218-229`, `741-751`). The plugin now does the same on a user close, and when a source closes first.
+
+**P20: symbolic links in status (F7).** Recorded in `tests/fixtures/symlink.z`:
+- a tracked link retargeted: `1 .M N... 120000 120000 120000 …`;
+- a file replaced by a link: `1 .T N... 100644 100644 120000 …`;
+- a staged retarget: `1 M. N... 120000 120000 120000 …`;
+- a file replaced by a link and staged: `1 T. N... 100644 120000 120000 …`;
+- an untracked link: `? new-link`, with no mode.
+
+`mW`, the sixth field (the seventh of a `u` record), is the working-tree mode. `fileStat` and `readFile` follow links, and the DTS has no `lstat` or `readlink`, so for a link the working-tree side would be the target's contents.
+
+**Live check of the fixes** (`GS_LIVE_BASE=/tmp/gs-rev/fix tests/live/fixture.sh acceptance`, and `/tmp/gs-rev/f5repo`, with the plugin installed from the checkout):
+- **Diffs.** A click on `plain.txt` (`two`→`TWO`) opened the diff with line 2 marked on both sides, with intra-line colours. `utf8.txt` opened with its multi-byte line as is, and `b.md` in the acceptance fixture showed its added line 2 in the add colour. `latin1.txt` gave `latin1.txt is binary; no diff shown`. `bad\uFFFD.txt` had no button, and a click gave the "not valid UTF-8" message.
+- **Staging.** `+` on `b.md` gave `M  b.md`; `+` on `new/d.txt` gave `A  new/d.txt`; `+` on `gone.ts` gave `D  gone.ts` (through `rm --cached`); `−` on Staged `a.ts` gave ` M a.ts`, with the working-tree file byte-identical.
+- **Closing.** The probe logged `listBuffers()` as `[Welcome, [No Name]]` before the first click. After the diff opened it was those plus the composite and its two sources. A click on the tab's `×` fired `buffer_closed` for the composite, then for both sources, and the list was `[Welcome, [No Name]]` again. No warnings were logged.
+- **The selected row.** With the section focused, a press on the row that is already selected (its button, or a right-click on it) reached nothing, like a row-body click there (P9 e). The same press on any other row worked, and Space on the selected row worked. Host behaviour, not the plugin's. Cause and fix: P21.
+
+### P21: presses on the selected row (2026-11-24)
+
+**Cause (high, source and live).** In the plain tree layout, a selected row in a sidebar section is drawn as `stack([piece, row([text("▌")])])` (`SRC/fresh-editor/src/view/shell/widgets.rs:1320-1329`). `piece` carries the row's hits: the body's `select`/`context`, and the `expand` and `action` buttons.
+- **The overlay covers the whole row.** `stack()` gives every child the whole rect (`SRC/fresh-ui/src/desc.rs:1332`), so the overlay `row()` spans the full width, not just the `▌` cell. It sets no pointer mode, and the default hit is opaque (`SRC/fresh-ui/src/render/object.rs:269-272`, `hit.rs:510`).
+- **The press stops there.** Hit-testing walks children topmost-first and stops at the first opaque hit (`SRC/fresh-ui/src/hit.rs:496-540`). The row's own gestures never run.
+- **Where the press goes instead.** It reaches the section's press handler, which answers a left press with section focus only (`SRC/fresh-editor/src/view/shell/sidebar.rs:296-306`). So a blurred section gets `focus` and nothing else; a focused one gets nothing, and a right-click gets nothing either way.
+- **The source comment is wrong.** It says "The overlay carries no gesture, so a press on that cell continues to the row's own `select` beneath".
+- **Not the cause.** `tree.rs` has no selected-row check, and no double-click or drag logic is involved.
+- **Upstream.** Master (`f29630048`) is unchanged. Upstream issue sinelaw/fresh#3828 (open, on 0.5.9) reports the same layer hiding the selected row's expand arrow.
+
+**Real, not the harness.** Each click was a press, a 400 ms hold, the release, then a 1.5 s wait. On the plain tree with the section focused:
+- `+` on the selected row: no event. `+` on another row: `action {index:2,key:"f:two",via:"click"}`.
+- A right-click on the selected row: no event. A right-click on another row: `context {index:3,…}`.
+- A body re-click on the selected row: no event.
+- Blurred: `+` on the selected row gave `focus` only. The `▌` stays drawn while blurred.
+
+**Fix: `cardBorders: true` with `itemHeight: 1` (high, source and live).**
+- **Why the rows don't change.** The tree picks the card layout on `cardBorders` alone (`widgets.rs:2855`), and that layout adds no `▌` overlay. A row is drawn as a card only when it has continuation lines and the height is above 1 (`SRC/fresh-editor-core/src/widgets/render.rs:2594-2601`, `:2884-2886`), so at height 1 every row is the usual one-line row with its button.
+- **Live, focused:** `+` on the selected row gave `action {index:1,key:"f:one",via:"click"}`, a right-click gave `context`, and a body re-click gave `select … via:"click"`.
+- **Live, blurred:** `+` gave `focus` then `action`; a right-click gave `focus` then `context`.
+- **Keyboard and groups:** Up, Down, Space and Enter work. A click on the selected group row toggles it both ways (S11 fixed).
+- **Selection:** `selectedIndex`, `setSelectedIndex` and `expandedKeys` work as before.
+- **Cost:**
+  - The selected row has the selection band without the `▌`.
+  - Outside the dock, the card layout keeps a one-column scrollbar gutter, so the button sits one column further left (`card_width`, `widgets.rs:1458`).
+  - The card layout ignores `columns`, which the plugin doesn't use.
+  - The type file documents `cardBorders` as acting only when `itemHeight > 1`, so recheck this on each Fresh upgrade.
+
+**Rejected:**
+- Clearing the selection after each event (`setSelectedIndex -1`). It works, but no row is ever highlighted, and Enter and Space have nothing to act on.
+- Buttons in a column beside the tree. The click moves focus to the button, the tree drops its selection (`tree.rs:67-70`), and the column doesn't follow the tree's scrolling or collapsing.
+- The `mouse_click` hook. It fires only for buffer panes (`app/click_handlers.rs:196-217`).
+- Other tree options (`toggleOnClick`, `checkable`, `indentCols`). They stay in the plain layout.
+
+Probe: `/tmp/gs-selrow/pkg/gs_selrow.ts` (not in the repo), logs `fresh-56225.log` and `fresh-59752.log` under `/tmp/gs-selrow/home`.
+
+### P22: a diff with an empty side (2026-11-24)
+
+Found in the final live run (`HOME=/tmp/gs-run/home`, `GS_LIVE_BASE=/tmp/gs-run/fix tests/live/fixture.sh acceptance`, the plugin linked from the checkout).
+
+**Symptom (high, live).** While the diff of untracked `new/d.txt` was open, every frame logged `WARN … render_composite: ViewLine missing for composite buffer: pane=0, line=0, pane_data=true` (52 times in a few seconds), and the status bar showed `[⚠ 1]`. The warnings stopped when that view was closed. A deleted file (an empty right side) does the same on pane 1.
+
+**Cause (high, source).** An empty buffer reports `line_count() == 1` (`SRC/fresh-editor/src/app/composite_buffer_actions.rs:1205-1228`) but draws no line. The diff of `""` against `"d\n"` is one pure insertion (`oldCount 0`). After it, `LineAlignment::from_hunks` still adds a row for every old line it hasn't passed, so it adds one for that phantom line 0 (`SRC/fresh-editor-core/src/model/composite_buffer.rs:356-375`). The renderer then finds no line to draw for it (`render_composite.rs:420-485`, whose comment calls this "unreachable in practice"). The bundled audit_mode's `contentToEntries` (`[]` for empty text) is open to the same.
+
+**Rejected:** one empty entry (`[{ text: "" }]`) instead of `[]`. It was probed live and changed nothing: the same warning came back 23 times.
+
+**Fix (high, live).** `compositeHunks` (`lib/diff.ts`): when a side's buffer is empty, pass one hunk whose count on that side is 1, which covers the phantom line, with `ops` listing only the other side's lines (`+`… or `-`…). With `ops` present, the host builds the rows from `ops` alone (`composite_buffer.rs:265-305`), so no row names the empty side's line 0. When both sides are empty, the hunk has `ops: ""`. Live: the diffs of untracked `new/d.txt` and deleted `gone.ts` drew correctly with no phantom gutter line, the log had zero `WARN`/`ERROR` lines, and no `[⚠]` appeared.
+
+**Rest of the final live run** (same build, all pass, zero warnings):
+- **Clicks on the selected row:** a click on `b.md` opened `b.md (staged ↔ working tree)` with line 2 marked as added. `+` on the selected `b.md` gave `M  b.md`, and Space on the next selected row gave `D  gone.ts` through `rm --cached`.
+- **The menu:** a right-click on the selected row opened the menu at the pointer, and Down, Down, Enter on Stage gave `A  new/c.txt`.
+- **Re-clicks:** a click on the selected `d.txt` replaced the diff tab. Two clicks on the Changes group collapsed it and expanded it again.
+- **Rename:** `−` on the selected rename gave ` D old.ts` and `?? moved.ts`.
+- **Groups:** Unstage All returned everything with the working tree unchanged, and the empty Staged group showed no button. Stage All staged everything again.
+- **Closing:** closing the diff tab with `×` closed both sources, and the tab bar went back to `[No Name]` and `Welcome`.
+
+### P23–P24: second code review (2026-11-24)
+
+Git probes in scratch repositories under `/tmp/gs-cr-probe/w` (git 2.50.1, script `/tmp/gs-cr-probe/probe.sh`, not in the repo). The review found that a row read before an outside change, such as a file restored in Fresh's terminal, which raises no `focus_gained`, could make `rm --cached` stage the deletion of a file that exists. It also found that a Changes `.R` passed its deleted original path to `add`.
+
+**P23: staging a deletion with `update-index --remove`.** Every command is `git --literal-pathspecs update-index --remove -- <p>`.
+
+| # | State | Result |
+|---|---|---|
+| a | ` D foo`, then `git checkout -- foo` before the write (the row is stale) | `rm --cached -q -- foo`: rc 0, `D  foo` and `?? foo`, so the deletion of a file that exists is staged. `update-index --remove -- foo`: rc 0, clean |
+| b | ` D foo`, restored with other content | rc 0, `M  foo`: the index takes the working tree's state |
+| c | P14 d: `foo` now a directory with untracked `foo/x` and a nested repository `foo/sub` | rc 0, `D  foo`, `?? foo/sub/`, `?? foo/x`; the index holds only the other file |
+| d | P14 g: `p` already removed from the index, ` D q` | rc 0, `D  p`, `D  q`, so a repeated write is harmless (`rm --cached`: rc 128, nothing staged) |
+| e | `.R bar ← foo` (`bar` intent-to-add), `foo` now a directory with `foo/x` and a nested `foo/sub`; `update-index --remove -- foo`, then `add -- bar` | both rc 0: `R  foo -> bar`, `?? foo/sub/`, `?? foo/x`. The old `add -- bar foo` stages `foo/x` and embeds `foo/sub`, as in P14 d |
+| f | P14 e's order: `add -A -- foo/x`, then `update-index --remove -- foo` | rc 128, `error: foo: is a directory - add individual files instead`. Deletions first: both rc 0, `D  foo`, `A  foo/x` |
+| g | `AD n` with `MD k`; a deleted intent-to-add path; `AD p` on an unborn branch | rc 0 each, as P14 b, c, h and i |
+| h | ` D a*` and ` D ab`, `-- 'a*'` | rc 0, `D  a*`; ` D ab` unchanged |
+| i | ` D d/f` where `d` is now a symbolic link to a directory | rc 128, `error: 'd/f' is beyond a symbolic link`, nothing staged. `rm --cached` stages `D  d/f`; `add` fails too (`pathspec 'd/f' is beyond a symbolic link`). The one case that got worse; accepted (spec, decisions) |
+
+**P24: a blob's id.** `git rev-parse :0:<p>` and `HEAD:<p>` print the object id. An intent-to-add path's is the empty blob (`e69de29…`), whose `cat-file -s` is 0. For an absent path, `rev-parse HEAD:absent` is rc 128 with `fatal: path 'absent' does not exist in 'HEAD'`, the same message as `cat-file -s`. `--verify` gives only `fatal: Needed a single revision`, so it is left off. Without it, a worktree file named `HEAD:absent` makes `rev-parse` echo the argument with rc 0, so the output is accepted only if it is an object id. A diff side reads its size and its content by that id: two reads of `:0:<p>` could straddle a write and pair one blob's size with another blob's text, which the size check would call binary.
+
+## 9. Follow-up: opening, diffs, staging and the title (2026-11-24)
+
+**Ticket.** "Click on file does not open it in tab. Diff numbers near the branch do not show actual changes count (I changed one line in README, it's shown in Changes but the numbers show 0 0)." Added: stage and unstage per file and per group; view file and view diff per file row, the diff side by side (Changes: index vs working tree; Staged: HEAD vs index).
+
+Same sources as above (`DTS`, `SRC`, `EP`), plus the third-party `git-review` copy (`/tmp/fresh-investigate/git-review/git_review.ts`, `GR`). Logs: `~/.local/state/fresh/logs/fresh-server-{91211,53581,59110}.log`. Throwaway git repos under `/tmp/gs-stage-probe*` were used for the staging commands (git 2.50.1).
+
+### 9.1 A click on a file row opens nothing (root cause, high)
+
+- **What the host sends.** A row-body click on a leaf row is a `select` hit; only rows with `hasChildren` toggle on click (`SRC/fresh-editor-core/src/widgets/kinds/tree.rs:320-353`). The plugin gets `select {index, key, col, row, via:"click"}` (`SRC/fresh-editor/src/app/widget_runtime.rs:217-227`).
+- **What the plugin does with it.** `select` only records the selection (`git_sidebar.ts:404-406`); files open on `activate` only (`:412-414`), which is R7 as written ("Enter or a double-click").
+- **What users expect.** The explorer opens a file on a single click, as a preview tab that keeps focus in the explorer; a double-click opens a permanent tab and focuses the editor (`SRC/fresh-editor/src/app/chrome/file_explorer.rs:83-147`). Built-in sidebar and panel trees act on `select` with `via === "click"`: `EP/search_replace.ts:2837-2846` opens on click, `EP/markdown_toc.ts:745-754` previews on click and keeps the section focused. Keyboard moves carry no `via`.
+- **Double-click.** From the code, a double-click on a leaf row in a sidebar section gives `select`, `select`, `activate`: `Slot::Sidebar` hits take the shared tail that calls `activate_on_double_click` when `clicks >= 2` (`SRC/fresh-editor/src/app/shell_host.rs:2209-2213,2259-2265`). The second press must land on the same cell within `editor.double_click_time_ms` (default 500) (`SRC/fresh-editor/src/app/mouse_input.rs:346-379`, `SRC/fresh-editor-core/src/config.rs:1776-1778`). P5 saw only one `select` through SGR injection. Live behaviour with a real mouse is UNCONFIRMED.
+- **Runtime evidence.** The plugin logged no error, no `setStatus`, and no open after the user's clicks in the section (`fresh-server-91211.log`, 22:27:33Z onwards: `refocus_floating_panel … git_sidebar:1`, mouse input, then only `gitSidebarTick`). The host does not log `select`/`activate`.
+- **Ruled out.** `fileStat` returns `{isFile, isDir, size, readonly}` or `null` (`SRC/fresh-plugin-runtime/src/backend/quickjs_backend.rs:4577-4593`), so `activate()` reads it correctly. The installed copy is byte-identical to the repo.
+- **Opening.** `openFile(path)` returns true once the request is sent and opens a permanent tab in the main split (`SRC/fresh-editor/src/app/file_open_orchestrators.rs:265-400`). `previewFileInSplit(splitId, path)` (`DTS:5742`) opens a preview tab, the explorer's single-click behaviour; `getActiveSplitId()` is `DTS:5343`.
+
+### 9.2 The title's "0 0" is ahead/behind, not changes (high)
+
+- The title is `Git · <branch> ↑A ↓B` from `# branch.ab` (`lib/status.ts:110-114`, R2). The repository now has an upstream (`origin/main`, both at `d34cc44`), so `# branch.ab +0 -0` renders `↑0 ↓0`. A modified README does not change it.
+- The file counts are already in the group labels (`Changes 1`).
+- **Line counts would need another git run.** `git --no-optional-locks diff --numstat` (and `--cached`) per refresh. They change on every saved edit, and a title change forces a remount (§2), so the section would remount on most refreshes.
+
+### 9.3 Row affordances in 0.5.9 (high unless noted)
+
+- **One button per row.** `TreeNode.action?: string | null` (`DTS:1979-1993`, `SRC/fresh-core/src/api.rs:2394`).
+  - Drawn as `[ label ]` against the panel's right edge, always visible, theme colour `ui.help_key_fg`.
+  - A long name slides under it.
+  - Costs the label plus 6 columns, and 1 more for the scrollbar (`SRC/fresh-editor-core/src/widgets/render.rs:2163-2177,2660-2715,2778-2791`; `SRC/fresh-editor/src/view/shell/widgets.rs:853-858`).
+  - Works on group rows too, and does not conflict with `toggleOnClick`: a press on it is an `action` hit, not a `select`, so it does not toggle (`tree.rs:288,320,334-356`; `widgets.rs:1259-1310`).
+- **Button events.**
+  - A click fires `action {index, key, via:"click"}` only, with no `select`, but the host moves the highlight to that row (`tree.rs:280-285,320-325`).
+  - A double-click fires `action` twice and no `activate` (`widget_runtime.rs:101-110`).
+  - A right-click on the button fires nothing.
+- **No other clickable segment.** Row clicks carry absolute screen `col`/`row`, but no API gives the section's screen origin or width (§2), so glyphs inside the label cannot be hit-tested (medium-high).
+  - `checkable:true` draws a native `[v]`/`[ ]` box on the left that fires `toggle` (`DTS:2475-2484`; `render.rs:2627-2650`).
+  - Table `columns` exist but are untyped in the DTS.
+  - `hoverAction` is HEAD-only.
+- **Keyboard.**
+  - A sidebar section has no keymap: "A sidebar section takes its keys through `widget_event` and never through a mode" (`widget_runtime.rs:2447-2470`; mounted with `mode: None`, `plugin_dispatch.rs:6491`). Plain letters (`s`, `u`, `+`, `-`) reach the tree, which has no text handler, and are swallowed. Ctrl/Alt chords leave the section for the editor keymap (`router.rs:374-411`).
+  - Usable keys:
+    - Up/Down, PgUp/PgDn;
+    - Left/Right;
+    - Enter → `activate {index, key}`;
+    - Space → `activate {index, key, via:"space"}` (non-checkable tree, `tree.rs:205-227`);
+    - Esc leaves the section.
+- **Right-click.** `context {index, key, col, row}`, with absolute screen cells. It focuses the section and does not move the selection (`shell_host.rs:2738-2760`).
+- **Menus.**
+  - **Row-anchored floating menu.** An anchored floating panel is the only menu that sits at the row. `mountFloatingWidget` (`DTS:8127`) with a column of buttons, then `floatingPanelControl(id, "anchor", row * 65536 + col)`.
+    - The op is implemented (`plugin_dispatch.rs:6782-6796`) but missing from the DTS op list (`DTS:8171-8185`), and is used by the built-in orchestrator's context menu (`EP/orchestrator.ts:7039-7088,17982-18003,18561-18571`).
+    - A choice arrives as `activate` with the button's `widget_key`; Esc or a click outside arrives as `cancel`.
+    - It takes focus. There is one floating slot.
+    - Where focus returns to after a menu opened from a sidebar section is UNCONFIRMED (medium).
+  - **Not anchored.** `showActionPopup` (`DTS:7839-7852`) is drawn bottom-right as a notification. `startPrompt` + `setPromptSuggestions` (`DTS:7100,7157`) is a quick-pick at the bottom or centre.
+- **Composite section content.** The sidebar draws a section with the dock's generic renderer (`SRC/fresh-editor/src/view/shell/sidebar.rs:373-382`), so `col([row([button…]), tree])` should host a button bar above the tree. Not probed in a sidebar (medium).
+- **Palette commands.** `registerCommand(name, description, handler, context?)` (`DTS:5447-5462`). The handler gets no arguments, so a command acts on the plugin's own `selectedKey`. `setContext` (`DTS:5468-5477`) can show such commands only while the section is focused.
+
+### 9.4 A side-by-side diff of two texts (high unless noted)
+
+- **No built-in fits.**
+  - `runCommand`/`executeAction` take no arguments and match localized names. "Side-by-Side Diff" is fixed to the active buffer, HEAD vs working tree (§3).
+  - `getPluginApi("compare-files").compare(leftPath, rightPath)` (`EP/compare_files.ts:731-734`) takes existing file paths only, returns no handle to close the view, and is `null` when compare_files is disabled.
+  - Feeding it temp files would mean files the plugin cannot delete (no delete API in the DTS), and `getTempDir()` is the host's while `replaceFile` follows the window authority.
+- **Composite buffer built by the plugin** (git-review's approach, `GR:441-517`). All in the 0.5.9 DTS, none marked experimental:
+  1. Read both sides with git through the existing Runner. Working-tree side: `readFile`, or the open buffer's text.
+  2. Two hidden read-only virtual buffers: `createVirtualBuffer({readOnly, editingDisabled, hiddenFromTabs, entries})` (`DTS:7926`).
+  3. `computeLineDiff(old, new)` gives `{oldStart, oldCount, newStart, newCount}` hunks, which `createCompositeBuffer` accepts as is (`DTS:6046,3540,223-247`; `GR:476-479`).
+  4. `createCompositeBuffer({name, mode, layout: side-by-side, sources, hunks})` (`DTS:6674,375-400`), then `showBuffer(id)` (`DTS:5777`), which opens it as a tab in the current split.
+  5. `setSyntaxRegions` (`DTS:6695`) highlights a virtual source (UTF-8 byte offsets).
+  6. `closeCompositeBuffer` (`DTS:6699`) drops only the composite's state. The plugin closes its own view with it, then `closeBuffer(id, true)` on the composite and both sources (P9 c). On a user's tab close, `buffer_closed`, it calls `closeCompositeBuffer` too and then closes the sources, as git-review does: only that call drops the host's composite state (§8 P19). A source that closes first is handled the same way.
+  7. Pass `hunks` as a list, even an empty one: with `null` the host draws neither pane (§8, live checks).
+- **What the composite does for us.** Both panes scroll as one, and the host draws intra-line highlights (`SRC/fresh-editor-core/src/model/composite_buffer.rs:251`; `render_composite.rs:266-292`).
+- **Vendorable helper.** `contentToEntries` (`EP/audit_mode.ts:5124-5141`, about 10 lines) drops the trailing newline that otherwise breaks the last view line. Apply it once, to the same text that goes to `computeLineDiff`, so that a change to the final newline still shows (§8 P18).
+- **Tab pile-up.** git-review keeps one diff slot plus a generation counter: a stale slow click is dropped, the new view is shown, then the old one closed (`GR:467,501-523`). audit_mode closes the previous view first (`audit_mode.ts:8143-8162`).
+- **Sides per row:**
+
+  | Row | Left | Right |
+  |---|---|---|
+  | Changes, modified/deleted/type change | `git show :<path>` | working file (`""` if deleted) |
+  | Changes, untracked | `""` | working file |
+  | Changes, intent-to-add (`.A`) | `""` (index blob is empty) | working file |
+  | Changes, conflicted (`u`) | no stage 0: `:2:<path>` (ours) or `HEAD:<path>` | working file with markers |
+  | Staged, modified/type change | `git show HEAD:<path>` | `git show :<path>` |
+  | Staged, added | `""` | `git show :<path>` |
+  | Staged, deleted | `git show HEAD:<path>` | `""` |
+  | Staged, renamed/copied | `git show HEAD:<orig>` | `git show :<path>` |
+  | Unborn branch | every `HEAD:` side is `""` | |
+
+  - Binary contents need a status message instead of a view: a NUL byte, `readFile` returning null or `undefined`, or a git object whose text is not exactly its `cat-file -s` bytes of UTF-8 (§8 P17).
+  - A Changes or conflicted row whose working-tree mode is 120000 (a symbolic link) is refused too: the file API follows the link (§8 P20). A Staged row's sides are git objects, which hold the link text.
+  - Very large files cross the bridge about three times, so cap them.
+- **Split and focus (P9, high).** With the keyboard in the section, `showBuffer` opens the tab in the split that was active before the click, and focus stays in the section.
+- **Closing a composite (P9, high).** `closeCompositeBuffer` drops the composite's state only. The buffer stays as an empty, unnamed tab until `closeBuffer(id, true)` closes it (`SRC/fresh-editor/src/app/composite_buffer_actions.rs:217-222`). A user's tab close fires `buffer_closed` for the composite.
+
+### 9.5 Staging commands (probed, git 2.50.1)
+
+- **How to run them.** From the repository root, through the existing Runner, so bind-mounted dev containers keep working (§7). Use `git --literal-pathspecs`: without it, `git add -- 'a*'` also staged `ab`.
+- **They take `index.lock`.** They cannot use `--no-optional-locks`, so R11's first bullet has to narrow to the background refresh. On failure (the user's own git holding the lock), report it and refresh.
+
+| State | Stage (Changes row) | Unstage (Staged row) |
+|---|---|---|
+| Modified, added, type change | `git add -- <p>` | `git reset -q -- <p>` |
+| Deleted (` D`, `AD`, `MD`) | `git update-index --remove -- <p>`. `add` also adds what is now under a directory at `<p>` and embeds a nested repository there (§8 P14 d). `rm --cached -q` was used first; it also drops the entry of a file restored since the row was read (P23 a) | `git reset -q -- <p>`. This also unstages a staged `<p>/…`: an index cannot hold `foo` and `foo/bar` at once (P14 j), and no command can avoid it |
+| Untracked | `git add -- <p>` | — |
+| Renamed (`orig`) | Changes `.R` (onto an intent-to-add path): `git update-index --remove -- <orig>`, then `git add -- <p>`. The original is a deletion: `add -- <p> <orig>` embeds a nested repository at `<orig>` (P23 e) | `git reset -q -- <p> <orig>`. Resetting `<p>` alone left `D  <orig>` staged |
+| Copied (`orig`) | — | `git reset -q -- <p>` only: the source keeps its own staged change (§8 P15) |
+| Conflicted (`!`) | `git add` marks it resolved even with markers still in it | — (never in Staged) |
+| Unborn branch | `git add -- <p>` | `git reset -q -- <p>` works. `git restore --staged` fails with rc 128, "could not resolve HEAD" |
+| Group: stage all | `git update-index --remove -- <every deletion and Changes rename original>`, then `git add -A -- <every other Changes path but conflicted>`. Deletions go first: after `add` has put `foo/x` in place of a deleted `foo`, removing `foo` fails (§8 P14 e, P23 f). A bare `git add -A`/`-u` resolves conflicts | — |
+| Group: unstage all | — | `git reset -q -- <every Staged path and orig>`. A bare `git reset -q` deleted `MERGE_HEAD` (aborting a merge), and `git reset -- :/` turned `UU` into ` M`. Listing the paths keeps both (git warns "needs merge") |
+
+- **Edge exit codes (P13, §8).**
+  - An unstage that lists paths while a conflict is open exits 0 and prints `<path>: needs merge`. That is success: it keeps the conflict and `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD` or `.git/rebase-merge`.
+  - One path that no longer exists fails the whole `add` with rc 128 (`pathspec '<p>' did not match any files`), and nothing in that command is staged.
+  - `cat-file -s HEAD:<absent>` is rc 128. So is "not a repository", so an absent side is decided from the status, not from this exit code. An intent-to-add path's `:0:` blob is empty, with rc 0.
+- **Directory rows** (submodule, nested repo): `git add` on an untracked nested repo adds an embedded repository, so offer no action there (P14 d saw it).
+- **Names that are not UTF-8.** Status comes back with U+FFFD in such a path (§8 P17), so it names nothing, and one such path fails a whole `add`. Those rows get no button; the group commands skip them and count them.
+- **Writes are never killed.** In 0.5.9 `kill()` is a SIGKILL on both runners (§8 P16), and a killed write leaves `.git/index.lock`. A write gets 60 s; after that the user is told git is still running, and it is waited for: until it exits it holds the lock, so the next write waits too, and its own result is reported. Reads keep the 10 s timeout and the kill.
+- **Precedent.** `audit_mode` stages with `git add -- <p>` and unstages with `git reset HEAD -- <p>`, awaiting a refresh after each (`EP/audit_mode.ts:4229-4240`). It has no stage-all and passes only the new path of a rename. git-review has no staging.
+
+### 9.6 Open
+
+- **Double-click.** Does a real mouse double-click on a file row deliver `activate` (§9.1)? Manual (P12), not yet run.
+- ~~**Focus.**~~ Closed by P9: `showBuffer` uses the split active before the click, and focus stays in the section. `openFile` was not probed.
+- ~~**Anchored menu.**~~ Closed by P10: it is drawn at the pointer, Esc and a click outside give `cancel` on the menu panel only, and focus returns to the section.
+- ~~**Re-click.**~~ Closed by P21: with `cardBorders: true` at `itemHeight: 1`, a click, a button press and a right-click on the selected row all reach the plugin.
+- ~~**Command length.**~~ Handled: stage all and unstage all run in commands of at most 16 KiB of paths each, with a rename's two paths in the same command. They are not atomic, and a failure reports how many paths it got through.
+- **Line endings (follow-up, not fixed).** Under `core.autocrlf` or `eol`/`text` attributes, a Changes diff compares the raw LF blob with the CRLF file on disk, so every line shows as changed. `git cat-file --filters` would give the file as git compares it, but it runs the repository's smudge filters on every click.
+- **Windows and the rows context (not fixable in 0.5.9).** `setContext` acts on the active window, so with several windows the palette commands follow whichever window was active when the context last changed. The reload half is fixed: load clears a context a previous load left set.
+- **Status that is not UTF-8 in a bind-mounted dev container (found, not fixed).** Through `spawnHostProcess`, a status whose output holds one path that is not UTF-8 comes back as `""` with rc 0 (§8 P17). The section then shows empty groups and the title `Git · HEAD`. `runOnTarget` (local) is lossy instead, and the rows show U+FFFD.
+- **Lossy text of the same length (low).** A blob refusal compares UTF-8 lengths. A blob in which three bad bytes become one U+FFFD (3 bytes), such as a truncated 4-byte sequence, keeps its length and is shown with U+FFFD in it.
+- **Untracked symbolic links.** `?` records carry no mode, so an untracked link's diff shows its target's contents (README Limits).

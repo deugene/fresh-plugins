@@ -2,6 +2,8 @@
 
 After this ships, a Fresh user working in a git repository sees a collapsible **Git** section under the file explorer. The section shows the current branch, plus two expandable groups, **Staged Changes** and **Changes**, that list the changed files. The section keeps itself current, so no diff tab is needed to see what is staged and what is not.
 
+After the 2026-11-24 follow-up (R14–R18), the user can also open a side-by-side diff of any listed file with one click. They can stage and unstage single files or a whole group without leaving the section.
+
 The plugin is the first package in a new multi-plugin repository, `deugene/fresh-plugins`.
 
 Investigation: [`docs/investigations/git-sidebar.md`](../investigations/git-sidebar.md) (cited as INV §n).
@@ -19,6 +21,12 @@ Fresh offers no quick way to see what is changed and what is staged (INV §1):
 
 So users run `git status` in a terminal, or open Review Diff and close it again.
 
+**Follow-up (2026-11-24).** In use, the section was read-only:
+
+- **A click on a file row did nothing.** Users expect it to act: the explorer opens a file on a single click (INV §9.1).
+- **Staging meant leaving the section.** It took a terminal or Review Diff.
+- **Seeing one file's diff was awkward.** It meant opening the file and running Side-by-Side Diff. That compares HEAD with the working tree only, so it shows neither what is staged nor what is left to stage (INV §3, §9.4).
+
 ## Current behaviour
 
 - **Sidebar.** It holds the file explorer plus any plugin sections, which are appended below it in mount order.
@@ -26,6 +34,15 @@ So users run `git status` in a terminal, or open Review Diff and close it again.
 - **Other sections.** The only built-in section is the Markdown table of contents.
 - **No git section.** There is none, built in or in the community registry (INV §1).
 - **The repository.** `deugene/fresh-plugins` does not exist on GitHub, and the local directory is not a git repository.
+
+**Before the 2026-11-24 follow-up** (R1–R13 as first shipped; INV §9.1–§9.3):
+
+- **File rows.**
+  - A single click selects the row and does nothing else.
+  - Enter, Space and (per the host's code) a double-click open the file. A real double-click was never confirmed live.
+- **Group rows.** Space toggles a group, as Enter does.
+- **No row controls.** Rows have no buttons, and a right-click does nothing.
+- **The title's `↑A ↓B`.** It counts commits ahead of and behind the upstream. With an upstream in sync it reads `↑0 ↓0`, whatever the working tree holds. This is R2 working as specified, and it stays.
 
 ## Requirements
 
@@ -69,14 +86,17 @@ So users run `git status` in a terminal, or open Review Diff and close it again.
 
 - Renamed and copied rows shall also show the original path.
 - Rows shall be coloured with the active theme's git file-status colours, and shall follow theme changes without a reload.
+- A row that can be staged or unstaged shall show a `+` or `−` button at its right edge (R15, R16).
 
 **R6.** The user shall be able to collapse and expand the whole section from its header.
 - That collapsed state, and any height the user set by dragging a divider, shall survive refreshes, branch changes, and restarts of the same workspace.
 - The section shall have no close button.
 
-**R7.** WHEN the user activates a file row, with Enter or a double-click, the file shall open in the editor.
+**R7.** WHEN the user chooses View File for a file row, from the row's menu (R17) or the command palette (R18), the file shall open in the editor as a tab.
 - IF the file does not exist in the working tree, THEN no buffer shall be created, and a status message shall say that the file is deleted.
-- Activating a group row shall toggle that group.
+- IF the row is a directory (a submodule or nested repository), THEN no buffer shall be created, and a status message shall say so.
+- No other gesture on a file row shall open the file itself: not a click, a double-click, Enter or Space. A click and Enter open the diff (R14); Space stages or unstages (R15).
+- Enter on a group row shall toggle that group.
 
 **R8.** WHEN a file is saved or reverted in the editor, or the editor regains focus, the section shall show the resulting status within 2 s, on a repository where `git status` completes in under 200 ms.
 
@@ -86,11 +106,11 @@ So users run `git status` in a terminal, or open Review Diff and close it again.
 
 **R10.** Refreshes shall not disturb the user:
 - WHEN a refresh finds no change, the section shall not change visibly: selection, group expansion and scroll stay as they were.
-- WHEN a refresh or branch change finds a change, group expansion shall be kept. The selection shall stay on the same file while that file is still listed.
+- WHEN a refresh or branch change finds a change, group expansion shall be kept. The selection shall stay on the same row (a file in a group) while that row is still listed. When the row has gone, for example because R15 moved the file to the other group, the selection shall stay at its position in its group.
 - IF a refresh fails, THEN the section shall keep showing the last good result.
 
 **R11.** The plugin's git activity shall not get in the user's way:
-- The plugin shall never create `.git/index.lock`, so the user's own git commands never fail because of it.
+- The plugin's refreshing shall never create `.git/index.lock`, so the user's own git commands never fail because of it. Only a stage or unstage the user asks for (R15, R16) writes the index.
 - On a repository where `git status` is slow, background refreshing shall keep git running no more than 25% of wall-clock time.
 - IF a group would hold more than 500 files, THEN it shall list the first 500 and one final row giving the number not shown.
 
@@ -106,12 +126,72 @@ The plugin shall:
 
 The repository shall be initialised as a local git repository with no remote.
 
-**R13.** WHILE the window is attached to a dev container whose workspace is bind-mounted from the host, the section shall show the same title, groups and rows as for the same workspace opened locally. It shall meet R8 and R9 for changes made inside the container, both git commands and edits. It shall do so whether or not the image has git. WHEN the window attaches or detaches, the section shall keep its position, collapsed state and height, and shall show current status within 5 s. WHERE the container's workspace is a container volume rather than a host bind mount, the section shall never show the host folder's git status. IF Fresh cannot open files that exist only in the volume, THEN the section shall show a single notice row saying the sources are in a container volume.
+**R13.** WHILE the window is attached to a dev container whose workspace is bind-mounted from the host, the section shall show the same title, groups and rows as for the same workspace opened locally, and R14–R18 shall behave as they do locally. It shall meet R8 and R9 for changes made inside the container, both git commands and edits. It shall do so whether or not the image has git. WHEN the window attaches or detaches, the section shall keep its position, collapsed state and height, and shall show current status within 5 s. WHERE the container's workspace is a container volume rather than a host bind mount, the section shall never show the host folder's git status. IF Fresh cannot open files that exist only in the volume, THEN the section shall show a single notice row saying the sources are in a container volume.
+
+**R14.** WHEN the user clicks a file row, or presses Enter on it, a side-by-side diff of that file shall open in the editor's active split, and keyboard focus shall stay in the section.
+- **A Changes row** shall compare the staged version (left) with the working-tree file on disk (right).
+  - The left side is empty when nothing is staged for the path (untracked, intent-to-add).
+  - The right side is empty for a deleted file.
+- **A conflicted row** shall compare the HEAD version (left, empty when HEAD lacks the path) with the working-tree file and its conflict markers (right).
+- **A Staged row** shall compare the HEAD version (left) with the staged version (right).
+  - For a rename or copy, the left side is the original path's HEAD version.
+  - The left side is empty for an added file, and on a branch with no commits.
+  - The right side is empty for a staged deletion.
+- **Display.**
+  - Changed lines shall be marked on both sides, and the two sides shall scroll together.
+  - The diff shall be read-only.
+  - Its tab title shall name the file and the comparison: staged ↔ working tree, or HEAD ↔ staged.
+- **One tab.** At most one diff tab shall be open: each later click or Enter replaces it, whichever row it is on.
+- **The selected row.** A click on the row that is already selected opens its diff again, as on any other row.
+- **No leftovers.** Closing the diff tab shall leave no buffer behind.
+- **A snapshot.** The diff shows the contents at the moment it opened, and does not follow later changes.
+- IF either side is binary (contains a NUL byte, or is not valid UTF-8) or larger than 5 MiB, THEN no diff shall open, and a status message shall say why.
+- IF a Changes or conflicted row's working-tree file is a symbolic link (git's working-tree mode 120000), THEN no diff shall open, and a status message shall say so. A Staged row on a link still compares the link texts. An untracked link carries no mode in git's status, so its diff shows the target's contents.
+- IF the row is a directory (a submodule or nested repository), THEN no diff shall open, and a status message shall say so.
+
+**R15.** Each file row under Changes shall have a `+` button, and each file row under Staged Changes a `−` button. Activating the button, or pressing Space on the row, shall:
+- **`+`:** stage the path. The index takes the working tree's state of it: changed content, a deletion, or a new file. Staging a deletion changes nothing under a directory that now stands at the path.
+- **`−`:** unstage the path.
+  - Its index entry returns to HEAD's, or is removed when HEAD lacks the path (including on a branch with no commits).
+  - For a staged rename, both the new and the original path return to HEAD's. For a staged copy, only the new path does: the original keeps its own change.
+  - The working tree is never changed.
+- **Only that path.** Nothing else shall change, even when the name contains glob characters (`*`, `?`, `[`).
+- **Rows without a button.** Conflicted rows, directory rows, and rows whose name is not valid UTF-8 shall have none. Space on one shall leave the repository unchanged, and a status message shall say why.
+- **Timing.** The section shall show the result within 2 s, on a repository where `git status` completes in under 200 ms. The selection stays at its position (R10), so repeated Space works down a group.
+- IF the stage or unstage fails (for example, while the user's own git holds `.git/index.lock`), THEN a status message shall give git's reason, and the section shall show the repository's actual status.
+- A stage or unstage shall never be stopped part-way, because a stopped git leaves `.git/index.lock` behind. IF it takes longer than 60 s, THEN a status message shall say git is still running.
+
+**R16.** WHILE a group lists at least one file, its group row shall have a button: `+` on Changes (stage all) and `−` on Staged Changes (unstage all). Activating the button, or pressing Space on the group row, shall:
+- **Stage all.** Stage every path in Changes as R15 does, including paths beyond the 500-row cap, except conflicted paths, directory paths and names that are not valid UTF-8.
+  - IF any path was skipped, THEN a status message shall say how many, and why.
+- **Unstage all.** Unstage every path in Staged Changes as R15 does, leaving the working tree unchanged.
+- **Conflicts and operations in progress.** Neither action shall mark a conflict resolved, discard a conflict, or end a merge, rebase, cherry-pick or revert in progress.
+- **Group toggling.** Activating the button shall not toggle the group. A click elsewhere on the row and Enter still toggle it (R3, R7).
+- **Empty groups.** An empty group shall have no button, and Space on it shall do nothing.
+- R15's timing and failure bullets apply.
+
+**R17.** WHEN the user right-clicks a file row or a group row, a menu shall open at the pointer listing that row's actions:
+- **On a file row:** View Diff (R14), View File (R7), and Stage (Changes) or Unstage (Staged) where R15 gives the row a button.
+- **On a group row:** Stage All or Unstage All, where R16 gives the row a button. A group row with no action opens no menu.
+- **Choosing an item** shall do what that action does elsewhere.
+- **Closing without a choice.** Esc, or a click outside the menu, shall close it and change nothing.
+- **Focus.** After the menu closes, keyboard focus shall be back in the section.
+- **Other rows.** A right-click on any other row (the `… N more` row, a notice) shall do nothing.
+
+**R18.** The command palette shall offer five Git section commands: View Diff, View File, Stage or Unstage, Stage All, and Unstage All.
+- **View Diff, View File, Stage or Unstage** act on the row selected in the section, as R14, R7 and R15 describe.
+- **Stage All and Unstage All** act on their group, as R16 describes, whichever row is selected.
+- IF no row is selected, or the action does not apply to the selected row, THEN a status message shall say so, and nothing shall change.
 
 ## Out of scope
 
-- Staging, unstaging, discarding, committing, or any other action that changes the repository.
-- Opening a diff from a row. Activation opens the file only.
+- **Other changes to the repository.** Discarding changes, committing, stashing, or anything else beyond R15/R16's staging and unstaging.
+- **Partial staging and editing.** Staging or unstaging part of a file (hunks or lines), and editing in the diff view.
+- **Resolving conflicts.** Marking a conflict resolved from the section: R15 and R16 never stage a conflicted file.
+- **More diff views.** More than one diff tab at a time; a diff that follows edits made after it opened; a diff of unsaved edits; a diff for a directory row.
+- **Other ways to open a file.** Opening the file itself by a click, double-click, Enter or Space (R7).
+- **Single-letter shortcuts** (`s`, `u`) in the section. Fresh 0.5.9 gives a sidebar section no key bindings (INV §9.3).
+- **The title.** Changing its `↑A ↓B`, or adding line or file counts to it.
 - Additional git repositories:
   - repositories nested inside the workspace (sub-repos, submodules);
   - a repository created after the plugin loaded (reload the plugin or restart Fresh instead).
@@ -119,7 +199,7 @@ The repository shall be initialised as a local git repository with no remote.
 - Keeping group expansion across editor restarts. Groups start expanded on each start.
 - SSH remote workspaces (best effort, unverified).
 - A host without git while attached to a dev container.
-- User settings, and palette commands.
+- User settings, and palette commands other than R18's.
 - Creating the GitHub repository, publishing to the plugin registry, and CI.
 
 ## Constraints
@@ -137,6 +217,15 @@ The repository shall be initialised as a local git repository with no remote.
 - **Section lifetime.** The section's position, collapsed state and height belong to the host.
   - The host keeps them across a remount of the same section, but not across an unmount and mount (INV §2).
   - So R6 rules out any refresh path that removes the section.
+- **Row controls in 0.5.9** (INV §9.3):
+  - a tree row carries at most one button;
+  - a sidebar section receives no letter keys;
+  - Enter and Space are the only activation keys;
+  - a right-click reports only absolute screen cells.
+- **The right-click menu (R17)** needs a host operation that 0.5.9 implements but its type file does not list: anchoring a floating panel at a screen cell (INV §9.3). It is the one exception to "declared APIs only", and it holds only while a live probe from a sidebar section passes (see Decisions).
+- **Presses on the selected row.** In 0.5.9 a sidebar tree in its plain layout lays a selection mark over the selected row, and the mark swallows every press on that row: a click, its button, a right-click (INV §8 P21). The tree layout used for cards, at one line per row, draws the same rows without the mark. The type file says that option acts only on taller rows, so this relies on how 0.5.9 picks the layout, and needs rechecking on each Fresh upgrade.
+- **Staging writes the index.** Like any git write, it takes `.git/index.lock`, so it can fail while the user's own git holds that lock (INV §9.5).
+- **Dangerous defaults.** Some plain git forms of stage-all and unstage-all resolve conflicts or abort a merge (INV §9.5), and R16 forbids both.
 
 ## Acceptance criteria
 
@@ -194,8 +283,9 @@ Open Fresh on it with the plugin installed.
 - The header has no ×.
 
 **A7.** (R7)
-- Enter on `b.md` opens `b.md`.
-- Enter on `gone.ts` shows a "deleted" status message, and the buffer list is unchanged.
+- View File on `b.md`, from its right-click menu and again from the palette, opens `b.md` as a tab.
+- View File on `gone.ts` shows a "deleted" status message, and the buffer list is unchanged.
+- No other gesture opens `b.md` itself as a tab: a click, a double-click, Enter or Space on its row.
 - Enter on a group row toggles it.
 
 **A8.** (R8) Edit and save `b.md` back to its HEAD content in Fresh. Within 2 s, `b.md` leaves Changes.
@@ -212,7 +302,7 @@ Open Fresh on it with the plugin installed.
 - Hold `.git/index.lock` externally for 10 s. The section keeps its previous content.
 
 **A11.** (R11)
-- While the plugin refreshes, a loop of 200 `git add`/`git reset` pairs in a terminal never fails with an `index.lock` error.
+- While the plugin refreshes and nobody uses R15/R16, a loop of 200 `git add`/`git reset` pairs in a terminal never fails with an `index.lock` error.
 - A unit test of the refresh scheduling, with simulated git durations of 1 s and 5 s, shows git busy no more than 25% of elapsed time.
 - In a repository with 1,200 untracked files, Changes shows 500 rows plus `… 700 more`, and still does after 3 refreshes.
 
@@ -229,10 +319,66 @@ Open Fresh on it with the plugin installed.
   - `git add b.md` moves it to Staged within 5 s;
   - `git commit -m x` empties Staged within 5 s;
   - `echo x >> z.txt` adds `z.txt U` within 5 s.
-- Enter on `b.md` opens it.
+- View File on `b.md` opens it, and a click on it opens its diff.
+- `+` on `b.md` stages it. `git status` in a host terminal shows `M  b.md`.
 - Detach: the section stays and is still current.
 - Repeat with `debian:bookworm-slim`, which has no git. The git commands run in a host terminal, and only `echo x >> z.txt` runs in the container. Same results.
 - **Volume variant:** the host folder is a git repo with its own changes, and `devcontainer.json` sets `workspaceMount: source=gs-vol,target=/workspaces/gs,type=volume`. After attach, the section shows none of the host's rows; per P8 it shows the notice row.
+
+**A14.** (R14)
+- **A Changes row.** Click `b.md` under Changes.
+  - A read-only side-by-side tab opens. Its left side is `b.md` as staged (here equal to HEAD), its right side the working-tree file, and the changed line is marked on both sides.
+  - Down then moves the selection in the section, so focus stayed there.
+- **A Staged row, then the same file in Changes.** Click `a.ts` under Staged: HEAD on the left, staged on the right. Then click `a.ts` under Changes: staged on the left, working tree on the right. The number of open tabs is the same as after the first click.
+- **Renames, adds, deletes.**
+  - `moved.ts` shows `old.ts`'s HEAD content on the left.
+  - `new/c.txt` has an empty left side.
+  - `gone.ts` has an empty right side.
+- **Enter.** Enter on `b.md` opens the same diff as a click.
+- **Re-opening.** Close the diff tab while `b.md` stays selected. A click on `b.md` opens its diff again, and so does Enter.
+- **The selected row's controls.** With `b.md` selected and the section focused, its `+` stages it and a right-click on it opens the menu. A click on the selected group row toggles it.
+- **Closing.** Close the diff tab, and the buffer list equals the one before the first click.
+- **Refused files.** For an untracked PNG, for a 6 MiB text file, for a modified tracked Latin-1 file, and for a tracked symbolic link that was retargeted, a click opens no tab and shows a status message.
+- **Final newline.** A file whose only change is a blank line added at its end shows that line as added.
+- **Unborn branch.** In a repository with no commits and one staged file, that file's Staged diff has an empty left side.
+- **Conflict.** In the conflict fixture, a click on the `!` row shows HEAD on the left and the conflict markers on the right.
+
+**A15.** (R15, R5, R10)
+- **Stage.**
+  - `+` on `b.md`: within 2 s, `b.md` is listed under Staged only, and `git status --porcelain` shows `M  b.md`.
+  - Space on `gone.ts` under Changes gives `D  gone.ts`.
+  - `+` on `new/c.txt` gives `A  new/c.txt`.
+- **Unstage.**
+  - `−` on `a.ts` under Staged: `a.ts` is listed only under Changes, and its working-tree file is byte-identical to before.
+  - `−` on `moved.ts`: `git diff --cached --name-only` prints neither `moved.ts` nor `old.ts`.
+  - `−` on a staged copy `copy.txt` (copy detection on) whose source `orig.txt` is also staged: `copy.txt` is untracked, and `orig.txt` is still staged.
+- **Repeated Space.** Select the first file under Changes and press Space three times. Three successive Changes files are staged.
+- **Literal paths.** With untracked files `a*` and `ab`, `+` on `a*` stages `a*` only.
+- **A deleted file that is now a directory.** Tracked `foo` is deleted and replaced by a directory holding an untracked file and a nested repository. `+` on `foo` gives `D  foo`, and everything under `foo/` stays untracked.
+- **Conflict.** In the conflict fixture, the `!` row has no button. Space on it shows a message, and `git status` still shows the conflict.
+- **Lock held.** Hold `.git/index.lock` externally and press `+` on `b.md`. A status message gives git's reason, and the section still lists `b.md` under Changes.
+- **Unborn branch.** In a repository with no commits, `+` then `−` on a new file leaves it untracked (`??`).
+
+**A16.** (R16, R5)
+- **Stage all.** `+` on the Changes group: Changes shows 0, and `git status --porcelain` shows no unstaged or untracked path.
+- **Unstage all.** `−` on the Staged Changes group: Staged Changes shows 0, and every working-tree file is byte-identical to before.
+- **Past the row cap.** In the repository with 1,200 untracked files, stage all makes `git diff --cached --name-only | wc -l` print 1200.
+- **During a merge.** With a merge in progress, one `UU` file and one staged file:
+  - stage all leaves the `UU` entry, and its message says one path was skipped;
+  - unstage all leaves `.git/MERGE_HEAD` in place and the `UU` entry as it was.
+- **No buttons when empty.** In a clean repository, neither group row has a button.
+- **No toggle.** A click on a group's button does not toggle the group.
+
+**A17.** (R17)
+- **A Changes file.** Right-click `b.md` under Changes: a menu at the pointer lists View Diff, View File and Stage. Choosing Stage does what `+` does in A15.
+- **A Staged file.** Right-click `moved.ts` under Staged: View Diff, View File, Unstage.
+- **A group.** Right-click the Staged Changes group: Unstage All.
+- **Closing.** Esc closes the menu with no change, and Down then moves the selection in the section.
+- **Other rows.** Right-click the `… N more` row: no menu.
+
+**A18.** (R18)
+- **With a row selected.** Select `b.md` under Changes and open the palette. The five Git section commands are listed, and each does what A14–A16 describe for `b.md` or its group.
+- **With nothing selected.** On a fresh start, with no row selected, each of View Diff, View File and Stage or Unstage shows a status message and changes nothing.
 
 ## Decisions
 
@@ -243,7 +389,7 @@ Decisions marked "user" were chosen by the user on 2026-11-23. Those marked "def
 | Build a new plugin; do not fork or adopt `git-review` | Its gaps (see Why) are the core of the request | user |
 | Local git now; GitHub repo later | Publishing is outward-facing | user |
 | Branch in the title, not in a row | Saves a row. The remount a branch change triggers must keep group state (R2, R10) | user |
-| Activation opens the file, never a diff | The 0.5.9 diff command works only on the active buffer and only HEAD vs working tree (INV §3) | user |
+| ~~Activation opens the file, never a diff~~ (superseded on 2026-11-24, see below) | The 0.5.9 diff command works only on the active buffer and only HEAD vs working tree (INV §3) | user |
 | Workspace repository only | Matches the explorer root | default |
 | Conflicted files go under Changes, marked `!` | Keeps the ticket's two groups | default |
 | Untracked files listed one by one, with a 500-row cap per group | Avoids an opaque `dir/` row, and the cap bounds an un-ignored `node_modules` | default |
@@ -252,3 +398,35 @@ Decisions marked "user" were chosen by the user on 2026-11-23. Those marked "def
 | Nothing shown outside a git repository | Matches `git_statusbar` | — |
 | Git runs on the host for bind mounts | Fresh's container authority keeps the filesystem on the host and assumes bind mounts; `runOnTarget` passes the host cwd to `docker exec -w`; images may lack git; in-container git meets ownership problems; `kill()` is a no-op there (INV §7) | default |
 | Volume workspaces are detected with host-side `docker inspect`, and their behaviour follows P8 | Fresh cannot be assumed to read files that exist only in a volume (INV §7, §8) | user |
+
+**2026-11-24 follow-up.** "user" decisions were chosen by the user on 2026-11-24; "default" ones were proposed and are open at spec approval.
+
+| Decision | Why | Source |
+|---|---|---|
+| The title keeps `↑A ↓B`, including `↑0 ↓0` | It counts commits against the upstream, which is R2 working as specified (INV §9.2). File counts are already in the group labels | user |
+| A click or Enter on a file row opens a side-by-side diff. The file opens only from the menu or the palette | A diff answers "what changed here" without leaving the section, and the file is one menu item away | user |
+| A double-click gets no behaviour of its own | Fresh 0.5.9 delivers it as two clicks and then an Enter (INV §9.1), so it opens the diff like a single click | user |
+| One diff tab, replaced by each click | No tab pile-up | user |
+| `+`/`−` buttons on rows, with Space doing the same | 0.5.9 allows one button per row and no letter keys in a section (INV §9.3) | user |
+| A right-click menu at the row, probed live first. If anchoring misbehaves from a sidebar section, the menu is dropped and the user told | It is the only menu that sits at the row, and it uses a host operation missing from the type file (INV §9.3) | user |
+| Palette commands that act on the selected row | They are the only keyboard path to View File, and to every action outside the section | user |
+| Conflicted files are never staged from the section | `git add` marks a conflict resolved even with its markers still in the file (INV §9.5) | user |
+| Enter on a file row opens the diff | View File is menu- and palette-only, and Enter is the keyboard twin of a click | default |
+| The diff's working-tree side is the file on disk, not unsaved edits | It matches what the row reflects | default |
+| A conflicted row's diff is HEAD vs the working tree | There is no staged version during a conflict (INV §9.4) | default |
+| No diff for binary files or over 5 MiB per side | Bounds the text moved through the plugin bridge (INV §9.4) | default |
+| Directory rows (submodule, nested repository) get no button, and stage all skips them | `git add` on an untracked nested repository embeds it (INV §9.5) | default |
+| After a row goes, the selection keeps its position in its group, not its index in the whole list | With the index, staging a file grows Staged Changes, so the index lands on the Changes group row and the next Space would stage the whole group (plan critique F1). Keeps R15's "repeated Space works down a group" | default |
+| A click, a button press or a right-click on the selected row works as on any other row. This replaces the earlier amendment "a click on the already-selected file row opens nothing" | The user asked for the selected row's buttons to work. The plain sidebar tree swallows presses under its selection mark; the card layout at one line per row does not, at the cost of the mark (INV §8 P21) | user |
+| The palette commands are listed whenever the section shows rows | Listing them only while the section has focus depends on focus order around opening the palette, which is unconfirmed (INV §9.3) | default |
+
+**2026-11-24 review fixes.** Chosen by the user after the code review.
+
+| Decision | Why | Source |
+|---|---|---|
+| Unstaging a copy resets only its new path; a rename still resets both | A copy's source keeps its own change, and R15 says "only that path". A rename's original is half of the same change: resetting the new path alone left `D <orig>` staged (INV §9.5, §8 P15) | user |
+| No diff for a Changes or conflicted row on a symbolic link | Fresh's file API follows links and has no `readlink`, so the working-tree side would be the target's contents rather than the link (INV §8 P20) | user |
+| Deletions, and a Changes rename's original path, are staged with `git update-index --remove`, not `git add` or `git rm --cached` | `add` on a deleted file that is now a directory also adds the directory's contents and embeds a nested repository, against R15's "only that path" (INV §8 P14). `rm --cached` drops the entry even when the file has come back since the row was read, staging the deletion of a file that exists; `update-index --remove` removes only a path that is gone, or is now a directory, when it runs (P23). Accepted cost: a deleted file under a directory since replaced by a symbolic link fails with git's reason (P23 i) | user |
+| Stage and unstage are never killed; after 60 s a message says git is still running | Fresh 0.5.9's kill is a SIGKILL, and a killed git write leaves `.git/index.lock` behind (INV §8 P16) | user |
+| A write past its 60 s is waited for: later writes queue behind it, and its result is reported when git exits | Until git exits it holds `.git/index.lock`, so the next write would fail; and R15 asks for git's reason when a write fails, late or not | default |
+| Status messages carry no `git-sidebar:` prefix, and git's reason drops its `fatal:` or `error:` tag and shows paths inside the repository relative to its root | The status bar cuts a long message at its width, and git's reason comes last, so it was the part lost (seen live on a slow write's filter error, and on a held lock's absolute path). Fresh's bundled plugins use no prefix either; debug lines keep it | default |

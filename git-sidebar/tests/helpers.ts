@@ -2,10 +2,14 @@
 // the results of `pwd` and `docker inspect` in a container.
 
 import { readFileSync } from "node:fs";
+import { parseStatus, type Status } from "../lib/status.ts";
 import type { TreeSpec } from "../lib/view.ts";
 
 /** A recorded `git status` output, tests/fixtures/<name>.z. */
 export const fixture = (name: string): string => readFileSync(new URL(`./fixtures/${name}.z`, import.meta.url), "utf8");
+
+/** A recorded `git status` output, parsed. */
+export const status = (name: string): Status => parseStatus(fixture(name));
 
 /** Every row's text, the shape tree assertions read best in. */
 export const texts = (spec: TreeSpec): string[] => spec.nodes.map((n) => n.text.text);
@@ -23,6 +27,13 @@ export function raw(opts: { branch?: string; ab?: string | null; records?: strin
 /** An ordinary changed-file record with status `xy`. */
 export const mod = (xy: string, path: string): string => `1 ${xy} N... 100644 100644 100644 ${H} ${H} ${path}`;
 export const untracked = (path: string): string => `? ${path}`;
+
+/** `n` untracked records, `<prefix>0000.txt` onwards. */
+export const manyUntracked = (n: number, prefix = "f"): string[] =>
+  Array.from({ length: n }, (_, i) => untracked(`${prefix}${String(i).padStart(4, "0")}.txt`));
+
+/** The paths a command carries: everything after its `--`. */
+export const pathsOf = (argv: string[]): string[] => argv.slice(argv.indexOf("--") + 1);
 
 /** `pwd` in the container printing `dir`. */
 export const pwdResult = (dir: string) => ({ code: 0, stdout: dir + "\n", stderr: "" });

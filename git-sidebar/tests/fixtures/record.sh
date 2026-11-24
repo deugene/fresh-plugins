@@ -72,6 +72,18 @@ git -C "$d" add -A; git -C "$d" commit -q -m ours
 git -C "$d" merge -q other >/dev/null 2>&1 || true
 record conflict "$d"
 
+# a merge in progress: one conflicted file (UU) and one staged file.
+d=$(new_repo merge)
+printf 'base\n' > "$d/uu.txt"; printf 'x\n' > "$d/s.txt"
+git -C "$d" add -A; git -C "$d" commit -q -m base
+git -C "$d" checkout -q -b other
+printf 'theirs\n' > "$d/uu.txt"; git -C "$d" commit -q -am theirs
+git -C "$d" checkout -q main
+printf 'ours\n' > "$d/uu.txt"; git -C "$d" commit -q -am ours
+git -C "$d" merge -q other >/dev/null 2>&1 || true
+printf 'y\n' > "$d/s.txt"; git -C "$d" add s.txt
+record merge "$d"
+
 # git rm --cached: D in Staged and ? in Changes for the same path.
 d=$(new_repo rm-cached)
 printf 'kept on disk\n' > "$d/f.txt"
@@ -126,6 +138,32 @@ printf '2\n' > "$d/dir with space/naïve file.txt"
 printf 'u\n' > "$d/ünï cødé.md"
 git -C "$d" mv "dir with space/naïve file.txt" "dir with space/naïve → renamed.txt" 2>/dev/null || true
 record unicode "$d"
+
+# a tracked file deleted and replaced by a directory that holds an untracked
+# file and a nested repository: ` D foo` next to `? foo/x` and `? foo/sub/`.
+d=$(new_repo deleted-dir)
+printf 'was a file\n' > "$d/foo"; printf 'k\n' > "$d/keep"
+git -C "$d" add -A; git -C "$d" commit -q -m base
+rm "$d/foo"; mkdir -p "$d/foo"; printf 'u\n' > "$d/foo/x"
+git init -q -b main "$d/foo/sub"; printf 's\n' > "$d/foo/sub/s"
+git -C "$d/foo/sub" add -A; git -C "$d/foo/sub" commit -q -m s
+record deleted-dir "$d"
+
+# symbolic links: a tracked link retargeted (.M, 120000 on every side), a
+# file replaced by a link (.T, worktree 120000), a link retargeted and
+# staged (M.), a file replaced by a link and staged (T.), and an untracked
+# link (?, which carries no mode).
+d=$(new_repo symlink)
+printf 'a\n' > "$d/a.txt"; printf 'b\n' > "$d/b.txt"
+printf 'f\n' > "$d/file.txt"; printf 'g\n' > "$d/staged-file.txt"
+ln -s a.txt "$d/link"; ln -s a.txt "$d/staged-link"
+git -C "$d" add -A; git -C "$d" commit -q -m base
+ln -sfn b.txt "$d/link"
+rm "$d/file.txt"; ln -s b.txt "$d/file.txt"
+ln -sfn b.txt "$d/staged-link"; git -C "$d" add staged-link
+rm "$d/staged-file.txt"; ln -s b.txt "$d/staged-file.txt"; git -C "$d" add staged-file.txt
+ln -s a.txt "$d/new-link"
+record symlink "$d"
 
 # clean repository.
 d=$(new_repo clean)

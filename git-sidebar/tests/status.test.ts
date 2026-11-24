@@ -44,6 +44,24 @@ test("conflicts (UU, AA, DU) go to Changes as !", () => {
   assert.deepEqual(r.changes, ["aa.txt !", "du.txt !", "uu.txt !"]);
 });
 
+test("conflicted entries carry their two-letter state (A4; for R14 and R16)", () => {
+  const { s } = parsed("conflict");
+  // Wrong field offsets in a `u` record would misread the path or the XY.
+  assert.deepEqual(
+    s.changes.map((e) => [e.path, e.conflict]),
+    [["aa.txt", "AA"], ["du.txt", "DU"], ["uu.txt", "UU"]],
+  );
+  // Ordinary entries carry no conflict field.
+  assert.ok(parsed("acceptance").s.changes.every((e) => !("conflict" in e)));
+});
+
+test("a merge in progress: the UU path under Changes as !, the staged file under Staged", () => {
+  const r = parsed("merge");
+  assert.deepEqual(r.staged, ["s.txt M"]);
+  assert.deepEqual(r.changes, ["uu.txt !"]);
+  assert.equal(r.s.changes[0].conflict, "UU");
+});
+
 test("rm --cached gives D in Staged and U in Changes", () => {
   const r = parsed("rm-cached");
   assert.deepEqual(r.staged, ["f.txt D"]);
@@ -123,4 +141,20 @@ test("an untracked nested repository (`dir/`) and a submodule are directories", 
     { path: "vendor/lib/", marker: "U", dir: true },
   ]);
   assert.deepEqual(s.staged, [{ path: "plain.txt", marker: "M" }]);
+});
+
+test("a working-tree symbolic link (mW 120000) marks the Changes entry only; `?` records carry no mode (R14, F7)", () => {
+  const s = parseStatus(fixture("symlink"));
+  assert.deepEqual(
+    s.changes.map((e) => [e.path, e.marker, e.link === true]),
+    [["file.txt", "T", true], ["link", "M", true], ["new-link", "U", false]],
+  );
+  // Staged rows compare HEAD with the index: no flag, even for a link.
+  assert.deepEqual(s.staged.map((e) => [e.path, e.marker, "link" in e]), [["staged-file.txt", "T", false], ["staged-link", "M", false]]);
+  // A conflicted link: `u XY sub m1 m2 m3 mW …`.
+  const u = parseStatus(raw({ records: [`u UU N... 120000 120000 120000 120000 ${H} ${H} ${H} l`, `u UU N... 100644 100644 100644 100644 ${H} ${H} ${H} f`] }));
+  assert.deepEqual(u.changes.map((e) => [e.path, e.link === true]), [["f", false], ["l", true]]);
+  // Only the worktree mode counts: a link replaced by a file is not one.
+  const back = parseStatus(raw({ records: [`1 .T N... 120000 120000 100644 ${H} ${H} t`] }));
+  assert.equal(back.changes[0].link, undefined);
 });
