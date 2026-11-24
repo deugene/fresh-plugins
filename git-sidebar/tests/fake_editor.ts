@@ -73,6 +73,25 @@ export class FakeEditor {
   sizes = new Map<string, number>();
   /** When set, `createCompositeBuffer` settles only after this does. */
   compositeGate: Promise<void> | null = null;
+  /** What `getCompositeCursorInfo` resolves with (null: the active buffer
+   *  is not a composite), or a promise the test settles. */
+  cursorInfo: { focusedPane: number; paneCount: number; lines: (number | null)[] } | null | Promise<unknown> = null;
+  /** Buffers open in the editor that the plugin did not make, by path: the
+   *  id `findBufferByPath` gives and the text `getBufferText` gives, which
+   *  may differ from the file on disk (unsaved edits). */
+  userBuffers = new Map<string, { id: number; text: string }>();
+  /** `getBufferPath` by buffer id ("" for any other, as for a virtual buffer). */
+  bufferPaths = new Map<number, string>();
+  /** What `getActiveBufferId` gives: the buffer `showBuffer` last showed,
+   *  or one a test sets, as a tab change would. */
+  activeBuffer = 0;
+  /** What `listPlugins` lists: by default merge_conflict, enabled. */
+  plugins: { name: string; path: string; enabled: boolean }[] = [{ name: "merge_conflict", path: "merge_conflict.ts", enabled: true }];
+  /** What each `prompt` resolves with, in order (null: Esc), or a promise
+   *  the test settles. With none left, Esc. */
+  promptAnswers: (string | null | Promise<string | null>)[] = [];
+  /** When set, `listPlugins` settles only after this does. */
+  pluginsGate: Promise<void> | null = null;
   calls: Call[] = [];
   procs: ProcCall[] = [];
   /** Every process started, never cleared. */
@@ -163,7 +182,14 @@ export class FakeEditor {
   async command(name: string): Promise<void> {
     const handler = this.commands.get(name);
     if (handler === undefined) throw new Error(`no command ${name}`);
-    await this.globals.get(handler)?.();
+    await this.fire(handler);
+  }
+
+  /** Run a handler the plugin registered, as a key bound to it would. */
+  async fire(handler: string): Promise<void> {
+    const fn = this.globals.get(handler);
+    if (fn === undefined) throw new Error(`no handler ${handler}`);
+    await fn();
     await this.flush();
   }
 
@@ -315,6 +341,31 @@ export class FakeEditor {
       ),
       readFile: rec("readFile", (p: string) => (this.files.has(p) ? (this.contents.has(p) ? this.contents.get(p)! : "") : null)),
       openFile: rec("openFile", () => true),
+      getBufferPath: rec("getBufferPath", (id: number) => this.bufferPaths.get(id) ?? ""),
+      findBufferByPath: rec("findBufferByPath", (p: string) => this.userBuffers.get(p)?.id ?? 0),
+      // Only `length` is read: the size of a user buffer's text.
+      getBufferInfo: rec("getBufferInfo", (id: number) => {
+        const b = [...this.userBuffers.values()].find((x) => x.id === id);
+        return b === undefined ? null : { id, length: b.text.length };
+      }),
+      getBufferText: (id: number) => {
+        this.record("getBufferText", [id]);
+        const b = [...this.userBuffers.values()].find((x) => x.id === id);
+        return Promise.resolve(b?.text ?? "");
+      },
+      executeAction: rec("executeAction", () => true),
+      prompt: (label: string, initial: string) => {
+        this.record("prompt", [label, initial]);
+        return Promise.resolve(this.promptAnswers.length > 0 ? this.promptAnswers.shift()! : null);
+      },
+      listPlugins: () => {
+        this.record("listPlugins", []);
+        return (this.pluginsGate ?? Promise.resolve()).then(() => this.plugins.map((p) => ({ ...p })));
+      },
+      getCompositeCursorInfo: () => {
+        this.record("getCompositeCursorInfo", []);
+        return Promise.resolve(this.cursorInfo);
+      },
       setStatus: rec("setStatus", () => undefined),
       debug: rec("debug", () => undefined),
       info: rec("info", () => undefined),
@@ -359,7 +410,11 @@ export class FakeEditor {
         const newCount = y.length - pre - suf;
         return oldCount === 0 && newCount === 0 ? [] : [{ oldStart: pre, oldCount, newStart: pre, newCount }];
       }),
-      showBuffer: rec("showBuffer", () => true),
+      showBuffer: rec("showBuffer", (id: number) => {
+        this.activeBuffer = id;
+        return true;
+      }),
+      getActiveBufferId: rec("getActiveBufferId", () => this.activeBuffer),
       closeBuffer: rec("closeBuffer", (id: number) => this.closeBuffer(id)),
       // As in Fresh 0.5.9: drops the composite's state, not the buffer
       // (INV §9.4, P9 c). Only closeBuffer closes it.

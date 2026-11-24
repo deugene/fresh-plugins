@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { containerId, detectMode, isDefinitiveFailure, normalise, objectId, run, runWrite, within, STATUS_ARGS, WRITE_TIMEOUT_MS, type GitResult, type Handle, type Runner } from "../lib/git.ts";
+import { commitMessage, containerId, detectMode, isDefinitiveFailure, normalise, objectId, run, runWrite, within, STATUS_ARGS, WRITE_TIMEOUT_MS, type GitResult, type Handle, type Runner } from "../lib/git.ts";
 import { GS_VOLUME as VOLUME, inspectResult as mounts, pwdResult as pwd } from "./helpers.ts";
 
 const ROOT = "/Users/me/src/repo";
@@ -247,4 +247,16 @@ test("objectId takes only an object id from rev-parse's output", () => {
   // Without --verify, rev-parse echoes an argument that names a file, with rc 0.
   assert.equal(objectId("HEAD:absent\n"), null);
   assert.equal(objectId(""), null);
+});
+
+test("commitMessage: the short id and the subject git recorded; without an id, still committed (R26)", () => {
+  const ok = (stdout: string): GitResult => ({ code: 0, stdout, stderr: "", timedOut: false });
+  assert.equal(commitMessage(ok("abc1234\n[ABC-12] fix typo\n"), "fix typo"), "committed abc1234: [ABC-12] fix typo");
+  // A subject that starts with `-` or `#` is kept; none from git: the one typed.
+  assert.equal(commitMessage(ok("abc1234\n-x\n"), "-x"), "committed abc1234: -x");
+  assert.equal(commitMessage(ok("abc1234\n"), "first"), "committed abc1234: first");
+  // Nothing (a non-UTF-8 stdout through `spawnHostProcess`, INV §8 P17), not an id, or a failed read.
+  assert.equal(commitMessage(ok(""), "first"), "committed: first");
+  assert.equal(commitMessage(ok("fatal: bad\n"), "first"), "committed: first");
+  assert.equal(commitMessage({ code: 128, stdout: "abc1234\nfirst\n", stderr: "fatal", timedOut: false }, "first"), "committed: first");
 });

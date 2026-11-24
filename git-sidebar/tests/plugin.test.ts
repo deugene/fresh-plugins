@@ -4,6 +4,8 @@ import { createHash } from "node:crypto";
 import { deferred, FakeEditor, type ProcCall, type ProcOutcome } from "./fake_editor.ts";
 import { rowKind, UNKNOWN_NOTICE, VOLUME_NOTICE, type TreeSpec } from "../lib/view.ts";
 import { NOTHING_SELECTED } from "../lib/actions.ts";
+import { DIFF_HINT } from "../lib/diff.ts";
+import { COMMIT_BUSY } from "../lib/stage.ts";
 import { fixture, GS_VOLUME, H, inspectResult, manyUntracked, mod, pathsOf, pwdResult, raw, texts, untracked } from "./helpers.ts";
 
 const ACCEPTANCE = fixture("acceptance");
@@ -31,8 +33,11 @@ interface Repo {
   blobs?: Record<string, string>;
   /** `cat-file -s` sizes that differ from the content's length. */
   blobSizes?: Record<string, number>;
-  /** A write (`--literal-pathspecs …`): its result, by default rc 0. */
+  /** A write (`--literal-pathspecs …`, or `commit …`): its result, by default rc 0. */
   onWrite?: (c: ProcCall) => ProcOutcome | void;
+  /** What the summary read after a commit (`log -1 … HEAD`) gives: by
+   *  default `abc1234` and the last commit's message, with rc 0. */
+  headLog?: ProcOutcome;
 }
 
 /** The acceptance fixture's objects the diffs read. */
@@ -52,11 +57,15 @@ const oidOf = (spec: string): string => createHash("sha1").update(spec).digest("
 const specOf = (repo: Repo, arg: string): string => Object.keys(repo.blobs ?? {}).find((s) => oidOf(s) === arg) ?? arg;
 
 function repoScript(repo: Repo): (c: ProcCall) => ProcOutcome {
+  let lastMessage = "";
   return (c) => {
     if (c.program === "docker") return repo.inspect ?? { code: 1, stdout: "", stderr: "no such container" };
     if (c.program === "pwd") return repo.pwd ?? BIND_PWD;
     if (c.program !== "git") return { code: 127, stdout: "", stderr: "unknown program" };
-    if (c.args[0] === "--literal-pathspecs") return repo.onWrite?.(c) ?? { code: 0, stdout: "", stderr: "" };
+    // A commit is a write too, without the flag (INV §8 P30).
+    if (c.args[0] === "commit") lastMessage = c.args[3] ?? "";
+    if (c.args[0] === "--literal-pathspecs" || c.args[0] === "commit") return repo.onWrite?.(c) ?? { code: 0, stdout: "", stderr: "" };
+    if (c.args[1] === "log") return repo.headLog ?? { code: 0, stdout: `abc1234\n${lastMessage}\n`, stderr: "" };
     if (c.args[0] === "rev-parse" && c.args[1] !== "--show-toplevel") {
       const spec = c.args[1];
       return repo.blobs?.[spec] === undefined ? { code: 128, stdout: "", stderr: `fatal: path '${spec}' does not exist` } : { code: 0, stdout: `${oidOf(spec)}\n`, stderr: "" };
@@ -110,11 +119,15 @@ const sentSpecs = () =>
 const lastShown = () => sentSpecs().at(-1)!;
 const hasFileRows = (spec: TreeSpec) => spec.itemKeys.some((k) => rowKind(k).kind === "file");
 
+const FOCUS = "Git Sidebar: Focus";
+/** The palette commands listed now, sorted. */
+const listedNow = () => [...fake.palette()].filter(([, listed]) => listed).map(([name]) => name).sort();
+
 /** A click on a row body, as the host reports it for a file row. */
 const click = (index: number, key: string) => fake.widget("select", { index, key, via: "click" });
 const statuses = () => fake.named("setStatus").map((c) => c.args[0] as string);
-/** The argv of every git write (`--literal-pathspecs …`) so far. */
-const writes = () => fake.gitCalls().filter((p) => p.args[0] === "--literal-pathspecs").map((p) => p.args);
+/** The argv of every git write (`--literal-pathspecs …`, or `commit …`) so far. */
+const writes = () => fake.gitCalls().filter((p) => p.args[0] === "--literal-pathspecs" || p.args[0] === "commit").map((p) => p.args);
 /** Every `cat-file` read so far, each object id shown as the spec it was
  *  resolved from. */
 const catFiles = () =>
@@ -135,6 +148,13 @@ const shownBuffers = () => fake.named("showBuffer").map((c) => c.args[0] as numb
 /** Each source's text, left then right, of every view built. */
 const sourceTexts = () => vbufOpts().map((o) => o.entries.map((e) => e.text).join(""));
 
+/** A fresh editor for a second scenario within one test. */
+function restartFake(): void {
+  fake.uninstall();
+  fake = new FakeEditor();
+  fake.install();
+}
+
 beforeEach(() => {
   fake = new FakeEditor();
   fake.install();
@@ -146,9 +166,12 @@ afterEach(() => {
   process.off("unhandledRejection", onRejection);
   fake.uninstall();
   assert.deepEqual(rejections, [], "unhandled rejections");
-  // Every git run is a lock-free read, or a write with literal paths (R11, R15).
+  // Every git run is a lock-free read, a write with literal paths (R11,
+  // R15), or a commit, which names no paths and must not export the flag to
+  // hooks (R26, INV §8 P30).
   for (const p of fake.allProcs.filter((x) => x.program === "git")) {
-    assert.ok(["--no-optional-locks", "rev-parse", "--literal-pathspecs"].includes(p.args[0]), p.args.join(" "));
+    assert.ok(["--no-optional-locks", "rev-parse", "--literal-pathspecs", "commit"].includes(p.args[0]), p.args.join(" "));
+    if (p.args[0] === "commit") assert.ok(!p.args.includes("--literal-pathspecs"), p.args.join(" "));
   }
 });
 
@@ -278,8 +301,9 @@ test("branch change: remount with all options, then push expansion and selection
   assert.deepEqual(m[0].spec.expandedKeys, ["g:s"]);
   assertEveryMountHasOptions();
   const names = fake.widgetCalls().map((c) => c.name);
-  // No "focus": the host's focus reveals a hidden explorer or a collapsed
-  // section, and no blur arrives when the user hides either.
+  // No "focus": the host's focus shows a hidden explorer column and expands
+  // a collapsed section (INV §8 P27), and the section never takes the
+  // keyboard by itself (R1, R22).
   assert.deepEqual(names, ["mountSidebarSection", "widgetMutate", "widgetMutate"]);
   assert.deepEqual(mutations(), [
     { kind: "setExpandedKeys", widgetKey: "git", keys: ["g:s"] },
@@ -328,7 +352,8 @@ test("Enter on a file row opens its diff, never the file; Space stages it; Enter
   await fake.advance(50);
   assert.deepEqual(sourceTexts().slice(2), ["# b", "# b\nchanged"]);
   assert.equal(fake.named("openFile").length, 0);
-  assert.deepEqual(statuses(), []);
+  // Each diff names its keys (R20), and nothing else is said.
+  assert.deepEqual(statuses(), [DIFF_HINT, DIFF_HINT]);
   fake.clear();
   // Space on a file row stages it, and opens no buffer or file (R7, R15).
   await fake.widget("activate", { index: 5, key: "c:b.md", via: "space" });
@@ -825,12 +850,12 @@ test("a deleted file whose path is now a directory: an empty right side, and Vie
   await click(2, "c:docs");
   await fake.advance(50);
   assert.deepEqual(sourceTexts(), ["was a file", ""]);
-  assert.deepEqual(statuses(), []);
+  assert.deepEqual(statuses(), [DIFF_HINT]);
   // An empty side needs no line diff: the host is not sent the other side for it.
   assert.equal(fake.named("computeLineDiff").length, 0);
   await fake.command("Git Sidebar: View File");
   assert.equal(fake.named("openFile").length, 0);
-  assert.deepEqual(statuses(), ["docs is a directory"]);
+  assert.deepEqual(statuses(), [DIFF_HINT, "docs is a directory"]);
 });
 
 test("View File on a name that is not UTF-8 says so, not that the file is deleted (R7, F6)", async () => {
@@ -889,6 +914,8 @@ test("a click on a file row opens one read-only side-by-side diff, never the fil
     assert.equal(o.hiddenFromTabs, true);
   }
   assert.deepEqual(sourceTexts(), ["# b", "# b\nchanged"]);
+  // No space after the `:`: Fresh picks the grammar from the text after it (R21, INV §8 P26).
+  assert.deepEqual(vbufOpts().map((o) => o.name), ["*Staged:b.md*", "*Working tree:b.md*"]);
   const c = compositeOpts()[0];
   assert.equal(c.name, "b.md (staged ↔ working tree)");
   assert.equal(c.mode, "git-sidebar-diff");
@@ -899,12 +926,14 @@ test("a click on a file row opens one read-only side-by-side diff, never the fil
   assert.equal(shownBuffers().length, 1);
   assert.equal(fake.openBuffers().size, 3);
   assert.ok(fake.openBuffers().has(shownBuffers()[0]));
-  assert.deepEqual(statuses(), []);
+  // The hint, once the view is shown (R20).
+  assert.deepEqual(statuses(), [DIFF_HINT]);
+  assert.ok(fake.calls.findIndex((x) => x.name === "setStatus") > fake.calls.findIndex((x) => x.name === "showBuffer"));
 });
 
-test("the diff mode is defined at load, read-only, with no keys of its own", async () => {
+test("the diff mode is defined at load, read-only, binding Enter only: Fresh's n, p, ], [, q and Esc fall through (R19, R20)", async () => {
   await load({ status: ACCEPTANCE, code: 0 });
-  assert.deepEqual(fake.named("defineMode").map((c) => c.args), [["git-sidebar-diff", [], true]]);
+  assert.deepEqual(fake.named("defineMode").map((c) => c.args), [["git-sidebar-diff", [["Enter", "gitSidebar_diffEnter"]], true]]);
 });
 
 test("Enter opens the same diff as a click; a Staged row compares HEAD with the index (R14)", async () => {
@@ -1077,7 +1106,7 @@ test("a working-tree file gone between its stat and its read diffs against an em
   fake.returns.set("readFile", [undefined]);
   await click(2, "c:new.txt");
   await fake.advance(50);
-  assert.deepEqual(statuses(), []);
+  assert.deepEqual(statuses(), [DIFF_HINT]);
   assert.deepEqual(sourceTexts(), ["", ""]);
 });
 
@@ -1197,21 +1226,31 @@ test("palette context: on while rows are shown, off under a notice, after giving
   await fake.advance(1000);
   assert.deepEqual(texts(lastShown()), [VOLUME_NOTICE]);
   assert.equal(fake.contextOn("git-sidebar-rows"), false);
-  assert.ok([...fake.palette().values()].every((listed) => !listed));
+  // Under the notice only Focus is listed (R22, A18).
+  assert.deepEqual(listedNow(), [FOCUS]);
   fake.label = "";
   await fake.emit("authority_changed", { label: "" });
   await fake.advance(1000);
   assert.equal(fake.contextOn("git-sidebar-rows"), true);
   await fake.widget("cancel");
   assert.equal(fake.contextOn("git-sidebar-rows"), false);
+  assert.equal(fake.contextOn("git-sidebar-shown"), false);
+  assert.deepEqual(listedNow(), [], "nothing after the end");
 });
 
 test("palette context stays off when git gives up before showing anything", async () => {
   await load({ status: "", code: 128 });
   await fake.advance(1000);
   assert.equal(fake.contextOn("git-sidebar-rows"), false);
-  // Only the clear at load (F14).
-  assert.deepEqual(fake.named("setContext").map((c) => c.args), [["git-sidebar-rows", false]]);
+  // The clears at load (F14); then the placeholder is shown, and taken down
+  // with Focus when git gives up (R22).
+  assert.deepEqual(fake.named("setContext").map((c) => c.args), [
+    ["git-sidebar-rows", false],
+    ["git-sidebar-shown", false],
+    ["git-sidebar-shown", true],
+    ["git-sidebar-shown", false],
+  ]);
+  assert.deepEqual(listedNow(), []);
 });
 
 // ---------------------------------------------------------------------------
@@ -1678,7 +1717,10 @@ test("a group op across an authority change stops and only logs", async () => {
 // R18: the rest of the palette
 // ---------------------------------------------------------------------------
 
-const FIVE = [
+/** The commands listed while the section shows rows (R18). */
+const ROW_COMMANDS = [
+  "Git Sidebar: Commit…",
+  "Git Sidebar: Resolve Conflict",
   "Git Sidebar: Stage All",
   "Git Sidebar: Stage or Unstage",
   "Git Sidebar: Unstage All",
@@ -1686,10 +1728,14 @@ const FIVE = [
   "Git Sidebar: View File",
 ];
 
-test("all five commands are registered, under the rows context (R18)", async () => {
+test("eight commands are registered: the row commands under the rows context, Focus under the shown one (R18, R22)", async () => {
   await load({ status: ACCEPTANCE, code: 0 });
-  assert.deepEqual([...fake.palette().keys()].sort(), FIVE);
-  for (const c of fake.named("registerCommand")) assert.equal(c.args[3], "git-sidebar-rows", String(c.args[0]));
+  assert.equal(fake.palette().size, 8);
+  assert.deepEqual([...fake.palette().keys()].sort(), [...ROW_COMMANDS, FOCUS].sort());
+  for (const c of fake.named("registerCommand")) {
+    assert.equal(c.args[3], c.args[0] === FOCUS ? "git-sidebar-shown" : "git-sidebar-rows", String(c.args[0]));
+  }
+  assert.equal(fake.named("registerCommand").find((c) => c.args[0] === FOCUS)!.args[2], "gitSidebar_focus");
   await fake.advance(200);
   assert.ok([...fake.palette().values()].every((listed) => listed));
 });
@@ -1743,11 +1789,11 @@ test("volume mode: the context is off, and a command run anyway changes nothing 
   await load({ status: ACCEPTANCE, code: 0, inspect: VOLUME_INSPECT, pwd: VOLUME_PWD });
   await fake.advance(1000);
   assert.equal(fake.contextOn("git-sidebar-rows"), false);
-  assert.ok([...fake.palette().values()].every((listed) => !listed));
-  for (const name of FIVE) await fake.command(name);
+  assert.deepEqual(listedNow(), [FOCUS], "only Focus under the notice (A18)");
+  for (const name of ROW_COMMANDS) await fake.command(name);
   await fake.advance(1000);
   assert.deepEqual(fake.gitCalls(), []);
-  assert.equal(statuses().length, 5);
+  assert.equal(statuses().length, ROW_COMMANDS.length);
 });
 
 // ---------------------------------------------------------------------------
@@ -1771,7 +1817,7 @@ test("right-click: a menu at the pointer listing the row's actions (R17, A17)", 
   assert.deepEqual(menuMounts(), [
     { id: 2, labels: ["View Diff", "View File", "Stage"] },
     { id: 2, labels: ["View Diff", "View File", "Unstage"] },
-    { id: 2, labels: ["Unstage All"] },
+    { id: 2, labels: ["Unstage All", "Commit…"] },
     { id: 2, labels: ["Stage All"] },
   ]);
   // Anchored under the cell the host reported, each time.
@@ -2124,9 +2170,774 @@ test("load clears a rows context a previous load left set, before any rows (R18,
   (fake.api().setContext as (n: string, on: boolean) => void)("git-sidebar-rows", true);
   fake.clear();
   await load({ status: ACCEPTANCE, code: 0, statusOutcome: () => "hang" });
-  assert.deepEqual(fake.named("setContext").map((c) => c.args), [["git-sidebar-rows", false]]);
+  // Both cleared before the placeholder mounts; the mount then sets the shown one (R22).
+  assert.deepEqual(fake.named("setContext").map((c) => c.args), [
+    ["git-sidebar-rows", false],
+    ["git-sidebar-shown", false],
+    ["git-sidebar-shown", true],
+  ]);
   const order = fake.calls.map((c) => c.name).filter((n) => n === "setContext" || n === "mountSidebarSection");
-  assert.deepEqual(order, ["setContext", "mountSidebarSection"]);
+  assert.deepEqual(order, ["setContext", "setContext", "mountSidebarSection", "setContext"]);
   assert.equal(fake.contextOn("git-sidebar-rows"), false);
-  assert.ok([...fake.palette().values()].every((listed) => !listed), "nothing listed under the placeholder");
+  assert.deepEqual(listedNow(), [FOCUS], "only Focus under the placeholder");
+});
+
+// ---------------------------------------------------------------------------
+// R19, R20: Enter in the diff
+// ---------------------------------------------------------------------------
+
+/** Enter in the diff, with the host's cursor info `lines` (right pane focused). */
+async function diffEnter(lines: (number | null)[] | null): Promise<void> {
+  fake.cursorInfo = lines === null ? null : { focusedPane: 1, paneCount: 2, lines };
+  await fake.fire("gitSidebar_diffEnter");
+  await fake.advance(50);
+}
+const opened = () => fake.named("openFile").map((c) => c.args);
+
+test("Enter in a Changes diff opens the file at the working-tree line; the diff stays (R19, INV §8 P25)", async () => {
+  await loadAcceptance();
+  await click(5, "c:b.md");
+  await fake.advance(50);
+  const view = fake.openBuffers();
+  assert.equal(view.size, 3);
+  // The added line 2: no left line, right line 1 (0-based).
+  await diffEnter([null, 1]);
+  assert.deepEqual(opened(), [["/repo/b.md", 2]]);
+  assert.deepEqual(fake.openBuffers(), view, "the composite and both sources stay open");
+  assert.equal(fake.named("closeBuffer").length + fake.named("closeCompositeBuffer").length, 0);
+  // A context row: both panes have a line, and the right one is opened.
+  fake.clear();
+  await diffEnter([0, 0]);
+  assert.deepEqual(opened(), [["/repo/b.md", 1]]);
+});
+
+test("Enter on a removed line opens the right-hand line after it, not the file's last line (R19, A19)", async () => {
+  await loadAcceptance({ blobs: { ...ACC_BLOBS, ":0:b.md": "# b\nold\nkeep1\nkeep2\n" } });
+  fake.contents.set("/repo/b.md", "# b\nkeep1\nkeep2\n");
+  await click(5, "c:b.md");
+  await fake.advance(50);
+  // Left line 1 (`old`) has no right line: the next one shown is `keep1`,
+  // right line 1, where the file's last line would be 3.
+  await diffEnter([1, null]);
+  assert.deepEqual(opened(), [["/repo/b.md", 2]]);
+});
+
+test("Enter in a Staged diff opens the same line number in the file on disk (R19)", async () => {
+  await loadAcceptance();
+  await click(1, "s:a.ts");
+  await fake.advance(50);
+  await diffEnter([0, 0]);
+  assert.deepEqual(opened(), [["/repo/a.ts", 1]]);
+});
+
+test("Enter clamps to the lines the tab will show: the file on disk, or the open buffer (R19)", async () => {
+  await loadAcceptance();
+  await click(5, "c:b.md");
+  await fake.advance(50);
+  // b.md on disk is now one line: line 2 would land on the host's line 1.
+  fake.contents.set("/repo/b.md", "# b\n");
+  await diffEnter([null, 1]);
+  assert.deepEqual(opened(), [["/repo/b.md", 1]]);
+  // Open in the editor with unsaved edits: that buffer's lines count, not the disk's.
+  fake.clear();
+  fake.contents.set("/repo/b.md", "1\n2\n3\n4\n5\n");
+  fake.userBuffers.set("/repo/b.md", { id: 7, text: "only\ntwo" });
+  await diffEnter([null, 4]);
+  assert.deepEqual(opened(), [["/repo/b.md", 2]]);
+  assert.deepEqual(fake.named("getBufferText").map((c) => c.args), [[7]]);
+  assert.equal(fake.named("readFile").length, 0);
+  // An empty file: line 1.
+  fake.clear();
+  fake.userBuffers.clear();
+  fake.contents.set("/repo/b.md", "");
+  await diffEnter([null, 1]);
+  assert.deepEqual(opened(), [["/repo/b.md", 1]]);
+  // A file that gives no text (not UTF-8): the line is passed as it is.
+  fake.clear();
+  fake.contents.set("/repo/b.md", undefined);
+  await diffEnter([null, 6]);
+  assert.deepEqual(opened(), [["/repo/b.md", 7]]);
+  // Too large for a diff to read: not read here either, and the line is passed as it is.
+  fake.clear();
+  fake.contents.set("/repo/b.md", "1\n");
+  fake.sizes.set("/repo/b.md", 6 * 1024 * 1024);
+  await diffEnter([null, 6]);
+  assert.deepEqual(opened(), [["/repo/b.md", 7]]);
+  assert.equal(fake.named("readFile").length, 0);
+  // An open buffer that large: its text is not fetched either.
+  fake.clear();
+  fake.userBuffers.set("/repo/b.md", { id: 7, text: "x".repeat(6 * 1024 * 1024) });
+  await diffEnter([null, 6]);
+  assert.deepEqual(opened(), [["/repo/b.md", 7]]);
+  assert.equal(fake.named("getBufferText").length, 0);
+});
+
+test("Enter in a deleted file's diff says it is deleted and opens nothing (R19, R7)", async () => {
+  await loadAcceptance();
+  await click(6, "c:gone.ts");
+  await fake.advance(50);
+  fake.clear();
+  await diffEnter([0, null]);
+  assert.equal(fake.named("openFile").length, 0);
+  assert.equal(fake.named("readFile").length, 0, "View File's checks come before any read");
+  assert.deepEqual(statuses(), ["gone.ts is deleted"]);
+});
+
+test("Enter does nothing without a composite cursor, after the view closed, or for a view replaced meanwhile (R19)", async () => {
+  await loadAcceptance();
+  await click(5, "c:b.md");
+  await fake.advance(50);
+  const composite = shownBuffers()[0];
+  fake.clear();
+  await diffEnter(null);
+  assert.deepEqual(opened(), []);
+  // The view closed by the user: nothing to act on.
+  await fake.closeTab(composite);
+  await fake.advance(50);
+  fake.clear();
+  await diffEnter([null, 1]);
+  assert.deepEqual(opened(), []);
+  // Replaced while the host answered: the answer is for the old view.
+  await click(5, "c:b.md");
+  await fake.advance(50);
+  fake.clear();
+  let answer!: (v: unknown) => void;
+  fake.cursorInfo = new Promise((r) => (answer = r));
+  const pending = fake.fire("gitSidebar_diffEnter");
+  await click(1, "s:a.ts");
+  await fake.advance(50);
+  answer({ focusedPane: 1, paneCount: 2, lines: [null, 1] });
+  await pending;
+  await fake.advance(50);
+  assert.deepEqual(opened(), []);
+  assert.deepEqual(fake.loudCalls().filter((c) => c.name !== "setStatus"), []);
+});
+
+// ---------------------------------------------------------------------------
+// R22: Focus
+// ---------------------------------------------------------------------------
+
+const focusCalls = () => fake.named("floatingPanelControl").map((c) => c.args).filter((a) => a[1] === "focus");
+
+test("Focus with nothing selected selects the first row, then moves the keyboard in (R22)", async () => {
+  await loadAcceptance();
+  await fake.command(FOCUS);
+  assert.deepEqual(mutations(), [{ kind: "setSelectedIndex", widgetKey: "git", index: 0 }]);
+  assert.deepEqual(focusCalls(), [[1, "focus", 0]]);
+  // The selection order: the row first, then the keyboard.
+  const names = fake.widgetCalls().map((c) => c.name);
+  assert.deepEqual(names, ["widgetMutate", "floatingPanelControl"]);
+  assert.deepEqual(statuses(), []);
+  // That row is the selection the row commands act on.
+  await fake.command("Git Sidebar: Stage or Unstage");
+  assert.deepEqual(statuses(), ["Stage or Unstage needs a file row selected; use Stage All or Unstage All for a group"]);
+});
+
+test("Focus keeps an existing selection (R22)", async () => {
+  await loadAcceptance();
+  await fake.widget("select", { index: 5, key: "c:b.md" });
+  fake.clear();
+  await fake.command(FOCUS);
+  assert.deepEqual(mutations(), []);
+  assert.deepEqual(focusCalls(), [[1, "focus", 0]]);
+});
+
+test("Focus under the placeholder and the volume notice moves the keyboard in, with no message (R22, A18)", async () => {
+  await load({ status: ACCEPTANCE, code: 0, statusOutcome: () => "hang" });
+  fake.clear();
+  await fake.command(FOCUS);
+  assert.deepEqual(focusCalls(), [[1, "focus", 0]]);
+  assert.deepEqual(mutations(), [], "no rows to select under the placeholder");
+  assert.deepEqual(statuses(), []);
+  restartFake();
+  fake.label = "Container:vol";
+  await load({ status: ACCEPTANCE, code: 0, inspect: VOLUME_INSPECT, pwd: VOLUME_PWD });
+  await fake.advance(1000);
+  assert.deepEqual(texts(lastShown()), [VOLUME_NOTICE]);
+  fake.clear();
+  await fake.command(FOCUS);
+  assert.deepEqual(focusCalls(), [[1, "focus", 0]]);
+  assert.deepEqual(statuses(), []);
+  assert.deepEqual(fake.gitCalls(), []);
+});
+
+test("Focus is not listed outside a repository; run from a key binding there, it says so and sends nothing (R22)", async () => {
+  await load({ status: "", code: 128 }, { git: false });
+  await fake.advance(1000);
+  assert.deepEqual(listedNow(), []);
+  fake.clear();
+  await fake.fire("gitSidebar_focus");
+  assert.deepEqual(focusCalls(), []);
+  assert.deepEqual(statuses(), ["the Git section is not shown"]);
+});
+
+test("load, refreshes and remounts never send focus: only the Focus command does (R22, R1)", async () => {
+  const repo: Repo = { status: ACCEPTANCE, code: 0 };
+  await load(repo);
+  await fake.advance(200);
+  repo.status = raw({ records: [untracked("x.txt")] });
+  await fake.emit("after_file_save", {});
+  await fake.advance(1000);
+  repo.status = repo.status.replace("# branch.head main", "# branch.head other");
+  await fake.emit("focus_gained", {});
+  await fake.advance(1000);
+  assert.ok(mounts().length >= 3, "the branch change remounted");
+  assert.deepEqual(focusCalls(), []);
+});
+
+// ---------------------------------------------------------------------------
+// R25: Resolve Conflict
+// ---------------------------------------------------------------------------
+
+async function loadConflict(): Promise<void> {
+  await load({ status: fixture("conflict"), code: 0 });
+  await fake.advance(200);
+  // uu.txt and aa.txt hold their markers; du.txt is deleted by us and absent.
+  fake.files.add("/repo/uu.txt");
+  fake.files.add("/repo/aa.txt");
+  fake.clear();
+}
+const actions = () => fake.named("executeAction").map((c) => c.args[0]);
+
+test("Resolve Conflict from the menu and the palette: the file opens, then Fresh's resolution starts on it; no write (R25, A25)", async () => {
+  await loadConflict();
+  // keys: g:s g:c c:aa.txt c:du.txt c:uu.txt
+  await rightClick(4, "c:uu.txt");
+  assert.deepEqual(menuMounts().map((m) => m.labels), [["View Diff", "View File", "Resolve Conflict"]]);
+  await choose("resolve");
+  await fake.advance(50);
+  assert.deepEqual(opened(), [["/repo/uu.txt"]]);
+  assert.deepEqual(actions(), ["start_merge_conflict"]);
+  // The open comes first: the action acts on the active buffer (INV §8 P29).
+  const order = fake.calls.map((c) => c.name).filter((n) => n === "openFile" || n === "executeAction");
+  assert.deepEqual(order, ["openFile", "executeAction"]);
+  fake.clear();
+  await fake.widget("select", { index: 2, key: "c:aa.txt" });
+  await fake.command("Git Sidebar: Resolve Conflict");
+  await fake.advance(50);
+  assert.deepEqual(opened(), [["/repo/aa.txt"]]);
+  assert.deepEqual(actions(), ["start_merge_conflict"]);
+  assert.deepEqual(writes(), [], "a conflicted file is never staged (R15)");
+  assert.deepEqual(statuses(), []);
+});
+
+test("Resolve Conflict on a DU row whose file is gone: \"deleted\", no open and no resolution (R25)", async () => {
+  await loadConflict();
+  await rightClick(3, "c:du.txt");
+  await choose("resolve");
+  await fake.advance(50);
+  assert.deepEqual(opened(), []);
+  assert.deepEqual(actions(), []);
+  assert.deepEqual(statuses(), ["du.txt is deleted"]);
+});
+
+test("Resolve Conflict with merge_conflict disabled opens the file and asks for no unknown action (R25, INV §8 P29)", async () => {
+  await loadConflict();
+  fake.plugins = [{ name: "merge_conflict", path: "merge_conflict.ts", enabled: false }];
+  await fake.widget("select", { index: 4, key: "c:uu.txt" });
+  await fake.command("Git Sidebar: Resolve Conflict");
+  await fake.advance(50);
+  assert.deepEqual(opened(), [["/repo/uu.txt"]]);
+  assert.deepEqual(actions(), []);
+  assert.deepEqual(fake.loudCalls(), []);
+  // Absent from the list altogether, as 0.5.9 lists a disabled bundled plugin.
+  fake.plugins = [];
+  fake.clear();
+  await fake.command("Git Sidebar: Resolve Conflict");
+  await fake.advance(50);
+  assert.deepEqual(opened(), [["/repo/uu.txt"]]);
+  assert.deepEqual(actions(), []);
+});
+
+test("Resolve Conflict on a row that is not conflicted, or with nothing selected: a message only (R18, A18)", async () => {
+  await loadAcceptance();
+  await fake.command("Git Sidebar: Resolve Conflict");
+  await fake.widget("select", { index: 5, key: "c:b.md" });
+  await fake.command("Git Sidebar: Resolve Conflict");
+  await fake.advance(50);
+  assert.deepEqual(statuses(), [NOTHING_SELECTED, "Resolve Conflict needs a file with a merge conflict selected"]);
+  assert.deepEqual(opened(), []);
+  assert.deepEqual(actions(), []);
+  assert.equal(fake.named("listPlugins").length, 0);
+});
+
+test("Resolve Conflict for a row gone while the plugin list was read: a message, nothing opened (R25)", async () => {
+  const repo: Repo = { status: fixture("conflict"), code: 0 };
+  await load(repo);
+  await fake.advance(200);
+  fake.files.add("/repo/uu.txt");
+  await fake.widget("select", { index: 4, key: "c:uu.txt" });
+  let open!: () => void;
+  fake.pluginsGate = new Promise<void>((r) => (open = r));
+  fake.clear();
+  await fake.command("Git Sidebar: Resolve Conflict");
+  // The conflict is resolved outside while the host lists the plugins.
+  repo.status = raw({ records: [mod("M.", "uu.txt")] });
+  await fake.emit("after_file_save", {});
+  await fake.advance(1000);
+  open();
+  await fake.advance(50);
+  assert.deepEqual(opened(), []);
+  assert.deepEqual(actions(), []);
+  assert.deepEqual(statuses(), ["uu.txt is no longer listed"]);
+});
+
+test("Resolve Conflict for a row still listed but no longer conflicted: a message, nothing opened (R25)", async () => {
+  const repo: Repo = { status: fixture("conflict"), code: 0 };
+  await load(repo);
+  await fake.advance(200);
+  fake.files.add("/repo/uu.txt");
+  await fake.widget("select", { index: 4, key: "c:uu.txt" });
+  let open!: () => void;
+  fake.pluginsGate = new Promise<void>((r) => (open = r));
+  fake.clear();
+  await fake.command("Git Sidebar: Resolve Conflict");
+  // Resolved and staged outside, then edited again: `c:uu.txt` is a plain change now.
+  repo.status = raw({ records: [mod("MM", "uu.txt")] });
+  await fake.emit("after_file_save", {});
+  await fake.advance(1000);
+  open();
+  await fake.advance(50);
+  assert.deepEqual(opened(), []);
+  assert.deepEqual(actions(), []);
+  assert.deepEqual(statuses(), ["uu.txt no longer has a merge conflict"]);
+});
+
+test("Resolve Conflict when the plugin list cannot be read still opens the file, and asks for no action (R25)", async () => {
+  await load({ status: fixture("conflict"), code: 0 });
+  await fake.advance(200);
+  fake.files.add("/repo/uu.txt");
+  await fake.widget("select", { index: 4, key: "c:uu.txt" });
+  let fail!: (e: Error) => void;
+  fake.pluginsGate = new Promise<void>((_, reject) => (fail = reject));
+  fake.clear();
+  await fake.command("Git Sidebar: Resolve Conflict");
+  fail(new Error("host gone"));
+  await fake.advance(50);
+  assert.deepEqual(opened(), [["/repo/uu.txt"]]);
+  assert.deepEqual(actions(), []);
+  assert.deepEqual(statuses(), []);
+});
+
+// ---------------------------------------------------------------------------
+// R26: Commit…
+// ---------------------------------------------------------------------------
+
+const COMMIT = "Git Sidebar: Commit…";
+const prompts = () => fake.named("prompt").map((c) => c.args);
+/** The summary read after a commit, as `gitSince` shows it. */
+const HEAD_LOG = "--no-optional-locks log -1 --no-show-signature --format=%h%n%s HEAD";
+/** Every git run's argv after the first commit, in order, statuses as `status`. */
+const gitSince = (from: number) =>
+  fake.gitCalls().slice(from).map((p) => (p.args.includes("status") ? "status" : p.args.join(" ")));
+
+test("Commit… from the Staged Changes menu: the message's argv, the short id, then a refresh (R26, A26)", async () => {
+  await loadAcceptance();
+  await rightClick(0, "g:s");
+  assert.deepEqual(menuMounts().map((m) => m.labels), [["Unstage All", "Commit…"]]);
+  fake.promptAnswers.push("first");
+  await choose("commit");
+  await fake.advance(1000);
+  assert.deepEqual(prompts(), [["Commit message: ", ""]]);
+  assert.deepEqual(writes(), [["commit", "-q", "-m", "first"]]);
+  const at = fake.gitCalls().findIndex((p) => p.args[0] === "commit");
+  assert.deepEqual(gitSince(at).slice(0, 3), ["commit -q -m first", HEAD_LOG, "status"]);
+  assert.deepEqual(statuses(), ["committed abc1234: first"]);
+  // On the root, like every write.
+  assert.deepEqual(fake.gitCalls()[at].cwd, "/repo");
+});
+
+test("Commit… from the palette; a message starting with - or # reaches git as typed (R26)", async () => {
+  await loadAcceptance();
+  fake.promptAnswers.push("-x");
+  await fake.command(COMMIT);
+  await fake.advance(3000);
+  fake.promptAnswers.push("#x");
+  await fake.command(COMMIT);
+  await fake.advance(3000);
+  assert.deepEqual(writes(), [
+    ["commit", "-q", "-m", "-x"],
+    ["commit", "-q", "-m", "#x"],
+  ]);
+});
+
+test("Commit…: Esc changes nothing and says so; spaces only say the message is empty; nothing staged opens no prompt (R26)", async () => {
+  await loadAcceptance();
+  await fake.command(COMMIT);
+  await fake.advance(1000);
+  assert.equal(prompts().length, 1);
+  assert.deepEqual(writes(), []);
+  // Said, so no earlier message stays up beside Fresh's "Search cancelled.".
+  assert.deepEqual(statuses(), ["commit cancelled"]);
+  fake.clear();
+  fake.promptAnswers.push("   ");
+  await fake.command(COMMIT);
+  await fake.advance(1000);
+  assert.deepEqual(writes(), []);
+  assert.deepEqual(statuses(), ["the commit message is empty; nothing committed"]);
+  restartFake();
+  await load({ status: fixture("clean"), code: 0 });
+  await fake.advance(200);
+  fake.clear();
+  await fake.command(COMMIT);
+  await fake.advance(1000);
+  assert.deepEqual(prompts(), []);
+  assert.deepEqual(statuses(), ["nothing staged to commit"]);
+  // Nor from a menu: Staged Changes offers no Commit… while empty.
+  await rightClick(0, "g:s");
+  assert.deepEqual(menuMounts(), []);
+});
+
+test("Commit… with a failing hook: git's reason, then the actual status (R26)", async () => {
+  await loadAcceptance({ onWrite: () => ({ code: 1, stdout: "", stderr: "nope\n" }) });
+  fake.promptAnswers.push("first");
+  await fake.command(COMMIT);
+  await fake.advance(1000);
+  assert.deepEqual(statuses(), ["could not commit: nope"]);
+  const at = fake.gitCalls().findIndex((p) => p.args[0] === "commit");
+  assert.deepEqual(gitSince(at).slice(0, 2), ["commit -q -m first", "status"], "no id read; a refresh");
+});
+
+test("a 70 s commit is never killed; a stage asked before runs first and one asked during runs after; its last word is `committed` (R26)", async () => {
+  const stage = deferred();
+  const commit = deferred();
+  await loadAcceptance({ onWrite: (c) => (c.args[0] === "commit" ? commit.outcome : c.args.includes("b.md") ? stage.outcome : undefined) });
+  await fake.widget("action", { index: 5, key: "c:b.md", via: "click" });
+  fake.promptAnswers.push("slow");
+  await fake.command(COMMIT);
+  await fake.advance(10);
+  assert.deepEqual(writes(), [["--literal-pathspecs", "add", "--", "b.md"]], "the commit waits for the stage");
+  stage.resolve({ code: 0, stdout: "", stderr: "" });
+  await fake.advance(10);
+  assert.deepEqual(writes().at(-1), ["commit", "-q", "-m", "slow"]);
+  // `+` on gone.ts while the commit's hook runs.
+  await fake.widget("action", { index: 6, key: "c:gone.ts", via: "click" });
+  await fake.advance(61_000);
+  assert.equal(fake.kills, 0, "a killed commit would leave .git/index.lock");
+  assert.ok(statuses().includes("commit: git is still running after 60 s"), statuses().join(" | "));
+  assert.equal(writes().length, 2, "gone.ts waits for the commit");
+  await fake.advance(9_000);
+  commit.resolve({ code: 0, stdout: "", stderr: "" });
+  await fake.advance(100);
+  assert.deepEqual(writes().at(-1), ["--literal-pathspecs", "update-index", "--remove", "--", "gone.ts"]);
+  assert.equal(statuses().at(-1), "committed abc1234: slow", "not `commit: done`");
+  assert.ok(!statuses().includes("commit: done"));
+  assert.equal(fake.kills, 0);
+});
+
+test("a restart during the prompt: the commit is not run, and the user is told, a notice brought up by it included (R26)", async () => {
+  await loadAcceptance({ inspect: VOLUME_INSPECT, pwd: VOLUME_PWD });
+  let answer!: (v: string | null) => void;
+  fake.promptAnswers.push(new Promise((r) => (answer = r)));
+  await fake.command(COMMIT);
+  await fake.emit("trust_changed", { level: "trusted" });
+  answer("first");
+  await fake.advance(1000);
+  assert.deepEqual(writes(), []);
+  assert.deepEqual(statuses(), ["commit: not run; the workspace's authority or trust changed after it was asked for"]);
+  // An attach to a volume container during the prompt: a notice, no rows.
+  fake.clear();
+  fake.promptAnswers.push(new Promise((r) => (answer = r)));
+  await fake.command(COMMIT);
+  fake.label = "Container:vol";
+  await fake.emit("authority_changed", { label: fake.label });
+  await fake.advance(1000);
+  assert.deepEqual(texts(lastShown()), [VOLUME_NOTICE]);
+  answer("first");
+  await fake.advance(1000);
+  assert.deepEqual(writes(), []);
+  assert.deepEqual(statuses(), ["nothing committed: the Git section no longer shows files"]);
+});
+
+test("a commit whose id read fails still says it committed (R26)", async () => {
+  await loadAcceptance({ headLog: { code: 128, stdout: "", stderr: "fatal: bad" } });
+  fake.promptAnswers.push("first");
+  await fake.command(COMMIT);
+  await fake.advance(1000);
+  assert.deepEqual(statuses(), ["committed: first"]);
+});
+
+test("a second Commit… before the first is drawn is refused with a message (R26)", async () => {
+  const commit = deferred();
+  await loadAcceptance({ onWrite: () => commit.outcome });
+  fake.promptAnswers.push("one", "two");
+  await fake.command(COMMIT);
+  await fake.command(COMMIT);
+  await fake.advance(10);
+  assert.deepEqual(writes(), [["commit", "-q", "-m", "one"]]);
+  assert.deepEqual(statuses(), [COMMIT_BUSY]);
+  // Refused before its prompt: no message is typed only to be thrown away.
+  assert.deepEqual(prompts(), [["Commit message: ", ""]]);
+  commit.resolve({ code: 0, stdout: "", stderr: "" });
+  await fake.advance(1000);
+});
+
+test("a commit that finds nothing staged says so, not the first line of git's status or a hook's output (R26)", async () => {
+  // The rows still list a staged file, but an unstage or a terminal emptied the index.
+  const out = 'On branch main\nUntracked files:\n\tf\n\nnothing added to commit but untracked files present (use "git add" to track)\n';
+  await loadAcceptance({ onWrite: () => ({ code: 1, stdout: out, stderr: "lint ok\n" }) });
+  fake.promptAnswers.push("first");
+  await fake.command(COMMIT);
+  await fake.advance(1000);
+  assert.deepEqual(statuses(), ["could not commit: nothing is staged"]);
+});
+
+test("in a bind-mounted dev container, the commit and its id read run on the host in the root (R26, R13)", async () => {
+  fake.label = "Container:abc";
+  await load({ status: ACCEPTANCE, code: 0, inspect: BIND_INSPECT, pwd: BIND_PWD });
+  await fake.advance(200);
+  fake.promptAnswers.push("first");
+  await fake.command(COMMIT);
+  await fake.advance(1000);
+  const runs = fake.gitCalls().filter((p) => p.args[0] === "commit" || p.args[1] === "log");
+  assert.deepEqual(runs.map((p) => [p.args[0] === "commit" ? "commit" : "log", p.via, p.cwd]), [
+    ["commit", "host", "/repo"],
+    ["log", "host", "/repo"],
+  ]);
+});
+
+// ---------------------------------------------------------------------------
+// R23: auto-reveal
+// ---------------------------------------------------------------------------
+
+/** The home window's active tab changes to buffer `id`, open on `path`. */
+async function switchTo(id: number, path: string, window = 1): Promise<void> {
+  fake.bufferPaths.set(id, path);
+  await fake.emit("active_buffer_changed", { window_id: window, buffer_id: id, previous: null, reason: "buffer" });
+}
+const chrome = (region: string, plugin: string | null = null, panel_id: number | null = null, window_id = 1) =>
+  fake.emit("chrome_focus_changed", { window_id, region, plugin, panel_id });
+const selects = () => mutations().filter((m) => m.kind === "setSelectedIndex").map((m) => m.index);
+
+test("auto-reveal: a tab change to a listed file selects its row, Changes first; no diff, no focus (R23, A23)", async () => {
+  await loadAcceptance();
+  // keys: g:s s:a.ts s:moved.ts g:c c:a.ts c:b.md c:gone.ts c:new/c.txt c:new/d.txt
+  await switchTo(7, "/repo/b.md");
+  await switchTo(8, "/repo/a.ts");
+  await switchTo(9, "/repo/moved.ts");
+  await switchTo(10, "/repo/new/c.txt");
+  assert.deepEqual(selects(), [5, 4, 2, 7]);
+  assert.equal(fake.named("createVirtualBuffer").length + fake.named("openFile").length, 0);
+  assert.deepEqual(focusCalls(), []);
+  assert.deepEqual(fake.gitCalls(), []);
+  // The revealed row is the selection the row commands act on.
+  await switchTo(7, "/repo/b.md");
+  await fake.command("Git Sidebar: Stage or Unstage");
+  await fake.advance(50);
+  assert.deepEqual(writes(), [["--literal-pathspecs", "add", "--", "b.md"]]);
+});
+
+test("auto-reveal leaves the selection alone: not listed, already selected, another window, a virtual buffer, a collapsed group (R23)", async () => {
+  await loadAcceptance();
+  await fake.widget("select", { index: 5, key: "c:b.md" });
+  fake.clear();
+  await switchTo(7, "/repo/README.md");
+  await switchTo(8, "/repo/b.md");
+  // a.ts's Staged row chosen, then a.ts opened (from its Staged diff, R19):
+  // the Staged row stays, not traded for the Changes row Space would act on.
+  await fake.widget("select", { index: 1, key: "s:a.ts" });
+  await switchTo(14, "/repo/a.ts");
+  await switchTo(9, "/repo/a.ts", 2);
+  await switchTo(10, "");
+  await switchTo(11, "/elsewhere/a.ts");
+  assert.deepEqual(selects(), []);
+  // Changes collapsed: no reveal into it, and it stays collapsed.
+  await fake.widget("expand", { index: 3, key: "g:c", expanded: false });
+  fake.clear();
+  await switchTo(12, "/repo/gone.ts");
+  await switchTo(13, "/repo/a.ts");
+  assert.deepEqual(mutations(), []);
+});
+
+test("auto-reveal waits while the keyboard is in the section, by its focus or the chrome event; a blur, a remount or the chrome event ends that (R23, INV §8 P28)", async () => {
+  const repo = await loadAcceptance();
+  await fake.widget("focus", { previous: "(re-focus)" });
+  await switchTo(7, "/repo/b.md");
+  assert.deepEqual(selects(), [], "the row Space acts on stays");
+  // A tab click: blur first, then the buffer change (P28 d).
+  await fake.widget("blur", {});
+  await switchTo(7, "/repo/b.md");
+  assert.deepEqual(selects(), [5]);
+  // Into the section by Alt+Shift+N: only the chrome event counts here.
+  fake.clear();
+  await chrome("section", "git_sidebar", 1);
+  await switchTo(8, "/repo/gone.ts");
+  assert.deepEqual(selects(), []);
+  // Out of it with no blur, as after a remount (P28 c).
+  await chrome("editor");
+  await switchTo(8, "/repo/gone.ts");
+  assert.deepEqual(selects(), [6]);
+  // Another plugin's section, or another panel, is not ours.
+  fake.clear();
+  await chrome("section", "markdown_toc", 1);
+  await switchTo(9, "/repo/b.md");
+  await chrome("section", "git_sidebar", 2);
+  await switchTo(10, "/repo/gone.ts");
+  assert.deepEqual(selects(), [5, 6]);
+  // Focused, then a remount (a branch change) clears it.
+  await fake.widget("focus", {});
+  repo.status = ACCEPTANCE.replace("# branch.head main", "# branch.head other");
+  await fake.emit("focus_gained", {});
+  await fake.advance(1000);
+  fake.clear();
+  await switchTo(7, "/repo/b.md");
+  assert.deepEqual(selects(), [5]);
+});
+
+test("a refresh that newly lists the active file does not move the selection (R23, R10)", async () => {
+  const repo = await loadAcceptance();
+  await fake.widget("select", { index: 5, key: "c:b.md" });
+  await switchTo(7, "/repo/later.txt");
+  fake.clear();
+  repo.status = ACCEPTANCE.replace(/\0$/, `\0${untracked("later.txt")}\0`);
+  await fake.emit("after_file_save", {});
+  await fake.advance(1000);
+  assert.ok(texts(lastShown()).includes("U later.txt"));
+  assert.deepEqual(selects(), []);
+});
+
+test("auto-reveal ignores a switch back to the home window: its active tab did not change (R23)", async () => {
+  await loadAcceptance();
+  await switchTo(7, "/repo/b.md");
+  // The user moves the selection away from the active file's row.
+  await fake.widget("select", { index: 1, key: "s:a.ts" });
+  fake.clear();
+  await fake.emit("active_buffer_changed", { window_id: 1, buffer_id: 7, previous: { window_id: 2, buffer_id: 3 }, reason: "window" });
+  assert.deepEqual(selects(), []);
+});
+
+test("a remount the host refuses leaves the section focused: no reveal moves the row Space acts on (R23)", async () => {
+  const repo = await loadAcceptance();
+  await fake.widget("focus", {});
+  fake.returns.set("mountSidebarSection", [false]);
+  repo.status = ACCEPTANCE.replace("# branch.head main", "# branch.head other");
+  await fake.emit("focus_gained", {});
+  await fake.advance(200);
+  assert.ok(fake.named("debug").some((c) => String(c.args[0]).includes("mountSidebarSection returned false")));
+  fake.clear();
+  await switchTo(7, "/repo/b.md");
+  assert.deepEqual(selects(), []);
+});
+
+test("the diff's hint does not replace a write's outcome sent while the diff was built (R20, R15)", async () => {
+  const lock = "fatal: Unable to create '/repo/.git/index.lock': File exists.";
+  await loadAcceptance({ onWrite: () => ({ code: 128, stdout: "", stderr: lock }) });
+  let release!: () => void;
+  fake.compositeGate = new Promise<void>((r) => (release = r));
+  await click(5, "c:b.md");
+  await fake.advance(10);
+  await fake.widget("activate", { index: 4, key: "c:a.ts", via: "space" });
+  await fake.advance(50);
+  release();
+  fake.compositeGate = null;
+  await fake.advance(50);
+  assert.equal(shownBuffers().length, 1, "the diff opened");
+  const said = statuses();
+  assert.ok(!said.includes(DIFF_HINT), said.join(" | "));
+  assert.match(said[said.length - 1], /^could not stage a\.ts: /);
+});
+
+test("the diff's hint waits while the keyboard is in the section, then shows once it is in the diff, once (R20, R14)", async () => {
+  await loadAcceptance();
+  // A click on a row: the keyboard is in the section, where n, p, q and
+  // Enter do nothing, so no hint yet.
+  await fake.widget("focus", {});
+  await click(5, "c:b.md");
+  await fake.advance(50);
+  const [composite] = shownBuffers();
+  assert.equal(fake.activeBuffer, composite, "the diff opened");
+  assert.deepEqual(statuses(), []);
+  // A click into the diff: blur, then the chrome event (P25 e, P28 c).
+  await fake.widget("blur", {});
+  assert.deepEqual(statuses(), [], "not on the blur alone");
+  await chrome("editor");
+  assert.deepEqual(statuses(), [DIFF_HINT]);
+  // Back to the section and into the diff again: said once per diff.
+  await chrome("section", "git_sidebar", 1);
+  await chrome("editor");
+  assert.deepEqual(statuses(), [DIFF_HINT]);
+});
+
+test("a waiting hint shows on a tab change to its diff with the keyboard in the editor; not for another tab, the explorer or a closed diff (R20)", async () => {
+  await loadAcceptance();
+  await fake.widget("focus", {});
+  await click(5, "c:b.md");
+  await fake.advance(50);
+  const [composite] = shownBuffers();
+  // The keyboard goes to the explorer, then to another tab's editor.
+  await chrome("explorer");
+  fake.activeBuffer = 99;
+  await switchTo(99, "/repo/README.md");
+  await chrome("editor");
+  assert.deepEqual(statuses(), []);
+  // Ctrl+PageDown back to the diff's tab: no chrome event, a tab change.
+  fake.activeBuffer = composite;
+  await fake.emit("active_buffer_changed", { window_id: 1, buffer_id: composite, previous: null, reason: "buffer" });
+  assert.deepEqual(statuses(), [DIFF_HINT]);
+  // A diff closed before the keyboard reached it gives no hint.
+  fake.clear();
+  await fake.widget("focus", {});
+  await click(4, "c:a.ts");
+  await fake.advance(50);
+  const [second] = shownBuffers();
+  await fake.emit("buffer_closed", { buffer_id: second });
+  await fake.advance(50);
+  fake.activeBuffer = 99;
+  await chrome("editor");
+  fake.activeBuffer = second;
+  await fake.emit("active_buffer_changed", { window_id: 1, buffer_id: second, previous: null, reason: "buffer" });
+  assert.deepEqual(statuses(), []);
+});
+
+test("a diff opened with the keyboard outside the section, as from the palette, shows its hint at once (R20, R18)", async () => {
+  await loadAcceptance();
+  await click(5, "c:b.md");
+  await fake.advance(50);
+  // Opening the palette blurs the section and gives the editor the keyboard.
+  await fake.widget("blur", { passed_on: true });
+  await chrome("editor");
+  fake.clear();
+  await fake.command("Git Sidebar: View Diff");
+  await fake.advance(50);
+  assert.equal(shownBuffers().length, 1);
+  assert.deepEqual(statuses(), [DIFF_HINT]);
+  // Nothing waits: a later move into the editor says nothing more.
+  await chrome("section", "git_sidebar", 1);
+  await chrome("editor");
+  assert.deepEqual(statuses(), [DIFF_HINT]);
+});
+
+test("a commit's message names the subject git recorded, after a hook rewrote it (R26)", async () => {
+  await loadAcceptance({ headLog: { code: 0, stdout: "abc1234\n[ABC-12] fix typo\n", stderr: "" } });
+  fake.promptAnswers.push("fix typo");
+  await fake.command(COMMIT);
+  await fake.advance(1000);
+  assert.deepEqual(statuses(), ["committed abc1234: [ABC-12] fix typo"]);
+});
+
+test("the queue counts a commit done when git exits: its refresh runs while the summary read is still out (R26, writeSeq)", async () => {
+  const head = deferred();
+  await loadAcceptance({ headLog: head.outcome });
+  fake.promptAnswers.push("first");
+  await fake.command(COMMIT);
+  await fake.advance(100);
+  const at = fake.gitCalls().findIndex((p) => p.args[0] === "commit");
+  assert.deepEqual(gitSince(at).slice(0, 3), ["commit -q -m first", HEAD_LOG, "status"]);
+  assert.deepEqual(statuses(), []);
+  head.resolve({ code: 0, stdout: "abc1234\nfirst\n", stderr: "" });
+  await fake.advance(50);
+  assert.deepEqual(statuses(), ["committed abc1234: first"]);
+});
+
+test("a restart during the summary read: the commit is logged, not left unreported (R26)", async () => {
+  const head = deferred();
+  await loadAcceptance({ headLog: head.outcome });
+  fake.promptAnswers.push("first");
+  await fake.command(COMMIT);
+  await fake.advance(100);
+  await fake.emit("trust_changed", { level: "trusted" });
+  head.resolve({ code: 0, stdout: "abc1234\nfirst\n", stderr: "" });
+  await fake.advance(50);
+  assert.ok(!statuses().some((s) => s.startsWith("committed")));
+  assert.ok(fake.named("debug").some((c) => String(c.args[0]).includes("committed abc1234: first (finished after a restart)")));
 });

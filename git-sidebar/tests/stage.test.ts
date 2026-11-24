@@ -4,7 +4,10 @@ import {
   chunk,
   CHUNK_BYTES,
   utf8Length,
+  classifyCommit,
   classifyWrite,
+  COMMIT_BUSY,
+  commitArgs,
   LITERAL,
   OpQueue,
   passable,
@@ -326,4 +329,42 @@ test("skippedMessage: what a group operation left out, with its count and plural
     skippedMessage({ conflicted: 2, dirs: 3, names: 4 }),
     "skipped 9: 2 with a merge conflict (resolve with git first), 3 directories (submodule or nested repository), 4 names git can't pass back (not UTF-8)",
   );
+});
+
+test("commitArgs: the message verbatim after -m, no paths, no -a, no literal-pathspecs flag; blank gives null (R26, INV §8 P30)", () => {
+  assert.deepEqual(commitArgs("first"), ["commit", "-q", "-m", "first"]);
+  // A message that starts with `-` or `#` arrives as typed: `-m` takes the next argument whole.
+  assert.deepEqual(commitArgs("-x"), ["commit", "-q", "-m", "-x"]);
+  assert.deepEqual(commitArgs("#x"), ["commit", "-q", "-m", "#x"]);
+  assert.deepEqual(commitArgs("  padded  "), ["commit", "-q", "-m", "  padded  "]);
+  for (const blank of ["", " ", "\t  "]) assert.equal(commitArgs(blank), null, JSON.stringify(blank));
+  const args = commitArgs("x")!;
+  assert.ok(!args.includes(LITERAL), "exported to hooks as GIT_LITERAL_PATHSPECS=1");
+  assert.ok(!args.includes("-a") && !args.includes("--"));
+});
+
+test("classifyCommit: nothing staged says so, whatever git's status or a hook printed first; otherwise as classifyWrite (R26)", () => {
+  const out = (code: number, stdout: string, stderr = ""): GitResult => ({ code, stdout, stderr, timedOut: false });
+  assert.deepEqual(classifyCommit(out(0, "")), { ok: true });
+  // git 2.50's output with nothing staged (`-q` or not), after a pre-commit hook that printed and passed.
+  const untrackedOnly = 'On branch main\nUntracked files:\n  (use "git add <file>..." to include in what will be committed)\n\tf\n\nnothing added to commit but untracked files present (use "git add" to track)\n';
+  assert.deepEqual(classifyCommit(out(1, untrackedOnly, "lint ok\n")), { ok: false, reason: "nothing is staged" });
+  assert.deepEqual(classifyCommit(out(1, "On branch main\nnothing to commit, working tree clean\n")), { ok: false, reason: "nothing is staged" });
+  assert.deepEqual(classifyCommit(out(1, 'On branch main\nChanges not staged for commit:\n\tmodified:   a\n\nno changes added to commit (use "git add" and/or "git commit -a")\n')), {
+    ok: false,
+    reason: "nothing is staged",
+  });
+  // A failing hook, a held lock: git's first line, as for any write.
+  assert.deepEqual(classifyCommit(out(1, "", "nope\n")), { ok: false, reason: "nope" });
+  assert.deepEqual(classifyCommit(out(1, "nope\n")), { ok: false, reason: "nope" });
+  assert.deepEqual(classifyCommit(out(128, "", "fatal: Unable to create '/r/.git/index.lock': File exists.\n"), "/r"), {
+    ok: false,
+    reason: "Unable to create '.git/index.lock': File exists.",
+  });
+});
+
+test("the busy commit message fits the status bar beside a TypeScript buffer (R26)", () => {
+  // The bar cut a 70-character version after 58 characters at 140 columns
+  // (INV §8, live checks).
+  assert.ok([...COMMIT_BUSY].length <= 56, `${[...COMMIT_BUSY].length}`);
 });

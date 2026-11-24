@@ -14,6 +14,23 @@ export type Mode = "local" | "bind" | "volume";
 export const STATUS_ARGS = ["--no-optional-locks", "status", "--porcelain=v2", "--branch", "-z", "-uall"];
 /** Takes no lock: rev-parse reads no index. */
 export const TOPLEVEL_ARGS = ["rev-parse", "--show-toplevel"];
+/** The new commit's short id and subject, one per line, read after a commit
+ *  (R26): the message as git recorded it, after any hook rewrote it. A read
+ *  of its own: `commit`'s summary is off (`-q`), and stdout can come back ""
+ *  through `spawnHostProcess` (INV §8 P17). No signature check is printed
+ *  (`log.showSignature`), and no optional lock is taken (R11). */
+export const HEAD_SUMMARY_ARGS = ["--no-optional-locks", "log", "-1", "--no-show-signature", "--format=%h%n%s", "HEAD"];
+
+/** The status message once a commit is made (R26), from the run of
+ *  `HEAD_SUMMARY_ARGS`: its short id and the subject git recorded. When that
+ *  read failed, or printed no id, it still says the commit was made; when
+ *  git gave no subject, the one typed stands in. */
+export function commitMessage(r: GitResult, typedSubject: string): string {
+  const [first = "", second = ""] = r.code === 0 ? r.stdout.split("\n") : [];
+  const id = first.trim();
+  if (!/^[0-9a-f]{4,64}$/.test(id)) return `committed: ${typedSubject}`;
+  return `committed ${id}: ${second.trim() || typedSubject}`;
+}
 /** A diff side's object id, then its size, then its content (R14). Reads
  *  only, so they take no lock either (R11). `spec` is `:0:<p>` or
  *  `HEAD:<p>`; the size and the content are read by the id, so a write
@@ -32,8 +49,8 @@ export function objectId(stdout: string): string | null {
   return /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(id) ? id : null;
 }
 const GIT_TIMEOUT_MS = 10_000;
-/** How long a stage or unstage may take before the user is told git is
- *  still running. Writes are never killed (see `run`). */
+/** How long a stage, unstage or commit may take before the user is told
+ *  git is still running. Writes are never killed (see `run`). */
 export const WRITE_TIMEOUT_MS = 60_000;
 
 const CONTAINER_PREFIX = "Container:";

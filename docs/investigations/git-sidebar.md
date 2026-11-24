@@ -610,6 +610,78 @@ Git probes in scratch repositories under `/tmp/gs-cr-probe/w` (git 2.50.1, scrip
 
 **P24: a blob's id.** `git rev-parse :0:<p>` and `HEAD:<p>` print the object id. An intent-to-add path's is the empty blob (`e69de29…`), whose `cat-file -s` is 0. For an absent path, `rev-parse HEAD:absent` is rc 128 with `fatal: path 'absent' does not exist in 'HEAD'`, the same message as `cat-file -s`. `--verify` gives only `fatal: Needed a single revision`, so it is left off. Without it, a worktree file named `HEAD:absent` makes `rev-parse` echo the argument with rc 0, so the output is accepted only if it is an object id. A diff side reads its size and its content by that id: two reads of `:0:<p>` could straddle a write and pair one blob's size with another blob's text, which the size check would call binary.
 
+### P25–P30: UX follow-up probes (2026-11-24)
+
+Fresh 0.5.9, git 2.50.1, through the `run-git-sidebar` driver (isolated `HOME`, tmux session `gs-ux-probe`, `GS_DRIVE_DIR=/tmp/gs-ux-probe/drive`). The probe package (`/tmp/gs-ux-probe/pkg/gs_ux_probe.ts`, not in the repo) is a copy of the plugin with extra logging: every panel 1 `widget_event`, `active_buffer_changed` with `getBufferPath`, `chrome_focus_changed` and `buffer_closed`. Its diff mode is `defineMode(DIFF_MODE, [["Enter", "gsProbe_enter"]], true)`, and the handler logs `getActiveBufferId()` and `getCompositeCursorInfo()`, then calls `openFile(abs, line + 1)`. Palette commands call `floatingPanelControl(1, "focus", 0)`, `editor.prompt`, a naive reveal (`setSelectedIndex` on `active_buffer_changed`), and `openFile` followed by `executeAction("start_merge_conflict")`. The repositories were the acceptance fixture plus `two.txt` (20 lines, with two changed lines, then with lines 10 and 20 deleted), `Makefile`, `x.zzz` and an extensionless `deploy` starting with `#!/bin/bash`, a merge with `UU f.txt` and a staged `s`, and a 1,200-untracked-file repository opened through a symbolic link (`/tmp/gs-ux-probe/biglink → big`).
+
+**P25: the diff's keys. Pass, no fallback.**
+
+| # | Check | Result |
+|---|---|---|
+| a | `n`/`]`, `p`/`[` with Enter bound in the mode | Cursor lines `[0,0]`, `n` → `[2,2]`, `n` → `[16,16]`, `p` → `[2,2]`, `]` → `[16,16]`, `[` → `[2,2]`. Keys the mode does not bind fall through to the `compositeBuffer` keymap |
+| b | `q`, Esc | Each closes the tab; `buffer_closed` fires for the composite and both sources, and `listBuffers()` is back to the list before the diff |
+| c | Enter runs the handler | Yes. `getActiveBufferId()` is the composite. `lines` on an added line `[null,1]`, a changed line `[2,2]`, a removed line `[9,null]`, a removed last line `[19,null]`. The blank row the host draws above a hunk, and the pane-label row, resolve to the nearest content row above (`[8,8]`) |
+| d | `openFile(abs, n)` from the handler | The file opens in the diff's split (the active one, split 0) at line `n`, the keyboard moves to it (typed text went into `b.md`), and the diff tab stays. Back on the diff tab, `n` still moves to the next change |
+| e | Esc in the section | `blur`, then `chrome_focus_changed {region:"editor"}`; the keyboard goes to the active editor buffer |
+
+**P26: syntax colours. Pass.** `capture-pane -e` on both panes: `*Staged:a.ts*` and `*Working tree:a.ts*` draw TypeScript keyword colours (`0;255;255` on `export const`); `*Staged:Makefile*` draws Makefile colours (`255;255;0` on the target and the recipe). `*Staged: Makefile*`, with the space, is plain, as are `*Staged:x.zzz*` and `*Staged:deploy*` (the `#!/bin/bash` script): detection from a virtual buffer's name gets no first line (spec R21).
+
+**P27: Focus. Pass, no `"reveal"` needed.** `floatingPanelControl(1, "focus", 0)` returned true and sent `focus` then `chrome_focus_changed {region:"section", plugin:"<entry stem>", panel_id:1}`; Down then logged a `select`.
+- From the palette with the keyboard in a buffer: as above.
+- With the explorer column hidden: the column comes back with the section, and the keyboard is in the section.
+- With the section collapsed from its header: it is expanded (`├ ▼`), with the keyboard in it.
+- From a user key binding: `{"key":"g","modifiers":["ctrl","alt"],"action":"<handler>","when":"global"}` in `config.json`'s `keybindings` runs the handler. Ctrl+Alt+G is unbound in 0.5.9's `default.json` (only Alt+G, Ctrl+G and a prompt Alt+G use `g`), and tmux's `C-M-g` arrives as it. So the README's example key is Ctrl+Alt+G.
+
+**P28: auto-reveal. Pass, no fallback.**
+- **a, echo.** `setSelectedIndex` from `active_buffer_changed` sends no `widget_event` back.
+- **b, scrolling.** With 1,200 untracked files and the section scrolled to the top, revealing `f00398.txt` (index 400) scrolled the tree so its row is visible (its last row).
+- **c, focus signals** (panel 1's `focus`/`blur`, and `chrome_focus_changed`):
+
+  | Change | Panel 1 | `chrome_focus_changed` | Where the keyboard is |
+  |---|---|---|---|
+  | A click into the editor | `blur` | `editor` | the editor |
+  | Alt+Shift+N, explorer → section → editor | `focus`, then `blur` | `section`, then `editor` | as named |
+  | Alt+Shift+P | — | `explorer` → `editor` | as named |
+  | Right-click menu opens, then Esc | `focus` (if blurred), no `blur` | none for the menu | the section after Esc |
+  | Opening the palette from the section | `blur {passed_on:true}` | `editor` | the editor after the palette |
+  | A remount (branch switch) while focused | no `blur` | `editor` | the editor |
+  | Ctrl+B (hide) while focused | `blur {passed_on:true}` | `editor` | the editor |
+  | Collapse from the header while focused | nothing | nothing | the section's header: Up and Down reach neither the tree nor the editor. A later click into the editor gives `blur` and `editor` |
+
+  So hiding the column does send `blur` in 0.5.9, against what an earlier test comment assumed. Collapsing sends neither signal, because the keyboard does not leave the section. Together the two signals catch every change in which the keyboard left.
+- **d, order.** A click on a tab while the section is focused gives `blur`, then `active_buffer_changed`, then `chrome_focus_changed {region:"editor"}`. The chrome event comes **after** the buffer change, so the panel's `blur` has to clear the focus flag too.
+- **e, paths.** `getCwd()`, `rev-parse --show-toplevel` and `getBufferPath()` all give the resolved form: `/private/tmp/…` on macOS, and `/private/tmp/gs-ux-probe/big/f00398.txt` for a file opened as `/tmp/gs-ux-probe/biglink/f00398.txt` in a workspace started through the link.
+
+**P29: conflicts. Pass; the disabled case needs the `listPlugins` check.**
+- `openFile` on the `UU` file (not open before), then `executeAction("start_merge_conflict")` right after it: the merge view (`*OURS*`, `*RESULT*`, `*THEIRS*`) opened on that file, with `Merge: 1 conflicts to resolve (0 auto-resolved)`. No WARN or ERROR line.
+- With `"plugins": {"merge_conflict": {"enabled": false}}`: the file opens, but the call logs `ERROR … console.error: [JS] Action start_merge_conflict is not defined as a global function`, and the status bar shows `[⚠ 1]`. `listPlugins()` then has no `merge_conflict` entry at all; with it enabled the entry is `{name:"merge_conflict", enabled:true}`. So the plugin asks `listPlugins()` first (the plan's fallback).
+
+**P30: git and the prompt. Pass, `-m <msg>` kept.**
+- `git commit -q -m -x` and `-m '#x'`: rc 0, subjects `-x` and `#x`, nothing on stdout.
+- A `pre-commit` hook that prints `nope` and exits 1: rc 1, stdout empty, stderr `nope`.
+- An unborn branch: the first commit, rc 0.
+- A merge with `UU f` and a staged file: rc 128, `error: Committing is not possible because you have unmerged files.`, `MERGE_HEAD` stays. After resolving and staging: rc 0, two parents, `MERGE_HEAD` gone.
+- A held lock: rc 128, `fatal: Unable to create '<root>/.git/index.lock': File exists.`.
+- `rev-parse --short HEAD` afterwards prints the new id.
+- A hook running `git ls-files -- "*.txt"`: `env= files=t.txt` for a plain commit, and `env=1 files=` with `--literal-pathspecs`.
+- `editor.prompt("Commit message: ", "")` from the palette: Esc resolves `null`, Enter resolves the text. Opening the palette from a focused section blurs it (`passed_on:true`), and after the prompt the keyboard is in the editor.
+
+### Found during the live checks of R19–R27 (2026-11-24)
+
+The plugin itself, through the same driver (`GS_DRIVE_DIR=/tmp/gs-ux-probe/live`), on the acceptance fixture and on scratch repositories: hooks that fail and that sleep 70 s, a held lock, an unborn branch, a merge with `UU` and `DU` paths, and the 1,200-file repository.
+
+- **The status bar cuts the diff hint.** At 140 columns with the explorer shown, a message is cut after about 70 characters. The first hint, `diff: n/] next change, p/[ previous, Enter opens the file at this line, q/Esc closes`, lost its `q/Esc`. It is now `n/] next change, p/[ previous, Enter open file, q/Esc close` (59 characters), which shows whole.
+- **After Commit… from the menu, the keyboard is in the editor.** The menu closes on the choice and the prompt takes the keyboard. Once the prompt answers, the keyboard goes to the editor, not back to the section, as with the palette (P30). The plugin sends no `"focus"` to bring it back: only Focus does (R22).
+
+Then a verification pass of the staged change, through the driver with its default `GS_DRIVE_DIR`, on the acceptance fixture and a scratch merge with `UU` and `UD` paths, also with merge_conflict disabled:
+
+- **The status bar joins Fresh's message and the plugin's.** It draws Fresh's latest message, then ` | ` and the plugin's last `setStatus`, which stays until the plugin replaces it: `Opened b.md | n/] next change, …` after Enter in a diff, and `Search cancelled. | nothing staged to commit` after Esc at the commit prompt with a file staged, the second half left from an earlier Commit… with nothing staged. So Esc at the prompt now says `commit cancelled` (R26).
+- **Less room beside a TypeScript buffer.** With `TypeScript   LSP (off)` at the right, the bar cut the 70-character busy message, `the last commit is still running or being shown; try again in a moment`, after 58 characters. It is now 50.
+- **The hint showed where its keys do nothing.** After a click on a row the keyboard is in the section: Enter opened nothing and Down moved the selection, though the hint had just named Enter. It now waits for the keyboard to reach the diff (R20).
+- **Auto-reveal traded a selected Staged row for the Changes row.** With `a.ts`'s Staged row selected, Enter in its Staged diff opened `a.ts` and moved the selection to `c:a.ts`, so Space would stage instead of unstage. It now keeps a row of the file that is already selected (R23).
+- **A pre-commit hook that runs `git reset -q` makes git record an empty commit** instead of refusing, as a terminal commit does, so the plugin reports a commit.
+- **A terminal `git reset` just before the prompt's Enter** made the commit find nothing staged: `could not commit: nothing is staged` in 3 runs, with a hook printing `lint ok`. A first run instead failed with `Unable to create '.git/index.lock': File exists.`, git's reason shown and no lock left behind. What held the lock was not identified.
+
 ## 9. Follow-up: opening, diffs, staging and the title (2026-11-24)
 
 **Ticket.** "Click on file does not open it in tab. Diff numbers near the branch do not show actual changes count (I changed one line in README, it's shown in Changes but the numbers show 0 0)." Added: stage and unstage per file and per group; view file and view diff per file row, the diff side by side (Changes: index vs working tree; Staged: HEAD vs index).
@@ -741,3 +813,130 @@ Same sources as above (`DTS`, `SRC`, `EP`), plus the third-party `git-review` co
 - **Status that is not UTF-8 in a bind-mounted dev container (found, not fixed).** Through `spawnHostProcess`, a status whose output holds one path that is not UTF-8 comes back as `""` with rc 0 (§8 P17). The section then shows empty groups and the title `Git · HEAD`. `runOnTarget` (local) is lossy instead, and the rows show U+FFFD.
 - **Lossy text of the same length (low).** A blob refusal compares UTF-8 lengths. A blob in which three bad bytes become one U+FFFD (3 bytes), such as a truncated 4-byte sequence, keeps its length and is shown with U+FFFD in it.
 - **Untracked symbolic links.** `?` records carry no mode, so an untracked link's diff shows its target's contents (README Limits).
+
+## 10. UX review against VS Code's Source Control view (2026-11-24)
+
+**Ticket.** "Review fresh editor docs, source code, official plugins. Find APIs, patterns and approaches that we could use to improve UX/UI of our plugin. Golden standard is VS Code git integration. Try to keep the plugin simple."
+
+Same sources as above (`DTS`, `SRC`, `EP`, `GR`), plus:
+
+- `UP` at master `8958d125d`, 82 commits past v0.5.9, none of them released (v0.5.9 is still the latest release);
+- `PR3539`, the closed upstream source-control plugin (`/tmp/fresh-investigate/pr3539/`);
+- `FD`, sinelaw/fresh-plugins `file-diff/file_diff.ts`;
+- `VS`, VS Code's git extension and SCM sources, cached under `/tmp/gs-ux-vscode/`: `package.json` is the git extension's manifest, and `docs/` holds the code.visualstudio.com source-control pages.
+
+No live probe was run while writing this section. UNCONFIRMED marks each claim one had to settle; §8 P25–P30 have since settled them (§10.7).
+
+### 10.1 Where the section stands (high)
+
+**What already matches VS Code's defaults:**
+
+- **Groups.** Staged Changes and Changes, each with a count. Untracked files are mixed into Changes (`git.untrackedChanges: mixed`, `VS/repository.ts:3133`).
+- **Rows.** The letters M A D R C T U `!`, in the theme's git colours (`VS/repository.ts:61-148`).
+- **Clicks.** A click opens the diff and the keyboard stays in the list (`VS/listService.ts:718-735`). One replaced diff tab plays the part of VS Code's preview tab.
+- **Enter.** It opens with the keyboard kept in the list. VS Code's keyboard open defaults to `preserveFocus: true` (`VS/listService.ts:711-712`). Fresh's own explorer and Markdown contents move the keyboard to the editor on Enter instead (`UP/docs/features/file-explorer.md:18-21`, `markdown.md:147`).
+- **The diff.** It opens on its first change: `initialFocusHunk: 0` (`git_sidebar.ts:677`), as VS Code's `revealFirstDiff` does (`VS/textDiffEditor.ts:147`).
+- **Actions.** Stage and unstage per row and per group, and a context menu.
+
+**Where it differs by an earlier decision (spec, Decisions):**
+
+- Conflicts are `!` rows under Changes, not a first Merge Changes group (`VS/sourceControl.ts:175-178`).
+- An empty Staged Changes group stays visible. VS Code hides it (`git.alwaysShowStagedChangesResourceGroup: false`).
+- Space stages. VS Code's Space expands and collapses (`VS/listCommands.ts:754`). Fresh's tree sends Space as `activate` with `via:"space"` so that a plugin can give it a meaning of its own (`UP/docs/internal/widget-controls-own-interaction.md:55-58`).
+- No discard and no commit.
+
+**What it lacks:**
+
+- the diff's Open File (`VS/package.json` `menus["editor/title"]` `git.openFile`);
+- a key that focuses the view (Ctrl+Shift+G);
+- auto-reveal of the active file (`scm.autoReveal: true`);
+- strike-through on deleted files (`VS/repository.ts:249-260`);
+- file icons;
+- a right-aligned letter;
+- actions shown only on hover;
+- tooltips;
+- multi-select;
+- a commit box;
+- discard;
+- staging selected ranges;
+- a progress indicator.
+
+### 10.2 Already there, not documented (high from code; confirmed live by §8 P25, P26)
+
+- **Diff keys.** The core keymap's `compositeBuffer` context binds:
+  - `n` / `]` to `composite_next_hunk`;
+  - `p` / `[` to `composite_prev_hunk`;
+  - `q` / Esc to `close` (`SRC/fresh-editor-core/keymaps/default.json:1760-1805`).
+
+  Composite panes get that context (`SRC/fresh-editor/src/app/render.rs:5864`). A buffer mode without text input lets keys it does not bind fall through to normal handling (`SRC/fresh-editor/src/input/router.rs:595-600`). So the plugin's empty `defineMode(DIFF_MODE, [], true)` keeps all of them. `q` closes the tab, which raises `buffer_closed`, already handled (P19).
+  - The keyboard stays in the section after a diff opens (P9), so the keys work once the user is in the diff. Esc in the section sends `blur` (P5), and what gets the keyboard next is UNCONFIRMED.
+  - VS Code's equivalent is Alt+F5 / Shift+Alt+F5 (`VS/diffEditorCommands.ts:47-65`).
+- **Reaching the section from the keyboard.** Alt+Shift+N and Alt+Shift+P cycle focus through the explorer, each section and the editor (`UP/docs/features/file-explorer.md:11`; v0.5.9 `default.json:1892-1959`).
+- **Syntax colours in the diff, probably.** A virtual buffer picks its grammar from its name (`SRC/fresh-editor/src/app/virtual_buffers.rs:341,371` → `state.rs:617`). `DetectedLanguage::from_virtual_name` strips the `*`s and takes the text after the last `:` (`SRC/fresh-editor-core/src/primitives/detected_language.rs:225-240`).
+  - The plugin names its sources `*<label>: <path>*` (`git_sidebar.ts:638`), so the name looked up is `" <path>"`, with a leading space.
+  - An extension still matches. A file at the repository root that is known by its name alone (`Makefile`) would not, and neither would a path that holds a `:`.
+  - A survey agent read the absence of `setSyntaxRegions` as "no highlighting". The name-based detection says otherwise. UNCONFIRMED live.
+
+### 10.3 Small additions, all in the 0.5.9 DTS
+
+| # | What | How | Evidence | Cost |
+|---|---|---|---|---|
+| a | **Open the file at the diff's cursor line** (VS Code's Open File in the diff) | Bind a key in `DIFF_MODE`. Its handler reads `getCompositeCursorInfo()` (`{focusedPane, paneCount, lines[]}`, `DTS:5630`), then `openFile(path, line + 1)` (`DTS:5696`). A Changes row's right pane is the file on disk, so its line is exact. A Staged pane's line is only near. A deleted file gets a message | `EP/audit_mode.ts:6732-6759,6859-6862` (Enter); `FD:511-524` | S |
+| b | **A focus command** (Ctrl+Shift+G) | `floatingPanelControl(PANEL, "focus")` (`DTS:8146,8175`). markdown_toc's "Focus Contents" also sends `"reveal"` (`EP/markdown_toc.ts:486-500`), but `"reveal"` is not in the DTS op list. A user can bind any handler name in their keymap (`SRC/fresh-editor/src/input/keybindings.rs:938`). Whether `"focus"` expands a collapsed section is UNCONFIRMED. With the explorer hidden, it opens the column (§2) | — | S |
+| c | **Auto-reveal the active file** (`scm.autoReveal`) | Handle `active_buffer_changed` (`DTS:9368`). When the section is not focused and the file is listed, select its row with `setSelectedIndex`, which never moves focus (`SRC/fresh-editor/src/app/plugin_dispatch.rs:6054-6063`). Prefer Changes over Staged, as VS Code does (`VS/scmViewPane.ts:1921-1960`). When a row of the active file is already focused and selected, in any group, VS Code changes nothing (`VS/scmViewPane.ts:1937-1944`). The explorer's own follow setting, `file_explorer.follow_active_buffer`, defaults to false (`SRC/fresh-editor-core/src/config.rs:1956,2426`). Whether the mutation echoes a `select` event is UNCONFIRMED | — | S/M |
+| d | **Strike-through on deleted files** | Segment styles take `strikethrough`, as well as `bold`, `italic` and `underline` (`DTS:1694-1742`), and tree text honours them (`SRC/fresh-editor/src/view/shell/widgets.rs:5122-5140`) | `VS/repository.ts:249-260` | S |
+| e | **Resolve a conflict with merge_conflict** | On `!` rows: `openFile(path)`, then `executeAction("start_merge_conflict")` (`DTS:5487`; unknown names become plugin actions, `keybindings.rs:938`). merge_conflict exports no API (`EP/merge_conflict.ts:1215-1227,1818`). On open it already shows a "use 'Merge: Start Resolution'" hint (`:131-167`). The order of the two queued calls is UNCONFIRMED. If merge_conflict is disabled, nothing happens and only a warning is logged | VS Code opens the file with its markers and Accept actions | S |
+| f | **A key hint when the diff opens** | One `setStatus` line naming the diff keys. find_references and diagnostics_panel show such hints (`EP/find_references.i18n.json`, `EP/diagnostics_panel.i18n.json`) | — | S |
+| g | **File history** | `openFile` then `executeAction("show_git_log_current_file")` (`EP/git_log.ts:695-704`), with the same caveats as (e). VS Code's core SCM view has no such item; its Timeline view does | — | S |
+
+### 10.4 Larger VS Code features (each widens the spec's scope)
+
+- **Commit** (M). A quick commit takes a message from `editor.prompt(label, initial)` (`DTS:7067`) and runs `git commit -m <msg>` through `runWrite` and `OpQueue`, never killed (P16).
+  - With nothing staged, it says so. VS Code offers to stage everything (`VS/commands.ts:2440-2470`), and that would need the same care as stage all (§9.5).
+  - Risks:
+    - hooks can run long: past 60 s the existing "still running" message shows;
+    - GPG signing with a terminal pinentry has no terminal under Fresh's runners, so it fails with git's reason (UNCONFIRMED);
+    - in a bind-mounted container, the commit runs on the host with the host's identity (§7).
+  - PR3539 had one (`pr.diff:1162-1200`). Its `ensureStaged` falls back to `git add -A`, which resolves conflicts (`:1626`). Avoid that.
+- **Discard** (M, destructive).
+  - A Changes row is restored from the index: `git restore --worktree -- <p>`, not from HEAD, which audit_mode does (`EP/audit_mode.ts:4337-4359`).
+  - An untracked file is deleted.
+  - It needs a confirmation. audit_mode uses `startPrompt` plus `setPromptSuggestions([Discard, Cancel])` (`:4398-4407`), then checks `git status` rather than the exit code (#2318).
+- **Stage or unstage a hunk from the diff** (M-L). audit_mode builds a patch, writes it with `scratchCreate` / `scratchPath` (`DTS:6112-6122`), and runs `git apply --check`, then `--cached [--reverse]` (`EP/audit_mode.ts:4088-4116,8869-8875`).
+  - `computeLineDiff` gives zero context lines, so the patch needs `--unidiff-zero`.
+  - Fresh's process API has no stdin, so a file is required.
+  - In a bind-mounted container the patch path must be the host path (UNCONFIRMED).
+  - Under autocrlf the patch does not apply (§9.6).
+- **A Merge Changes group first** (S-M). It changes R3 and R4, and the "conflicts go under Changes" decision.
+- **File icons** (M). The explorer draws icons only with `editor.nerd_font_icons` (`SRC/fresh-editor/src/view/file_tree/slots.rs:296-335`).
+  - A plugin can match them with `getBuiltinFileIcons()` (`DTS:6520`), the host's lookup order (`view/file_icons.rs:218-238`), and the theme's overrides from `getThemeData`.
+  - Risk: a copy of the host's merge drifts from it.
+
+### 10.5 Not possible in 0.5.9, or coming upstream (high)
+
+- **A right-aligned status letter.**
+  - `columns` / `cells` have no alignment, always draw a header (`SRC/fresh-core/src/api.rs:2408-2432`), and are ignored by the card layout that P21 needs.
+  - `padToChars` needs the section width, which no API gives (§2).
+  - Master adds `align:"between"`, `splitByte`, `fadeTail` and `hoverAction` as untyped row properties (`UP` `3838ead19`, #3826, unreleased).
+- **Actions shown on hover only.** `hoverAction` is master-only. The always-visible `[ + ]` is 0.5.9's equivalent, and moving to `hoverAction` later is compatible.
+- **Items in the explorer and tab menus** (Stage, Open Changes): `addFileExplorerMenuItem` and `addTabMenuItem` are master-only (`36f25885a`, #3838).
+- **Header buttons.** The header draws a chevron, the title and optional `⟳`/`×` only, and a plugin section gets no `⟳` (`SRC/fresh-editor/src/view/shell/sidebar.rs:486-566`, `app/render.rs:3268`).
+  - A toolbar row above the tree would render, but a press on it blurs the tree, which clears the tree's selection (`SRC/fresh-editor-core/src/widgets/kinds/tree.rs:62-70`).
+- **Tooltips, multi-select, icon fields.** None of them is on a 0.5.9 or master `TreeNode` (`DTS:1906-2002`).
+- **A unified (inline) diff.** `"unified"` is accepted, but it splits the panes without interleaving lines (`SRC/fresh-editor/src/view/composite_view.rs:40-56`).
+- **A diff as a preview tab.** `previewFileInSplit` takes file paths only (`SRC/fresh-editor/src/app/buffer_management.rs:336,359-396`).
+- **A persistent status-bar item.** `registerStatusBarElement` and `setStatusBarValue` are per buffer, and the item shows only if the user adds `{git_sidebar:<token>}` to `status_bar.*` (`DTS:5513-5518`).
+- **Direction.** The maintainer wants git panels as third-party plugins (#3539, #526). The internal "Git Changes" mockup only illustrates the accordion (`UP/docs/internal/sidebar-sections-design.md:230-246`). Nothing upstream competes with this section.
+
+### 10.6 Conventions not followed (medium)
+
+- **No i18n file.** The docs ask for `<stem>.i18n.json`, `%cmd.*` names and `editor.t()` (`UP/docs/plugins/development/i18n.md:9-85`). A sibling `git_sidebar.i18n.json` is not loaded as a second plugin (`SRC/fresh-plugin-runtime/src/thread.rs:1448,1538`).
+- **Settings.** If settings are ever added, master names them in snake_case (`9821caa3a`).
+
+### 10.7 Open
+
+- ~~**P25, the diff keys.**~~ Closed by §8 P25: all six keys work with Enter bound in the mode, and Esc in the section sends the keyboard to the active editor buffer.
+- ~~**P26, syntax colours.**~~ Closed by §8 P26: coloured by name or extension once the name has no space after the `:`. A shebang-only file stays plain.
+- ~~**P27, the focus command.**~~ Closed by §8 P27: `"focus"` expands a collapsed section and shows a hidden column, so `"reveal"` is not used.
+- ~~**P28, auto-reveal.**~~ Closed by §8 P28: no echo, and the row scrolls into view. The panel's `blur` comes before `active_buffer_changed`, and `chrome_focus_changed` after it.
+- ~~**P29, conflicts.**~~ Closed by §8 P29: resolution starts on the newly opened file. With merge_conflict disabled the call logs an ERROR, so the plugin checks `listPlugins()` first.

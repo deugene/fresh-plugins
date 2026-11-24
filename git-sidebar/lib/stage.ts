@@ -1,10 +1,13 @@
-// Staging and unstaging (R15, R16): the git arguments, how a write's result
-// reads, and the queue that runs one write at a time.
+// Staging, unstaging and committing (R15, R16, R26): the git arguments, how
+// a write's result reads, and the queue that runs one write at a time.
 //
-// Every write's argv starts with `--literal-pathspecs`: without it a path
-// such as `a*` is a glob, and `git add -- 'a*'` also stages `ab` (INV §9.5).
-// Writes take `.git/index.lock`, so they cannot use `--no-optional-locks`;
-// only these user-requested writes ever take it (R11).
+// Every stage and unstage argv starts with `--literal-pathspecs`: without it
+// a path such as `a*` is a glob, and `git add -- 'a*'` also stages `ab`
+// (INV §9.5). A commit names no paths and does not take the flag: git
+// exports it to hooks as `GIT_LITERAL_PATHSPECS=1`, so a hook's own glob
+// pathspec would match nothing (INV §8 P30). Writes take
+// `.git/index.lock`, so they cannot use `--no-optional-locks`; only these
+// user-requested writes ever take it (R11).
 
 import { gitReason, trimSlash, type GitResult } from "./git.ts";
 import { unpassable, type Entry, type Status } from "./status.ts";
@@ -78,6 +81,28 @@ export function stageArgs(e: Entry): string[][] {
 export function unstageArgs(e: Entry): string[][] {
   return [[...RESET, ...writePaths(e)]];
 }
+
+/**
+ * Commit what is staged with the message `msg` exactly as typed (R26), or
+ * null when it is empty or only whitespace. `-m <msg>` as its own argument
+ * takes a message that starts with `-` or `#` as it is (INV §8 P30); no
+ * `-a`, no paths, so only the index is committed and the working tree is
+ * left alone. `-q` keeps git's own summary off stdout, so a failing hook's
+ * output is the only text there is for `gitReason`, except when git finds
+ * nothing staged (`classifyCommit`). Hooks run, and a merge,
+ * cherry-pick or revert with nothing left conflicted is concluded, as from
+ * a terminal.
+ */
+export function commitArgs(msg: string): string[] | null {
+  return msg.trim() === "" ? null : ["commit", "-q", "-m", msg];
+}
+
+/** Why Commit… is refused while the last commit holds the write queue's key
+ *  (R26). The queue holds it until the refresh after the write is drawn, so
+ *  the commit may be done but not yet on screen: "finishing" covers both.
+ *  Short: the status bar cut a 70-character version after 58 characters
+ *  beside a TypeScript buffer (INV §8, live checks). */
+export const COMMIT_BUSY = "a commit is still finishing; try again in a moment";
 
 /** Most path bytes one group command carries. Stays well under Windows'
  *  32 K-character command line, and bounds each bridge message; the
@@ -261,6 +286,31 @@ export type WriteOutcome = { ok: true } | { ok: false; reason: string };
  */
 export function classifyWrite(r: GitResult, root?: string): WriteOutcome {
   return r.code === 0 ? { ok: true } : { ok: false, reason: gitReason(r, root) };
+}
+
+/** The last line git prints when a commit finds nothing staged: `nothing
+ *  to commit, working tree clean`, `nothing added to commit but untracked
+ *  files present …` or `no changes added to commit …`. English only: under
+ *  another locale the line is translated and git's first line stands. */
+const NOTHING_TO_COMMIT = /^(?:nothing (?:added )?to commit|no changes added to commit)\b/;
+
+/**
+ * `classifyWrite` for a commit (R26). A commit that finds nothing staged,
+ * because the rows were stale or an unstage queued ahead of it emptied the
+ * index, exits 1 with the whole status on stdout, `-q` or not, and a
+ * pre-commit hook has already run, so stderr may hold its output. Its
+ * first line (`On branch main`, or the hook's `lint ok`) is no reason:
+ * say that nothing is staged instead.
+ */
+export function classifyCommit(r: GitResult, root?: string): WriteOutcome {
+  if (r.code === 0) return { ok: true };
+  const last = r.stdout
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l !== "")
+    .pop();
+  if (last !== undefined && NOTHING_TO_COMMIT.test(last)) return { ok: false, reason: "nothing is staged" };
+  return classifyWrite(r, root);
 }
 
 /**

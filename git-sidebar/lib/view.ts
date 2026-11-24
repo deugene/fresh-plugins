@@ -28,7 +28,9 @@ export const MARKER_COLOR: Record<Marker, string> = {
 
 export interface Segment {
   text: string;
-  style?: { fg: string };
+  /** `strikethrough` is drawn in tree text (DTS `TextStyle`; R24). Left
+   *  out, not false, on every other segment. */
+  style?: { fg: string; strikethrough?: boolean };
 }
 
 export interface Node {
@@ -78,7 +80,11 @@ function fileNode(e: Entry): Node {
   const name = slash < 0 ? path : path.slice(slash + 1);
   const dir = slash < 0 ? "" : path.slice(0, slash);
   const fg = MARKER_COLOR[e.marker];
-  const segments: Segment[] = [{ text: e.marker, style: { fg } }, { text: " " }, { text: name, style: { fg } }];
+  // A deleted file's name is struck through, in both groups; its marker,
+  // directory and original path are not, and nothing else is (R24). A
+  // conflict that deletes keeps `!` as its one signal (spec, decisions).
+  const nameStyle: Segment["style"] = e.marker === "D" ? { fg, strikethrough: true } : { fg };
+  const segments: Segment[] = [{ text: e.marker, style: { fg } }, { text: " " }, { text: name, style: nameStyle }];
   if (dir) segments.push({ text: `  ${dir}`, style: { fg: DIM } });
   if (e.orig !== undefined) segments.push({ text: `  ← ${e.orig}`, style: { fg: DIM } });
   return node(segments, 1, false);
@@ -230,6 +236,47 @@ export function reconcile(
   }
   const kept = Math.min(index, keys.length - 1);
   return kept >= 0 ? { key: keys[kept], index: kept } : { key: null, index: -1 };
+}
+
+/**
+ * The row auto-reveal selects for the file at `absPath` (R23), or null to
+ * leave the selection alone. `root` is the repository's top level, in the
+ * same resolved form as the editor's buffer paths (INV §8 P28 e).
+ *
+ * With one of the file's rows already `selectedKey`, in either group, the
+ * selection stays: a Staged row the user chose is not traded for the
+ * Changes row, which Space would act on instead (R23 "Both groups").
+ * VS Code leaves its selection alone in the same case, a row of the file
+ * in any group (INV §10.3 c).
+ *
+ * Otherwise the Changes row is tried first, then the Staged one, as VS Code
+ * prefers. The first group that lists the file decides: when that group is
+ * collapsed, or the file's row is not drawn (past the 500-row cap), nothing
+ * is selected, and no group is expanded. A path outside the root, a
+ * sibling such as `/repo2` included, is never listed.
+ */
+export function revealKey(
+  absPath: string,
+  root: string,
+  entries: EntryMap,
+  shownKeys: string[],
+  expanded: ReadonlySet<string>,
+  selectedKey: string | null,
+): string | null {
+  const r = trimSlash(root);
+  const prefix = r === "/" ? "/" : `${r}/`;
+  if (!absPath.startsWith(prefix)) return null;
+  const rel = absPath.slice(prefix.length);
+  if (rel === "") return null;
+  if (selectedKey === fileKey("c", rel) || selectedKey === fileKey("s", rel)) return null;
+  for (const [key, group] of [
+    [fileKey("c", rel), CHANGES_KEY],
+    [fileKey("s", rel), STAGED_KEY],
+  ] as const) {
+    if (!entries.has(key)) continue;
+    return expanded.has(group) && shownKeys.includes(key) ? key : null;
+  }
+  return null;
 }
 
 export const VOLUME_NOTICE = "Sources are in a container volume; Fresh opens host files only";

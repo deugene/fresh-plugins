@@ -1,8 +1,11 @@
 // git-sidebar: a "Git" section under the file explorer with the current
 // branch and two groups, Staged Changes and Changes, kept current. A click
-// or Enter on a file opens its side-by-side diff (R14); `+`/`−` and Space
-// stage and unstage (R15, R16); a right-click opens the row's menu (R17);
-// the palette has the same commands (R18).
+// or Enter on a file opens its side-by-side diff (R14), and Enter in the
+// diff opens the file at its line (R19, R20); `+`/`−` and Space stage and
+// unstage (R15, R16); a right-click opens the row's menu (R17), with
+// Resolve Conflict (R25) and Commit… (R26); the palette has the same
+// commands, and Focus (R18, R22). Switching to a listed file selects its
+// row (R23).
 //
 // This file only wires the editor to the pure pieces in lib/: status parsing
 // (status.ts), the tree (view.ts), what each row offers (actions.ts), the
@@ -16,6 +19,7 @@ import {
   anchorArg,
   badName,
   buttonLabel,
+  conflicted,
   dirReason,
   menuChoice,
   menuItems,
@@ -27,7 +31,10 @@ import {
   type PaletteCommand,
 } from "./lib/actions.ts";
 import {
+  classifyCommit,
   classifyWrite,
+  COMMIT_BUSY,
+  commitArgs,
   OpQueue,
   skippedMessage,
   stageAllPlan,
@@ -40,14 +47,19 @@ import {
   blobRefusal,
   compositeHunks,
   contentToEntries,
+  DIFF_HINT,
   DiffSlot,
+  lineCount,
+  openLine,
   paneLabels,
   refusal,
   refusalMessage,
   rowRefusal,
   sides,
   sizeRefusal,
+  sourceName,
   tabTitle,
+  targetLine,
   type Refusal,
   type Side,
   type View,
@@ -59,6 +71,7 @@ import {
   noticeTree,
   placeOf,
   reconcile,
+  revealKey,
   rowKind,
   signature,
   STAGED_KEY,
@@ -77,6 +90,8 @@ import {
   containerId,
   detectMode,
   gitReason,
+  commitMessage,
+  HEAD_SUMMARY_ARGS,
   isDefinitiveFailure,
   objectId,
   run,
@@ -94,15 +109,23 @@ import {
 const editor = getEditor();
 
 const PANEL = 1;
+/** The plugin's name as the host gives it: the entry file's stem (INV §4).
+ *  `chrome_focus_changed` names a section by it (INV §8 P28 c). */
+const PLUGIN_NAME = "git_sidebar";
 /** The right-click menu (R17): a floating panel of its own. Its `cancel`
  *  (Esc, a click outside) closes only the menu, never the section. */
 const MENU = 2;
 const TICK = "gitSidebarTick";
-/** The diff view's keymap: none of its own, read-only (R14). */
+/** The diff view's keymap, read-only (R14): Enter opens the file (R19).
+ *  Keys it does not bind fall through to Fresh's side-by-side keys, `n`,
+ *  `p`, `]`, `[`, `q` and Esc (R20, INV §8 P25). */
 const DIFF_MODE = "git-sidebar-diff";
 /** Set while the section shows status rows: the palette commands are
  *  listed only then (R18, INV §8 P11). */
 const ROWS_CONTEXT = "git-sidebar-rows";
+/** Set while the section is shown at all, rows, placeholder or notice:
+ *  Focus is listed only then (R22, R18). */
+const SHOWN_CONTEXT = "git-sidebar-shown";
 /** Title before the first status, and in volume mode. */
 const BARE_TITLE = "Git";
 
@@ -137,7 +160,8 @@ let phase: "pending" | "shown" | "gaveUp" | "ended" = "pending";
 let epoch = 0;
 
 /** What the section draws now, or null when it is not mounted. The title is
- *  fixed per mount; an equal signature means no widget calls. */
+ *  fixed per mount; an equal signature means no widget calls.
+ *  SHOWN_CONTEXT is set exactly while it is not null (`setShown`). */
 let shown: { title: string; sig: string } | null = null;
 /** Group expansion, owned here because a remount resets the host's. */
 const expanded = new Set<string>([STAGED_KEY, CHANGES_KEY]);
@@ -163,6 +187,20 @@ const NO_ENTRIES: EntryMap = new Map();
 const slot = new DiffSlot();
 /** The row the open menu is for, or null when no menu is open. */
 let menuFor: string | null = null;
+/** Whether the keyboard is in the section, so auto-reveal leaves the row
+ *  Space acts on alone (R23). From panel 1's `focus` and `blur` and from
+ *  `chrome_focus_changed`: a tab click sends `blur` before the buffer
+ *  change and the chrome event after it, and a remount sends the chrome
+ *  event and no `blur` (INV §8 P28 c, d). A remount clears it too (INV §2). */
+let sectionFocused = false;
+/** The region that last took the keyboard in the home window: the region
+ *  `chrome_focus_changed` names, or "section" on panel 1's `focus` (INV §8
+ *  P28 c). Fresh starts with the keyboard in the editor, and the section
+ *  mounts blurred. */
+let keyboardRegion = "editor";
+/** The diff view whose key hint waits for the keyboard to be in it (R20),
+ *  by its composite id, or null. */
+let hintFor: number | null = null;
 
 const sched = new Scheduler();
 const timer = new SingleTimer(
@@ -178,10 +216,15 @@ function log(msg: string): void {
   editor.debug(`git-sidebar: ${msg}`);
 }
 
+/** How many status messages have been sent: a later one can tell whether
+ *  it would replace one sent meanwhile. */
+let said = 0;
+
 /** A status message for the user. No `git-sidebar:` prefix, as in Fresh's
  *  own plugins: the status bar cuts a long message at its width, and
  *  git's reason, which matters most, comes last. Debug lines keep it. */
 function say(msg: string): void {
+  said++;
   editor.setStatus(msg);
 }
 
@@ -252,6 +295,13 @@ function setRows(next: typeof rows): void {
   rows = next;
 }
 
+/** Replace what is shown, setting SHOWN_CONTEXT when the section comes or
+ *  goes (R22). */
+function setShown(next: typeof shown): void {
+  if ((shown === null) !== (next === null)) editor.setContext(SHOWN_CONTEXT, next !== null);
+  shown = next;
+}
+
 function pushSelection(index: number): void {
   mutate({ kind: "setSelectedIndex", widgetKey: TREE_KEY, index });
 }
@@ -269,8 +319,9 @@ function pushExpanded(): void {
  * resets its tree to the spec's seeds — so seed them, then push them. Every
  * mount passes all three options: a remount without them reverts to a
  * closable section that takes focus, scoped to whatever window is active
- * then. No focus is ever asked for: the host's "focus" reveals a hidden
- * explorer column and a collapsed section.
+ * then. No mount or update asks for focus: the host's "focus" shows a
+ * hidden explorer column and expands a collapsed section (INV §8 P27), so
+ * only the Focus command sends it (R22, R1).
  */
 function show(title: string, spec: TreeSpec, notice = false): boolean {
   const sig = signature(title, spec);
@@ -291,8 +342,11 @@ function show(title: string, spec: TreeSpec, notice = false): boolean {
     log(`${remount ? "mountSidebarSection" : "updateFloatingWidget"} returned false; retrying on the next refresh`);
     return false;
   }
+  // A remount clears the host's focus (INV §2). A refused one changed
+  // nothing, and the old section may still hold the keyboard.
+  if (remount) sectionFocused = false;
   const prevIndex = selectedIndex;
-  shown = { title, sig };
+  setShown({ title, sig });
   shownKeys = spec.itemKeys;
   // A notice row stands in for the rows, not for the selected file: keep
   // the file's key and place, so it is selected again when the rows come
@@ -338,7 +392,7 @@ function showNotice(text: string): void {
 function stop(unmount: boolean): void {
   sched.cancel();
   if (unmount) editor.unmountFloatingWidget(PANEL);
-  shown = null;
+  setShown(null);
   setRows(null);
 }
 
@@ -488,30 +542,77 @@ function readiness(): Readiness {
   return { status: rows.status, entries: rows.entries, root, mode };
 }
 
-/** View File (R7): open the row's file as a tab. Reached from the menu
- *  (R17) and the palette (R18) only; no gesture on a row opens the file
- *  itself. */
-function viewFile(key: string): void {
+/** The row's file as an absolute path, when it is a regular file that
+ *  View File may open; otherwise null, after saying why. */
+function fileToOpen(key: string): string | null {
   const row = rowKind(key);
-  if (row.kind !== "file" || root === null) return;
+  if (row.kind !== "file" || root === null) return null;
   if (rows?.entries.get(key)?.entry.dir === true) {
     say(dirReason(trimSlash(row.path)));
-    return;
+    return null;
   }
   // Status names it lossily (F6): the path names no file, so the stat below
   // would call it deleted.
   if (unpassable(row.path)) {
     say(nameReason(row.path));
-    return;
+    return null;
   }
   const path = editor.pathJoin(root, row.path);
   // openFile on a missing path would create a new buffer, and `fileExists`
   // is true for a directory too (a deleted file's path reused by one, a
   // symlink to one).
   const stat = editor.fileStat(path) as { isFile?: unknown; isDir?: unknown } | null;
-  if (stat?.isFile === true) editor.openFile(path);
-  else if (stat?.isDir === true) say(`${row.path} is a directory`);
-  else say(`${row.path} is deleted`);
+  if (stat?.isFile === true) return path;
+  say(stat?.isDir === true ? `${row.path} is a directory` : `${row.path} is deleted`);
+  return null;
+}
+
+/** View File (R7): open the row's file as a tab; whether it opened.
+ *  Reached from the menu (R17), the palette (R18), Resolve Conflict (R25)
+ *  and Enter in the diff (R19) only; no gesture on a row opens the file
+ *  itself. */
+function viewFile(key: string): boolean {
+  const path = fileToOpen(key);
+  if (path === null) return false;
+  // Not sent: nothing opened, so nothing may act on the active buffer as
+  // if it were this file (Resolve Conflict).
+  if (editor.openFile(path)) return true;
+  log(`openFile returned false for ${path}`);
+  return false;
+}
+
+/** How many lines the tab for `path`, a regular file, will show: `openFile`
+ *  switches to a buffer already open on it
+ *  (`file_open_orchestrators.rs:271-275`), whose text may hold unsaved
+ *  edits; otherwise the file on disk. Either is read only when a diff would
+ *  read it too (`sizeRefusal`). Null when that is not known: too large to read, or
+ *  no text (not UTF-8: `readFile` gives `undefined`). */
+async function linesShown(path: string): Promise<number | null> {
+  const open = editor.findBufferByPath(path);
+  if (open !== 0) {
+    // The same size cap as a file on disk: the whole text crosses the bridge.
+    const info = editor.getBufferInfo(open);
+    if (info !== null && sizeRefusal(info.length) !== null) return null;
+    return lineCount(await editor.getBufferText(open));
+  }
+  const stat = editor.fileStat(path) as { size?: unknown } | null;
+  if (sizeRefusal(typeof stat?.size === "number" ? stat.size : 0) !== null) return null;
+  const text: unknown = editor.readFile(path);
+  return typeof text === "string" ? lineCount(text) : null;
+}
+
+/** Enter in the diff (R19): open the row's file at the 0-based `target`
+ *  (null: its last line), clamped to the lines its tab will show, since the
+ *  host jumps to line 1 past the end (`openLine`). The keyboard moves to the
+ *  file and the diff tab stays (INV §8 P25 d). View File's checks come
+ *  first, so only a regular file is read to count its lines. */
+async function openAt(key: string, target: number | null, myEpoch: number): Promise<void> {
+  const path = fileToOpen(key);
+  if (path === null) return;
+  const count = await linesShown(path);
+  if (myEpoch !== epoch) return;
+  const line = openLine(target, count);
+  if (!(line === null ? editor.openFile(path) : editor.openFile(path, line))) log(`openFile returned false for ${path}`);
 }
 
 /** One side's text, why it is refused, or why it could not be read; null
@@ -607,6 +708,7 @@ async function openDiff(key: string): Promise<void> {
   if (gen === null) return;
   const myEpoch = epoch;
   const stale = () => myEpoch !== epoch || !slot.isCurrent(gen);
+  const saidBefore = said;
   try {
     const { left, right } = sides(listed.entry, listed.group, status.oid === null);
     // Both sides at once; a git object's side reads its id, its size, then
@@ -635,7 +737,7 @@ async function openDiff(key: string): Promise<void> {
     // Hidden, read-only sources: the diff is a snapshot, not an editor (R14).
     const source = (label: string, text: string) =>
       editor.createVirtualBuffer({
-        name: `*${label}: ${path}*`,
+        name: sourceName(label, path),
         mode: DIFF_MODE,
         readOnly: true,
         editingDisabled: true,
@@ -675,7 +777,7 @@ async function openDiff(key: string): Promise<void> {
         hunks,
       };
       if (hunks.length > 0) opts.initialFocusHunk = 0;
-      view = { composite: await editor.createCompositeBuffer(opts), left: a, right: b };
+      view = { composite: await editor.createCompositeBuffer(opts), left: a, right: b, key, hunks, rightLines: lineCount(rightText) };
     } catch (e) {
       dropView(null, made);
       throw e;
@@ -689,6 +791,14 @@ async function openDiff(key: string): Promise<void> {
     const prev = slot.install(view);
     editor.showBuffer(composite);
     if (prev !== null) closeView(prev);
+    // The diff's keys are Fresh's and Enter is ours; nothing else shows them
+    // (R20). They work only once the keyboard is in the diff, and a click or
+    // Enter on a row leaves it in the section (R14), so then the hint waits
+    // for it to move in (`hintIfInDiff`). Not over a message sent during the
+    // build, such as a write's outcome (R15, R26), which nothing would say
+    // again.
+    hintFor = sectionFocused ? composite : null;
+    if (!sectionFocused && said === saidBefore) say(DIFF_HINT);
   } finally {
     slot.done(gen);
   }
@@ -814,19 +924,30 @@ async function groupWrite(kind: "stageAll" | "unstageAll", asked: number): Promi
 }
 
 /**
- * Run one row's write commands in order, in the root through the runner, so
- * a bind-mounted dev container writes on the host (R13). On failure, git's
- * reason goes to the status bar (R15) and the rest do not run; either way
- * the queue asks for a refresh, which shows the repository's actual status.
- * A write that finishes across an epoch change (an attach, detach or trust
- * change) only logs.
+ * Run one row's write commands, or a commit's (R26), in order, in the root
+ * through the runner, so a bind-mounted dev container writes on the host
+ * (R13). On failure, git's reason goes to the status bar (R15, R26) and the
+ * rest do not run; either way the queue asks for a refresh, which shows the
+ * repository's actual status. A write that finishes across an epoch change
+ * (an attach, detach or trust change) only logs.
  *
  * Never killed (F0): in 0.5.9 a kill is a SIGKILL, and a killed `git add`
  * leaves `.git/index.lock` behind for good. After `WRITE_TIMEOUT_MS` the
  * user is told git is still running; it is waited for, holding the queue,
- * and how it ended is reported too.
+ * and how it ended is reported too: by `onOk` when given, which runs once
+ * every command has succeeded and says the last word, so no `done` of this
+ * function's own overwrites it (R26). `onOk` is not awaited: the queue
+ * counts the write as done (`writeSeq`) as soon as git exits, so a status
+ * read before that is never drawn while `onOk` runs its own read.
+ * `classify` reads each command's result: a commit's is `classifyCommit`.
  */
-async function write(commands: string[][], what: string, asked: number): Promise<void> {
+async function write(
+  commands: string[][],
+  what: string,
+  asked: number,
+  onOk?: (m: Mode, r0: string) => Promise<void>,
+  classify: typeof classifyWrite = classifyWrite,
+): Promise<void> {
   const where = stillAsked(what, asked);
   if (where === null) return;
   const myEpoch = epoch;
@@ -836,7 +957,7 @@ async function write(commands: string[][], what: string, asked: number): Promise
       slow = true;
       if (myEpoch === epoch) say(`${what}: git is ${left.stderr}`);
     });
-    const outcome = classifyWrite(r, where.r0);
+    const outcome = classify(r, where.r0);
     if (myEpoch !== epoch) {
       log(`${what} finished after a restart: ${outcome.ok ? "ok" : outcome.reason}`);
       return;
@@ -846,8 +967,140 @@ async function write(commands: string[][], what: string, asked: number): Promise
       return;
     }
   }
+  if (onOk !== undefined) void guardedAsync(what, () => onOk(where.m, where.r0))();
   // After "still running", say how it ended.
-  if (slow) say(`${what}: done`);
+  else if (slow) say(`${what}: done`);
+}
+
+/** The write queue's key for a commit: no row key looks like it. */
+const COMMIT_KEY = "commit";
+
+/**
+ * Commit… (R26): ask for a one-line message, then commit exactly what is
+ * staged, through the write queue like every write: one at a time with
+ * stages and unstages, in the order asked, never killed (R15, INV §8 P16).
+ * With nothing staged, or while the last commit holds the queue's key, no
+ * prompt opens. The prompt can stay open across a
+ * refresh or a restart, so what it found is checked again once it answers:
+ * the section's end, its rows (a restart may have brought up a notice),
+ * and Staged Changes. A restart during the prompt is caught by the queue's
+ * `stillAsked`, which says so.
+ */
+async function commitFlow(): Promise<void> {
+  const ready = readiness();
+  if ("why" in ready) {
+    say(ready.why);
+    return;
+  }
+  const before = paletteTarget("commit", selectedKey, ready.status, ready.entries);
+  if (!before.ok) {
+    say(before.message);
+    return;
+  }
+  // Refused before the prompt opens, not after the message is typed; the
+  // queue still refuses one that becomes busy while the prompt is open.
+  if (ops.blocked(COMMIT_KEY)) {
+    say(COMMIT_BUSY);
+    return;
+  }
+  const asked = epoch;
+  const typed = await editor.prompt("Commit message: ", "");
+  if (phase === "ended") return;
+  // Esc: nothing changes, and that is said (R26), so an earlier message,
+  // such as "nothing staged to commit", is not left beside Fresh's own
+  // "Search cancelled." (INV §8, live checks).
+  if (typed === null) {
+    say("commit cancelled");
+    return;
+  }
+  if (rows === null) {
+    say("nothing committed: the Git section no longer shows files");
+    return;
+  }
+  const now = paletteTarget("commit", selectedKey, rows.status, rows.entries);
+  if (!now.ok) {
+    say(now.message);
+    return;
+  }
+  const args = commitArgs(typed);
+  if (args === null) {
+    say("the commit message is empty; nothing committed");
+    return;
+  }
+  const typedSubject = typed.trim();
+  const queued = ops.enqueue(
+    COMMIT_KEY,
+    guardedAsync("commit", () => write([args], "commit", asked, (m, r0) => committed(m, r0, typedSubject), classifyCommit)),
+  );
+  if (queued === null) say(COMMIT_BUSY);
+}
+
+/** After a commit: its short id and its message as git recorded it, after
+ *  any hook rewrote it (R26, `commitMessage`), read on its own after the
+ *  commit. Across a restart it only logs, as a write does. It runs beside
+ *  the next queued write, so a message sent during the read, such as that
+ *  write's failure, is newer and is not covered: the commit only logs then,
+ *  and the refresh shows it. */
+async function committed(m: Mode, r0: string, typedSubject: string): Promise<void> {
+  const myEpoch = epoch;
+  const saidBefore = said;
+  const msg = commitMessage(await run(runner, m, "git", HEAD_SUMMARY_ARGS, r0), typedSubject);
+  if (myEpoch !== epoch) log(`${msg} (finished after a restart)`);
+  else if (said !== saidBefore) log(`${msg} (not shown: a later message was)`);
+  else say(msg);
+}
+
+function commitSoon(): void {
+  void guardedAsync("commitFlow", commitFlow)();
+}
+
+/** The bundled plugin whose action starts conflict resolution (R25). */
+const MERGE_PLUGIN = "merge_conflict";
+/** Its "Merge: Start Resolution", which acts on the active buffer
+ *  (`merge_conflict.ts:1215-1227,1352`; INV §10.3 e). An action name, not
+ *  an API: recheck it after a Fresh upgrade. */
+const MERGE_ACTION = "start_merge_conflict";
+
+/**
+ * Resolve Conflict (R25): open the conflicted file as View File does, then
+ * start Fresh's merge resolution on it, which acts on the buffer just
+ * opened when asked right after the open (INV §8 P29). With merge_conflict
+ * disabled the action is unknown and the host logs an ERROR and shows a
+ * warning count, so it is asked only when `listPlugins()` lists the plugin
+ * enabled (P29); the file still opens. Never stages anything (R15).
+ */
+async function resolveConflict(key: string): Promise<void> {
+  const row = rowKind(key);
+  if (row.kind !== "file") return;
+  const myEpoch = epoch;
+  // A list that cannot be read counts as no resolver: the file still
+  // opens (R25).
+  let plugins: { name: string; enabled: boolean }[] = [];
+  try {
+    plugins = await editor.listPlugins();
+  } catch (e) {
+    log(`listPlugins threw: ${String(e)}; opening the file only`);
+  }
+  if (myEpoch !== epoch) return;
+  // The rows may have changed while the menu was open or the host
+  // answered: the row may be gone, or no longer conflicted.
+  const now = rows;
+  if (now === null || !now.entries.has(key)) {
+    say(`${trimSlash(row.path)} is no longer listed`);
+    return;
+  }
+  if (!conflicted(key, now.entries)) {
+    say(`${trimSlash(row.path)} no longer has a merge conflict`);
+    return;
+  }
+  const resolver = plugins.some((p) => p.name === MERGE_PLUGIN && p.enabled);
+  if (!viewFile(key)) return;
+  if (resolver) editor.executeAction(MERGE_ACTION);
+  else log(`${MERGE_PLUGIN} is not enabled: opened the file only`);
+}
+
+function resolveSoon(key: string): void {
+  void guardedAsync("resolveConflict", () => resolveConflict(key))();
 }
 
 function openDiffSoon(key: string): void {
@@ -911,9 +1164,27 @@ function onMenuEvent(e: HookEventMap["widget_event"]): void {
     say(`${trimSlash(row.path)} is no longer listed`);
     return;
   }
-  if (choice === "diff") openDiffSoon(key);
-  else if (choice === "file") viewFile(key);
-  else rowOp(key);
+  // Each choice routed by name: a new choice must never fall into a write.
+  switch (choice) {
+    case "diff":
+      openDiffSoon(key);
+      return;
+    case "file":
+      viewFile(key);
+      return;
+    case "resolve":
+      resolveSoon(key);
+      return;
+    case "commit":
+      commitSoon();
+      return;
+    case "stage":
+    case "unstage":
+    case "stageAll":
+    case "unstageAll":
+      rowOp(key);
+      return;
+  }
 }
 
 editor.on(
@@ -937,6 +1208,13 @@ editor.on(
         // The host removed the section: with `closable: false` that happens
         // only when its window closed. Stop for good.
         end();
+        return;
+      case "focus":
+        sectionFocused = true;
+        keyboardRegion = "section";
+        return;
+      case "blur":
+        sectionFocused = false;
         return;
       case "select":
         select();
@@ -969,6 +1247,83 @@ editor.on(
   }),
 );
 
+/** Enter in a diff the section opened (R19): the row's file, at the line
+ *  under the diff's cursor (`targetLine`). Bound in DIFF_MODE; `n`, `p`,
+ *  `]`, `[`, `q` and Esc fall through to Fresh's own keys for a
+ *  side-by-side view (INV §8 P25). */
+registerHandler(
+  "gitSidebar_diffEnter",
+  guardedAsync("diff Enter", async () => {
+    const v = slot.current();
+    if (v === null) return;
+    const myEpoch = epoch;
+    const info = await editor.getCompositeCursorInfo();
+    // A restart, or the view closed or replaced, while the host answered.
+    if (myEpoch !== epoch || slot.current() !== v || info === null) return;
+    await openAt(v.key, targetLine(info.lines, v.hunks, v.rightLines), myEpoch);
+  }),
+);
+
+/**
+ * The diff's key hint (R20), once the keyboard is in the diff it waits for:
+ * in the editor, not the section, with the diff's tab active. Said once per
+ * view; a view replaced or closed meanwhile drops it.
+ */
+function hintIfInDiff(): void {
+  if (hintFor === null || sectionFocused || keyboardRegion !== "editor") return;
+  if (slot.current()?.composite !== hintFor) {
+    hintFor = null;
+    return;
+  }
+  if (editor.getActiveBufferId() !== hintFor) return;
+  hintFor = null;
+  say(DIFF_HINT);
+}
+
+/** Which region holds the keyboard (INV §8 P28 c): the section only when
+ *  the region is a section named by this plugin and panel. A click into the
+ *  diff, or Esc in the section, moves it to the editor (P25 e). */
+editor.on(
+  "chrome_focus_changed",
+  guarded("chrome_focus_changed", (e: HookEventMap["chrome_focus_changed"]) => {
+    if (e.window_id !== homeWindow) return;
+    keyboardRegion = e.region;
+    sectionFocused = e.region === "section" && e.plugin === PLUGIN_NAME && e.panel_id === PANEL;
+    hintIfInDiff();
+  }),
+);
+
+/**
+ * Auto-reveal (R23): when the home window's active tab changes to a file the
+ * section lists, while the keyboard is elsewhere, select that file's row.
+ * `setSelectedIndex` scrolls it into view, never moves the keyboard and
+ * sends no `select` back (INV §8 P28 a, b), so no diff opens. A collapsed
+ * group, a row past the cap, or one of the file's rows already selected
+ * leaves the selection alone (`revealKey`). Only a tab change reveals: a
+ * refresh never does (R10). A tab change to a diff also gives the hint
+ * that waits for it (R20).
+ */
+editor.on(
+  "active_buffer_changed",
+  guarded("active_buffer_changed", (e: HookEventMap["active_buffer_changed"]) => {
+    if (e.window_id !== homeWindow) return;
+    // A tab change to a diff waiting for its hint, the keyboard in the editor.
+    hintIfInDiff();
+    if (sectionFocused || rows === null || root === null) return;
+    // A window switch back to the home window is not a tab change: its
+    // active tab is the one it had, whose row the user may have left since.
+    if (e.reason === "window") return;
+    // "" for a virtual buffer, such as a diff view, or one with no file.
+    const path = editor.getBufferPath(e.buffer_id);
+    if (path === "") return;
+    const key = revealKey(path, root, rows.entries, shownKeys, expanded, selectedKey);
+    if (key === null) return;
+    const index = shownKeys.indexOf(key);
+    recordSelection(key, index);
+    pushSelection(index);
+  }),
+);
+
 editor.on(
   "buffer_closed",
   guarded("buffer_closed", (e: HookEventMap["buffer_closed"]) => {
@@ -991,30 +1346,74 @@ function paletteCommand(cmd: PaletteCommand): void {
     say(t.message);
     return;
   }
-  if (cmd === "viewFile") viewFile(t.key);
-  else if (cmd === "viewDiff") openDiffSoon(t.key);
-  // The selected file, or the group itself for Stage All and Unstage All:
-  // the same path as its button (R15, R16).
-  else rowOp(t.key);
+  switch (cmd) {
+    case "viewFile":
+      viewFile(t.key);
+      return;
+    case "viewDiff":
+      openDiffSoon(t.key);
+      return;
+    case "resolve":
+      resolveSoon(t.key);
+      return;
+    case "commit":
+      commitSoon();
+      return;
+    case "toggle":
+    case "stageAll":
+    case "unstageAll":
+      // The selected file, or the group itself for Stage All and Unstage
+      // All: the same path as its button (R15, R16).
+      rowOp(t.key);
+      return;
+  }
+}
+
+/**
+ * Focus (R22): move the keyboard into the section. The host's "focus"
+ * shows a hidden explorer column and expands a collapsed section (INV §8
+ * P27). With rows shown and none selected, the first row is selected first,
+ * so Enter and Space have one to act on. Not routed through `paletteTarget`:
+ * it acts under the placeholder and a notice too, where there are no rows
+ * to target. A key the user binds to its handler can run it at any
+ * time, so with no section it says so.
+ */
+function focusSection(): void {
+  if (shown === null) {
+    say("the Git section is not shown");
+    return;
+  }
+  if (rows !== null && selectedKey === null && shownKeys.length > 0) {
+    recordSelection(shownKeys[0], 0);
+    pushSelection(0);
+  }
+  editor.floatingPanelControl(PANEL, "focus", 0);
 }
 
 /** `Git Sidebar:` prefix: the host keys plugin commands by display name,
- *  and a later registration of the same name replaces an earlier one. */
+ *  and a later registration of the same name replaces an earlier one. Each
+ *  handler is `gitSidebar_<cmd>`, the name a key binding uses (R27). */
 const COMMANDS: { name: string; description: string; cmd: PaletteCommand }[] = [
   { name: "Git Sidebar: View Diff", description: "Side-by-side diff of the file selected in the Git section", cmd: "viewDiff" },
   { name: "Git Sidebar: View File", description: "Open the file selected in the Git section", cmd: "viewFile" },
   { name: "Git Sidebar: Stage or Unstage", description: "Stage or unstage the file selected in the Git section", cmd: "toggle" },
   { name: "Git Sidebar: Stage All", description: "Stage every file under Changes", cmd: "stageAll" },
   { name: "Git Sidebar: Unstage All", description: "Unstage every file under Staged Changes", cmd: "unstageAll" },
+  { name: "Git Sidebar: Commit…", description: "Commit what is staged, with a one-line message", cmd: "commit" },
+  { name: "Git Sidebar: Resolve Conflict", description: "Open the conflicted file selected in the Git section and start Fresh's merge resolution", cmd: "resolve" },
 ];
+const FOCUS_HANDLER = "gitSidebar_focus";
 
 guarded("palette", () => {
   for (const c of COMMANDS) {
     const handler = `gitSidebar_${c.cmd}`;
     registerHandler(handler, guarded(handler, () => paletteCommand(c.cmd)));
-    // Listed only while the section shows rows (INV §8, P11).
+    // Listed only while the section shows rows (R18; INV §8, P11).
     editor.registerCommand(c.name, c.description, handler, ROWS_CONTEXT);
   }
+  // Listed whenever the section is shown at all (R22).
+  registerHandler(FOCUS_HANDLER, guarded(FOCUS_HANDLER, focusSection));
+  editor.registerCommand("Git Sidebar: Focus", "Move the keyboard to the Git section", FOCUS_HANDLER, SHOWN_CONTEXT);
 })();
 
 // ---------------------------------------------------------------------------
@@ -1054,11 +1453,13 @@ editor.on("trust_changed", guarded("trust_changed", () => restart(false)));
 // (INV §8, P2). Rows follow from the first status; if git then fails, the
 // section goes away again.
 guarded("load", () => {
-  // The host keeps a context across a plugin reload: clear one a previous
-  // load left set, so the palette lists nothing before rows are shown
-  // (R18, INV §9.6). `rows` starts null, in step with it.
+  // The host keeps a context across a plugin reload: clear those a previous
+  // load left set, so the palette lists nothing before rows are shown, nor
+  // Focus before the section is (R18, R22, INV §9.6). `rows` and `shown`
+  // start null, in step with them.
   editor.setContext(ROWS_CONTEXT, false);
-  editor.defineMode(DIFF_MODE, [], true);
+  editor.setContext(SHOWN_CONTEXT, false);
+  editor.defineMode(DIFF_MODE, [["Enter", "gitSidebar_diffEnter"]], true);
   if (looksLikeRepo()) show(BARE_TITLE, buildTree(null));
   requestRefresh();
 })();

@@ -9,12 +9,13 @@ import {
   noticeTree,
   placeOf,
   reconcile,
+  revealKey,
   rowKind,
   signature,
   STAGED_KEY,
   VOLUME_NOTICE,
 } from "../lib/view.ts";
-import { H, manyUntracked, raw, status as fixture, texts, untracked } from "./helpers.ts";
+import { H, manyUntracked, mod, raw, status as fixture, texts, untracked } from "./helpers.ts";
 
 test("groups: Staged first, Changes second, with true counts", () => {
   const spec = buildTree(fixture("acceptance"));
@@ -232,4 +233,77 @@ test("reconcile: a gone row's selection stays at its offset in its group, not it
   assert.deepEqual(reconcile("n:notice", { group: null, offset: -1 }, 7, ["g:s", "g:c"]), { key: "g:c", index: 1 });
   assert.deepEqual(reconcile(null, null, 3, ["g:s"]), { key: null, index: -1 });
   assert.deepEqual(reconcile("c:x", null, 3, []), { key: null, index: -1 });
+});
+
+test("a deleted file's name is struck through in both groups; nothing else is (R24)", () => {
+  const struck = (spec: ReturnType<typeof buildTree>) =>
+    spec.itemKeys.flatMap((k, i) => (spec.nodes[i].text.segments.some((s) => s.style?.strikethrough === true) ? [k] : []));
+  // Changes ` D gone.ts` in the acceptance fixture, Staged `D f.txt` from `git rm --cached`.
+  const acc = buildTree(fixture("acceptance"));
+  assert.deepEqual(struck(acc), ["c:gone.ts"]);
+  const gone = acc.nodes[acc.itemKeys.indexOf("c:gone.ts")].text.segments;
+  assert.deepEqual(gone, [
+    { text: "D", style: { fg: "ui.file_status_deleted_fg" } },
+    { text: " " },
+    { text: "gone.ts", style: { fg: "ui.file_status_deleted_fg", strikethrough: true } },
+  ]);
+  assert.deepEqual(struck(buildTree(fixture("rm-cached"))), ["s:f.txt"]);
+  // Its directory segment is not struck through.
+  const nested = buildTree(parseStatus(raw({ records: [`1 .D N... 100644 100644 000000 ${H} ${H} src/old.ts`] })));
+  const segs = nested.nodes[nested.itemKeys.indexOf("c:src/old.ts")].text.segments;
+  assert.deepEqual(
+    segs.map((s) => [s.text, s.style?.strikethrough === true]),
+    [["D", false], [" ", false], ["old.ts", true], ["  src", false]],
+  );
+  // No M, A, R, C, T, U or `!` row, a deleting conflict (DU, UD) included.
+  const others = [
+    "acceptance", "copy", "conflict", "merge", "mm", "rename", "intent-to-add", "unborn", "symlink", "unicode",
+  ].map((name) => buildTree(fixture(name)));
+  others.push(buildTree(parseStatus(raw({ records: [`u UD N... 100644 100644 000000 100644 ${H} ${H} ${H} ud.txt`, mod("T.", "t.sh")] }))));
+  for (const spec of others) {
+    for (const k of struck(spec)) assert.equal(spec.nodes[spec.itemKeys.indexOf(k)].text.segments[0].text, "D", k);
+  }
+  assert.ok(texts(buildTree(fixture("conflict"))).includes("! du.txt"));
+  // The signature sees the style.
+  const plain = { ...acc, nodes: acc.nodes.map((n) => ({ ...n, text: { ...n.text, segments: n.text.segments.map((s) => (s.style ? { ...s, style: { fg: s.style.fg } } : s)) } })) };
+  assert.notEqual(signature("t", acc), signature("t", plain));
+});
+
+test("revealKey: the file's Changes row, else its Staged row; null when not listed, collapsed, not drawn or already selected (R23)", () => {
+  const acc = fixture("acceptance");
+  const spec = buildTree(acc);
+  const entries = entryMap(acc);
+  const both = new Set([STAGED_KEY, CHANGES_KEY]);
+  const reveal = (p: string, expanded: ReadonlySet<string> = both, keys = spec.itemKeys, e = entries, selected: string | null = null) =>
+    revealKey(p, "/repo", e, keys, expanded, selected);
+  assert.equal(reveal("/repo/b.md"), "c:b.md");
+  assert.equal(reveal("/repo/new/c.txt"), "c:new/c.txt", "a nested path");
+  // Listed in both groups: the Changes row.
+  assert.equal(reveal("/repo/a.ts"), "c:a.ts");
+  // Staged only.
+  assert.equal(reveal("/repo/moved.ts"), "s:moved.ts");
+  // One of the file's rows already selected: it stays, the Staged one too,
+  // which the Changes row would replace (R23 "Both groups").
+  assert.equal(reveal("/repo/a.ts", both, spec.itemKeys, entries, "s:a.ts"), null);
+  assert.equal(reveal("/repo/a.ts", both, spec.itemKeys, entries, "c:a.ts"), null);
+  assert.equal(reveal("/repo/moved.ts", both, spec.itemKeys, entries, "s:moved.ts"), null);
+  // Another row selected, a group row included: the file's row as usual.
+  assert.equal(reveal("/repo/a.ts", both, spec.itemKeys, entries, "s:moved.ts"), "c:a.ts");
+  assert.equal(reveal("/repo/a.ts", both, spec.itemKeys, entries, STAGED_KEY), "c:a.ts");
+  // Not listed, outside the root, a sibling root, the root itself.
+  assert.equal(reveal("/repo/README.md"), null);
+  assert.equal(reveal("/elsewhere/b.md"), null);
+  assert.equal(reveal("/repo2/b.md"), null);
+  assert.equal(reveal("/repo"), null);
+  assert.equal(revealKey("/repo/b.md", "/repo/", entries, spec.itemKeys, both, null), "c:b.md", "a root with a trailing slash");
+  assert.equal(revealKey("/b.md", "/", entries, spec.itemKeys, both, null), "c:b.md", "a repository at the filesystem root");
+  // Changes collapsed: the group that lists the file decides, even with a Staged row drawn.
+  assert.equal(reveal("/repo/b.md", new Set([STAGED_KEY])), null);
+  assert.equal(reveal("/repo/a.ts", new Set([STAGED_KEY])), null, "not its Staged row instead");
+  assert.equal(reveal("/repo/moved.ts", new Set([CHANGES_KEY])), null);
+  // Past the 500-row cap: listed but not drawn.
+  const many = parseStatus(raw({ ab: null, records: manyUntracked(600) }));
+  const manySpec = buildTree(many);
+  assert.equal(revealKey("/repo/f0400.txt", "/repo", entryMap(many), manySpec.itemKeys, both, null), "c:f0400.txt");
+  assert.equal(revealKey("/repo/f0550.txt", "/repo", entryMap(many), manySpec.itemKeys, both, null), null);
 });

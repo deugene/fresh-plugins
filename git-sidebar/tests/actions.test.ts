@@ -11,6 +11,7 @@ import {
   MINUS,
   NO_ROWS,
   NOTHING_SELECTED,
+  NOTHING_STAGED,
   paletteTarget,
   rowAction,
 } from "../lib/actions.ts";
@@ -87,12 +88,24 @@ test("menuItems follow A17", () => {
   const m = (key: string, s: { status: Status; entries: EntryMap } = acc) => menuItems(key, s.status, s.entries).map((i) => i.label);
   assert.deepEqual(m("c:b.md"), ["View Diff", "View File", "Stage"]);
   assert.deepEqual(m("s:moved.ts"), ["View Diff", "View File", "Unstage"]);
-  assert.deepEqual(m(STAGED_KEY), ["Unstage All"]);
+  // Staged Changes also offers Commit… while it lists files (R26).
+  assert.deepEqual(m(STAGED_KEY), ["Unstage All", "Commit…"]);
+  assert.deepEqual(menuItems(STAGED_KEY, acc.status, acc.entries).map((i) => i.choice), ["unstageAll", "commit"]);
   assert.deepEqual(m(CHANGES_KEY), ["Stage All"]);
   assert.deepEqual(menuItems("c:b.md", acc.status, acc.entries).map((i) => i.choice), ["diff", "file", "stage"]);
   // Rows with no action: a conflicted file keeps its views; an empty group, `… N more` and a notice get nothing.
-  assert.deepEqual(m("c:uu.txt", shown(fixture("conflict"))), ["View Diff", "View File"]);
-  assert.deepEqual(m(STAGED_KEY, shown(fixture("clean"))), []);
+  // A conflicted file: its views, and Resolve Conflict (R25), never Stage.
+  const conflict = shown(fixture("conflict"));
+  assert.deepEqual(m("c:uu.txt", conflict), ["View Diff", "View File", "Resolve Conflict"]);
+  assert.deepEqual(m("c:du.txt", conflict), ["View Diff", "View File", "Resolve Conflict"]);
+  assert.deepEqual(menuItems("c:uu.txt", conflict.status, conflict.entries).map((i) => i.choice), ["diff", "file", "resolve"]);
+  const ud = shown(parseStatus(raw({ records: [`u UD N... 100644 100644 000000 100644 ${H} ${H} ${H} ud.txt`] })));
+  assert.deepEqual(m("c:ud.txt", ud), ["View Diff", "View File", "Resolve Conflict"]);
+  // No other row offers it.
+  for (const k of ["c:b.md", "c:gone.ts", "s:a.ts", STAGED_KEY, CHANGES_KEY]) assert.ok(!m(k).includes("Resolve Conflict"), k);
+  assert.deepEqual(m(STAGED_KEY, shown(fixture("clean"))), [], "no Commit… with nothing staged");
+  assert.ok(!m(CHANGES_KEY).includes("Commit…"));
+  assert.ok(!m("s:a.ts").includes("Commit…"));
   assert.deepEqual(m("more:c"), []);
   assert.deepEqual(m("n:notice"), []);
   assert.deepEqual(m("c:not-listed.txt"), []);
@@ -123,8 +136,18 @@ test("paletteTarget (R18): the selected row, the group, or a message", () => {
   const clean = shown(fixture("clean"));
   assert.deepEqual(paletteTarget("stageAll", null, clean.status, clean.entries), { ok: false, message: "nothing to stage" });
   assert.deepEqual(paletteTarget("unstageAll", null, clean.status, clean.entries), { ok: false, message: "nothing to unstage" });
+  // Commit…: Staged Changes whichever row is selected, while it lists a file (R26).
+  for (const sel of [null, "c:b.md", CHANGES_KEY]) assert.deepEqual(target("commit", sel), { ok: true, key: STAGED_KEY });
+  assert.deepEqual(paletteTarget("commit", null, clean.status, clean.entries), { ok: false, message: NOTHING_STAGED });
+  assert.equal(NOTHING_STAGED, "nothing staged to commit");
+  // Resolve Conflict: a selected `!` row only (R25, R18).
+  const resolveNeeds = { ok: false, message: "Resolve Conflict needs a file with a merge conflict selected" };
+  assert.deepEqual(paletteTarget("resolve", "c:uu.txt", conflict.status, conflict.entries), { ok: true, key: "c:uu.txt" });
+  assert.deepEqual(target("resolve", "c:b.md"), resolveNeeds);
+  assert.deepEqual(target("resolve", CHANGES_KEY), resolveNeeds);
+  assert.deepEqual(target("resolve", null), { ok: false, message: NOTHING_SELECTED });
   // Under a notice there is no status.
-  for (const cmd of ["viewDiff", "viewFile", "toggle", "stageAll", "unstageAll"] as const) {
+  for (const cmd of ["viewDiff", "viewFile", "toggle", "stageAll", "unstageAll", "resolve", "commit"] as const) {
     assert.deepEqual(paletteTarget(cmd, "c:b.md", null, NONE_SHOWN), { ok: false, message: NO_ROWS }, cmd);
   }
   assert.equal(NO_ROWS, "the Git section shows no files");
@@ -143,7 +166,7 @@ test("menuSpec: a column of bare buttons keyed by choice; menuChoice reads them 
   ]);
   assert.ok(buttons.every((b) => b.bare && b.focusable));
   for (const b of buttons) assert.notEqual(menuChoice(b.key), null);
-  for (const c of ["diff", "file", "stage", "unstage", "stageAll", "unstageAll"]) assert.equal(menuChoice(`menu:${c}`), c);
+  for (const c of ["diff", "file", "resolve", "commit", "stage", "unstage", "stageAll", "unstageAll"]) assert.equal(menuChoice(`menu:${c}`), c);
   assert.equal(menuChoice("menu:toString"), null);
   assert.equal(menuChoice("git"), null);
 });

@@ -1,5 +1,6 @@
 // What a row offers: its button (R5, R15, R16), its right-click menu (R17)
-// and what the palette commands act on (R18). The button, Space, the menu
+// and what the palette commands act on (R18), Resolve Conflict (R25)
+// included. The button, Space, the menu
 // and the palette all ask here, so they cannot disagree about a row.
 
 import { trimSlash } from "./git.ts";
@@ -71,7 +72,9 @@ export function buttonLabel(key: string, status: Status | null, entries: EntryMa
   return a.kind === "none" ? null : BUTTON_LABEL[a.kind];
 }
 
-export type MenuChoice = "diff" | "file" | ActionKind;
+/** A menu item: a view, the row's button action, Resolve Conflict on a
+ *  conflicted row (R25), or Commit… on Staged Changes (R26). */
+export type MenuChoice = "diff" | "file" | "resolve" | "commit" | ActionKind;
 
 export interface MenuItem {
   choice: MenuChoice;
@@ -85,9 +88,18 @@ const ACTION_LABEL: Record<ActionKind, string> = {
   unstageAll: "Unstage All",
 };
 
+/** Whether the row `key` is a conflicted file (`!`, under Changes): the one
+ *  row Resolve Conflict acts on (R25). */
+export function conflicted(key: string, entries: EntryMap): boolean {
+  const listed = entries.get(key);
+  return listed !== undefined && listed.group === "changes" && listed.entry.marker === "!";
+}
+
 /** The right-click menu of the row `key` (R17): View Diff, View File and
- *  the row's action on a file row; the action alone on a group row; nothing
- *  on any other row or a group with no action. */
+ *  the row's action on a file row, Resolve Conflict on a conflicted one
+ *  (R25); the action alone on a group row, and Commit… on Staged Changes
+ *  while it lists a file (R26); nothing on any other row or a group with no
+ *  action. */
 export function menuItems(key: string, status: Status | null, entries: EntryMap): MenuItem[] {
   if (status === null) return [];
   const action = rowAction(key, status, entries);
@@ -98,19 +110,24 @@ export function menuItems(key: string, status: Status | null, entries: EntryMap)
     return [];
   }
   if (action.kind !== "none") items.push({ choice: action.kind, label: ACTION_LABEL[action.kind] });
+  if (conflicted(key, entries)) items.push({ choice: "resolve", label: "Resolve Conflict" });
+  if (key === STAGED_KEY && status.staged.length > 0) items.push({ choice: "commit", label: "Commit…" });
   return items;
 }
 
-export type PaletteCommand = "viewDiff" | "viewFile" | "toggle" | "stageAll" | "unstageAll";
+export type PaletteCommand = "viewDiff" | "viewFile" | "toggle" | "stageAll" | "unstageAll" | "resolve" | "commit";
 
 /** What a palette command acts on (R18): a row key, or the message to
  *  show instead. */
 export type PaletteTarget = { ok: true; key: string } | { ok: false; message: string };
 
 export const NOTHING_SELECTED = "no row is selected in the Git section";
+export const NOTHING_STAGED = "nothing staged to commit";
 
 export function paletteTarget(cmd: PaletteCommand, selectedKey: string | null, status: Status | null, entries: EntryMap): PaletteTarget {
   if (status === null) return { ok: false, message: NO_ROWS };
+  // Commit… acts on Staged Changes whichever row is selected (R18, R26).
+  if (cmd === "commit") return status.staged.length > 0 ? { ok: true, key: STAGED_KEY } : { ok: false, message: NOTHING_STAGED };
   if (cmd === "stageAll" || cmd === "unstageAll") {
     // Whichever row is selected (R18).
     const key = cmd === "stageAll" ? CHANGES_KEY : STAGED_KEY;
@@ -118,6 +135,9 @@ export function paletteTarget(cmd: PaletteCommand, selectedKey: string | null, s
     return { ok: true, key };
   }
   if (selectedKey === null) return { ok: false, message: NOTHING_SELECTED };
+  if (cmd === "resolve") {
+    return conflicted(selectedKey, entries) ? { ok: true, key: selectedKey } : { ok: false, message: "Resolve Conflict needs a file with a merge conflict selected" };
+  }
   const isFile = entries.has(selectedKey);
   if (cmd === "viewDiff" || cmd === "viewFile") {
     if (!isFile) return { ok: false, message: `${cmd === "viewDiff" ? "View Diff" : "View File"} needs a file row selected` };
@@ -131,7 +151,7 @@ export function paletteTarget(cmd: PaletteCommand, selectedKey: string | null, s
 
 /** A menu button's widget key, and the choice it stands for. */
 const MENU_KEY_PREFIX = "menu:";
-const MENU_CHOICES: ReadonlySet<string> = new Set<MenuChoice>(["diff", "file", ...(Object.keys(BUTTON_LABEL) as ActionKind[])]);
+const MENU_CHOICES: ReadonlySet<string> = new Set<MenuChoice>(["diff", "file", "resolve", "commit", ...(Object.keys(BUTTON_LABEL) as ActionKind[])]);
 
 export function menuChoice(widgetKey: string): MenuChoice | null {
   if (!widgetKey.startsWith(MENU_KEY_PREFIX)) return null;

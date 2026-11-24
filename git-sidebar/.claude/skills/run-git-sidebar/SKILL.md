@@ -72,7 +72,7 @@ Read state that the screen doesn't show through `eval`. For example, the diff's 
 
 ```bash
 node $D eval 'const o = []; for (const b of editor.listBuffers()) if (b.name !== "gs-driver-token") o.push({ id: b.id, name: b.name, text: await editor.getBufferText(b.id) }); return o;'
-# [{"id":3,"name":"*Staged: b.md*","text":"# b"},{"id":5,"name":"b.md (staged ↔ working tree)","text":""},…,{"id":4,"name":"*Working tree: b.md*","text":"# b\nchanged"}]
+# [{"id":3,"name":"*Staged:b.md*","text":"# b"},{"id":5,"name":"b.md (staged ↔ working tree)","text":""},…,{"id":4,"name":"*Working tree:b.md*","text":"# b\nchanged"}]
 ```
 
 A script runs in its own realm. It sees `editor.*` but none of the plugin's module state, because git-sidebar exports no plugin API. To reach the plugin, use `cmd` or the screen.
