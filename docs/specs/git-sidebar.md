@@ -11,6 +11,8 @@ The UX follow-up (R19–R27) takes VS Code's Source Control view as its standard
 - tell deleted files and conflicts apart at a glance;
 - commit what is staged, without leaving the editor.
 
+The every-window follow-up (R28) gives each window its own section. Fresh's Orchestrator opens each project in its own window, so after it the user sees each project's Git section in that project, also after reopening Fresh.
+
 The plugin is the first package in a new multi-plugin repository, `deugene/fresh-plugins`.
 
 Investigation: [`docs/investigations/git-sidebar.md`](../investigations/git-sidebar.md) (cited as INV §n).
@@ -71,9 +73,14 @@ So users run `git status` in a terminal, or open Review Diff and close it again.
 - **Deleted and conflicted rows.** A deleted file's row differs from other rows only by its `D` and its colour. A conflicted row offers View Diff and View File. Fresh's resolver ("Merge: Start Resolution") is run by hand on the open file.
 - **Committing.** There is no commit: users run `git commit` in a terminal.
 
+**Before the every-window follow-up** (R1–R27 as shipped; INV §11):
+
+- **One window.** The plugin loads once per Fresh process, and mounted its one section in the window that was active at load, showing that window's folder. Other Orchestrator windows had no section.
+- **Reopening Fresh.** The Orchestrator restores the last window used, which is often not the launch folder's window, so the section seemed to be gone.
+
 ## Requirements
 
-**R1.** WHEN Fresh starts or the plugin loads in a workspace that is inside a git repository, a section shall appear in the sidebar below the file explorer.
+**R1.** WHEN Fresh starts or the plugin loads in a workspace that is inside a git repository, or a window whose folder is inside one becomes active (R28), a section shall appear in the sidebar below the file explorer.
 - It shall not take keyboard focus.
 - It shall not open a hidden file explorer.
 - IF the workspace is not inside a git repository, or git cannot be run, THEN no section shall be shown and no error shall be raised to the user.
@@ -210,6 +217,7 @@ The repository shall be initialised as a local git repository with no remote.
 - **View Diff, View File, Stage or Unstage, Resolve Conflict** act on the row selected in the section, as R14, R7, R15 and R25 describe.
 - **Stage All, Unstage All, Commit…** act on their group, as R16 and R26 describe, whichever row is selected.
 - IF no row is selected, or the action does not apply to the selected row, THEN a status message shall say so, and nothing shall change.
+- **Which section.** They act on the active window's section (R28).
 
 **R19. Open the file from its diff.** WHEN the keyboard is in a diff tab the section opened (R14) and the user presses Enter, the row's file shall open in the editor as a tab. The keyboard moves to it, and the cursor goes to the line that matches the diff's cursor:
 - **A Changes or conflicted row's diff:** the working-tree line on the cursor's row of the diff.
@@ -229,14 +237,14 @@ WHEN the keyboard is first in a diff tab the section opened, a status message sh
 
 **R21. Diff colours.** Both sides of a diff shall be coloured with the syntax Fresh picks for that file from its name or extension, as when it is opened. That includes a file at the repository root, and a file known by its name rather than its extension (such as `Makefile`). A file Fresh has no syntax for stays plain, and so does a file Fresh recognises only by its first line, such as a script with a shebang and no extension (see Decisions).
 
-**R22. Focus.** The command palette shall offer **Git Sidebar: Focus** whenever the section is shown. WHEN it runs, the keyboard shall move into the section:
+**R22. Focus.** The command palette shall offer **Git Sidebar: Focus** whenever the active window's section is shown (R28). WHEN it runs, the keyboard shall move into that section:
 - IF the explorer column is hidden, THEN it shall be shown, with the section.
 - IF the section is collapsed, THEN it shall be expanded (see Decisions).
 - IF no row is selected, THEN the first row shall be selected.
 - **A key binding.** A key the user binds to this command in their Fresh keymap shall do the same.
 - **No automatic focus.** The section still never takes the keyboard by itself (R1).
 
-**R23. Auto-reveal.** WHEN the active tab changes to a file that the section lists, WHILE the keyboard is not in the section, the section shall select that file's row and scroll it into view.
+**R23. Auto-reveal.** WHEN a window's active tab changes to a file that its section lists, WHILE the keyboard is not in the section, the section shall select that file's row and scroll it into view. A switch to another window is not a tab change (R28).
 - **Both groups.** Where the file is listed in both groups, the Changes row shall be selected, unless one of the file's two rows is already selected: then the selection shall not change.
 - **When nothing changes.** IF the file is not listed, or its row's group is collapsed, THEN the selection shall not change, and no group shall be expanded.
 - **Nothing else.** It shall not open a diff, take the keyboard, show a hidden explorer column, or expand a collapsed section.
@@ -276,6 +284,17 @@ Failure cases:
 - Resolve Conflict (R25);
 - Commit and its limits: a one-line message, and only what is staged (R26).
 
+**R28. Every window.** Fresh's Orchestrator gives each project its own window (INV §11). WHEN a window whose folder is inside a git repository becomes active, that window shall have its own Git section, showing that window's repository, and R1–R27 shall hold for it.
+- **Its own state.** Each window's section keeps its own collapsed state, group expansion, selection and diff tab across switches, and its collapsed state across restarts. The divider between the explorer and the section is the explorer's, and the explorer is one for all windows, so the height is the same in every window (INV §8 P32).
+- **Switching.** Switching windows shall not change another window's section. WHEN a window becomes active, its section shall show current status within 2 s, on a repository where `git status` completes in under 200 ms.
+- **Inactive windows.** WHILE a window is not active, no git command shall start for it, and its section shall not refresh in the background. A git command already running finishes.
+  - IF a stage, unstage, stage all, unstage all or commit cannot run in full because its window stopped being active, THEN what is left shall not run, and a status message shall say how far it got.
+- **Commands.** The palette commands (R18) and Focus (R22) shall act on the active window's section.
+- **Messages.** A status message about a window that is not active shall be shown when that window next becomes active.
+- **Windows on one folder.** Two windows on the same folder, such as a tab extracted into a window of its own, shall each have their own section.
+- **No repository.** A window whose folder is not inside a git repository has no section (R1). It shall be checked again each time that window becomes active.
+- **When it appears.** A window's section appears when that window is first shown after Fresh starts or the plugin loads.
+
 ## Out of scope
 
 - **Other changes to the repository.** Discarding changes, stashing, pushing, pulling, or anything else beyond R15/R16's staging and unstaging and R26's commit.
@@ -300,8 +319,12 @@ Failure cases:
 - **The title.** Changing its `↑A ↓B`, or adding line or file counts to it.
 - Additional git repositories:
   - repositories nested inside the workspace (sub-repos, submodules);
-  - a repository created after the plugin loaded (reload the plugin or restart Fresh instead).
-- Multiple editor windows: the section belongs to the window that was active when the plugin loaded.
+  - a repository created after its window last became active (switch to another window and back, or restart Fresh, instead).
+- **Other windows** (R28):
+  - refreshing a window that is not active;
+  - a Git section in the Orchestrator's preview of a window not yet shown since Fresh started;
+  - running a window's git while another window is active. Fresh 0.5.9's `openMachine` could do that (INV §11.4);
+  - a section height of its own per window: the divider is the explorer's (INV §8 P32).
 - Keeping group expansion across editor restarts. Groups start expanded on each start.
 - SSH remote workspaces (best effort, unverified).
 - A host without git while attached to a dev container.
@@ -320,6 +343,12 @@ Failure cases:
 - **Coexistence.** The plugin must coexist with the built-in git plugins without changing their behaviour.
 - **No unhandled promise rejections.** One kills the plugin runtime (INV §2).
 - **Dev containers.** Fresh's container authority keeps the filesystem on the host; only processes enter the container (INV §7).
+- **Windows** (INV §11):
+  - Fresh 0.5.9 has one sidebar section per plugin panel id, editor-wide, so each window's section needs an id of its own.
+  - Window ids change on every launch, and two windows can share a folder, so only a workspace's stable id keeps a section's saved state its own.
+  - Most plugin APIs act on the active window only: running git in the window's authority, contexts, status messages, prompts and opening buffers.
+  - Widget events name the active window, not the section's.
+  - No event announces a window restored at startup.
 - **Section lifetime.** The section's position, collapsed state and height belong to the host.
   - The host keeps them across a remount of the same section, but not across an unmount and mount (INV §2).
   - So R6 rules out any refresh path that removes the section.
@@ -561,6 +590,16 @@ Open Fresh on it with the plugin installed.
 
 **A27.** (R27) The README describes every item R27 lists. Following its Focus key binding example works (A22).
 
+**A28.** (R28) Fresh runs with the Orchestrator, not `--simple`, on three folders: the fixture as A (the launch folder), a second copy of it as B on branch `feature-b`, and a plain folder P. Each is opened as a window.
+- **Switching.** A switch to B shows B's section, titled `Git · feature-b`, with B's rows, and not A's. Back in A, A's section shows its rows, selection and group expansion as left, with no remount, and current status within 2 s.
+- **Writes stay in their window.** In B, `+` on `b.md` stages it in B. Back in A, A's rows have not changed. In A, Stage All from the palette changes only A.
+- **No repository.** In P there is no Git section, and the palette lists no Git Sidebar command. Back in B, they are listed again.
+- **Restart.** Collapse B's section, leave A's open, quit, relaunch in A, then switch to B: B's section is collapsed and A's is open.
+- **A write cut off.** With 2,000 untracked files in B, Stage All followed at once by a switch to A: B's remaining commands do not run, and no git runs for B while A is active. Back in B, the status bar says how many files were staged.
+- **Windows on one folder.** Extract Tab to New Workspace on a tab of A: the new window has its own section for A's repository.
+- **Closing a window.** Closing B's window from A leaves A's section working.
+- Nothing is logged above warning level.
+
 ## Decisions
 
 Decisions marked "user" were chosen by the user on 2026-11-23. Those marked "default" were proposed and accepted.
@@ -642,3 +681,17 @@ Decisions marked "user" were chosen by the user on 2026-11-23. Those marked "def
 | After Commit… from the menu, the keyboard is in the editor (R17's exception) | The prompt takes the keyboard, and Fresh gives it to the editor when the prompt answers, as after the palette (INV §8 P30). Only Focus moves the keyboard into the section (R22), and the section never takes it by itself (R1) | user |
 | Auto-reveal keeps a file's Staged row when it is already selected (R23) | Trading it for the Changes row moved the row Space acts on: seen live, opening a file from its Staged diff then made Space stage instead of unstage. VS Code also leaves its selection alone when it already is the active file (INV §10.3 c) | user |
 | Esc at the commit prompt says the commit was cancelled (R26) | Fresh draws its own "Search cancelled." beside the plugin's last message, which was left standing: seen live as `Search cancelled. \| nothing staged to commit` with a file staged (INV §8, live checks) | user |
+
+**2026-11-24 every window.** Proposed with R28 ("default"), and open at spec approval. The user asked for the section in every project.
+
+| Decision | Why | Source |
+|---|---|---|
+| One section per window, each with its own panel id | Fresh 0.5.9 has one section per panel id, editor-wide: a mount with another window's scope moves it (INV §11.1) | user |
+| The panel id comes from the window's stable id, or from its folder when the stable id is empty | Window ids change on every launch, and two windows can share a folder. The saved collapsed state is keyed by panel id (INV §11.2) | default |
+| A window's section is mounted when the window becomes active, at load for the launch window, never earlier | A mount before Fresh restores the window turns its saved layout into a hint that is not applied. A mount on activation claims it (INV §11.2, §8 P32) | default |
+| Only the active window's section refreshes, and git starts only for it | `runOnTarget` runs on the active window's authority, and status messages and contexts go to the active window (INV §11.4). It also keeps R11's 25% across windows. `openMachine` could lift the first limit later | default |
+| A stage, unstage or commit not yet run when its window stops being active is not run, and says so when the window is active again | Running it would take the wrong window's authority. Switching in the middle of a write is rare | default |
+| Status messages about an inactive window wait until it is active again, all of them in order, shown together; a repeat of the last one waiting is kept once | `setStatus` writes to the active window, where the message would name another project's files. Keeping only the last would lose a git failure's reason (R15) under a later "not run". A repeat back to back adds nothing to read | default |
+| Windows on one repository share one write queue | Two windows on one folder, or on folders of one repository, would otherwise write at once and collide on `.git/index.lock` (R15, INV §8 P16) | default |
+| A section restarts on `authority_changed` only when its own window's label changed | The hook also comes on a switch between windows with different authorities (INV §11.4). Restarting then would drop the window's mode, and the outcome of a write still running (R15, R26) | default |
+| Load unmounts the old panel id 1 once | The host keeps a section across a plugin reload, so an update without a restart would leave the old section on screen beside the new one (INV §2). A window's saved state under id 1 is dropped once, so its collapsed state resets after the upgrade | default |

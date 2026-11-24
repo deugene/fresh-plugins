@@ -1,9 +1,9 @@
 import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { deferred, FakeEditor, type ProcCall, type ProcOutcome } from "./fake_editor.ts";
+import { deferred, FakeEditor, panelOf, type ProcCall, type ProcOutcome, type ProcResult } from "./fake_editor.ts";
 import { rowKind, UNKNOWN_NOTICE, VOLUME_NOTICE, type TreeSpec } from "../lib/view.ts";
-import { NOTHING_SELECTED } from "../lib/actions.ts";
+import { NOT_SHOWN, NOTHING_SELECTED } from "../lib/actions.ts";
 import { DIFF_HINT } from "../lib/diff.ts";
 import { COMMIT_BUSY } from "../lib/stage.ts";
 import { fixture, GS_VOLUME, H, inspectResult, manyUntracked, mod, pathsOf, pwdResult, raw, texts, untracked } from "./helpers.ts";
@@ -19,10 +19,12 @@ let rejections: unknown[] = [];
 const onRejection = (e: unknown) => rejections.push(e);
 let loads = 0;
 
-/** A repository at /repo whose `git status` prints `state.status`. */
+/** A repository at /repo (or `root`) whose `git status` prints `state.status`. */
 interface Repo {
   status: string;
   code: number;
+  /** Its top level, as `rev-parse --show-toplevel` prints it (default /repo). */
+  root?: string;
   revParseCode?: number;
   /** `pwd` in the container: its workspace folder. */
   pwd?: ProcOutcome;
@@ -80,7 +82,7 @@ function repoScript(repo: Repo): (c: ProcCall) => ProcOutcome {
     }
     if (c.args[0] === "rev-parse") {
       const code = repo.revParseCode ?? repo.code;
-      return code === 0 ? { code: 0, stdout: "/repo\n", stderr: "" } : { code, stdout: "", stderr: "fatal: not a git repository" };
+      return code === 0 ? { code: 0, stdout: `${repo.root ?? "/repo"}\n`, stderr: "" } : { code, stdout: "", stderr: "fatal: not a git repository" };
     }
     if (repo.statusOutcome) return repo.statusOutcome();
     return repo.code === 0 ? { code: 0, stdout: repo.status, stderr: "" } : { code: repo.code, stdout: "", stderr: "fatal" };
@@ -90,9 +92,9 @@ function repoScript(repo: Repo): (c: ProcCall) => ProcOutcome {
 /** The repository the last `load` scripted. */
 let currentRepo: Repo = { status: "", code: 0 };
 
-async function load(repo: Repo, opts: { git?: boolean } = {}): Promise<void> {
+async function load(repo: Repo, opts: { git?: boolean; script?: (c: ProcCall) => ProcOutcome } = {}): Promise<void> {
   currentRepo = repo;
-  fake.script = repoScript(repo);
+  fake.script = opts.script ?? repoScript(repo);
   if (opts.git !== false) fake.files.add("/repo/.git");
   await import(`../git_sidebar.ts?load=${++loads}`);
   await fake.flush();
@@ -107,6 +109,9 @@ function mounts() {
   }));
 }
 const lastMount = () => mounts().at(-1)!;
+/** Unmounts of a section's panel (the active window's by default): not the
+ *  legacy id-1 panel load clears, nor the menu. */
+const sectionUnmounts = (panel = fake.panel) => fake.named("unmountFloatingWidget").filter((c) => c.args[0] === panel);
 const mutations = () => fake.named("widgetMutate").map((c) => c.args[1] as { kind: string; keys?: string[]; index?: number });
 
 function assertEveryMountHasOptions(window = 1): void {
@@ -127,7 +132,8 @@ const listedNow = () => [...fake.palette()].filter(([, listed]) => listed).map((
 const click = (index: number, key: string) => fake.widget("select", { index, key, via: "click" });
 const statuses = () => fake.named("setStatus").map((c) => c.args[0] as string);
 /** The argv of every git write (`--literal-pathspecs …`, or `commit …`) so far. */
-const writes = () => fake.gitCalls().filter((p) => p.args[0] === "--literal-pathspecs" || p.args[0] === "commit").map((p) => p.args);
+const writeCalls = () => fake.gitCalls().filter((p) => p.args[0] === "--literal-pathspecs" || p.args[0] === "commit");
+const writes = () => writeCalls().map((p) => p.args);
 /** Every `cat-file` read so far, each object id shown as the spec it was
  *  resolved from. */
 const catFiles = () =>
@@ -148,9 +154,29 @@ const shownBuffers = () => fake.named("showBuffer").map((c) => c.args[0] as numb
 /** Each source's text, left then right, of every view built. */
 const sourceTexts = () => vbufOpts().map((o) => o.entries.map((e) => e.text).join(""));
 
-/** A fresh editor for a second scenario within one test. */
+/** Every git run is a lock-free read, a write with literal paths (R11,
+ *  R15), or a commit, which names no paths and must not export the flag to
+ *  hooks (R26, INV §8 P30). With windows, no git or docker starts outside
+ *  the active window's folder (R28); `pwd` runs in the container, with no
+ *  cwd. */
+function assertProcsAllowed(): void {
+  for (const p of fake.allProcs.filter((x) => x.program === "git")) {
+    assert.ok(["--no-optional-locks", "rev-parse", "--literal-pathspecs", "commit"].includes(p.args[0]), p.args.join(" "));
+    if (p.args[0] === "commit") assert.ok(!p.args.includes("--literal-pathspecs"), p.args.join(" "));
+  }
+  if (fake.windows !== null) {
+    for (const p of fake.allProcs.filter((x) => x.program !== "pwd")) {
+      const inRoot = p.windowRoot !== null && (p.cwd === p.windowRoot || p.cwd.startsWith(`${p.windowRoot}/`));
+      assert.ok(inRoot, `${p.program} ${p.args.join(" ")} in ${p.cwd} while window ${p.window} (${p.windowRoot}) was active`);
+    }
+  }
+}
+
+/** A fresh editor for a second scenario within one test. The first
+ *  scenario's runs are checked as `afterEach` checks the last one's. */
 function restartFake(): void {
   fake.uninstall();
+  assertProcsAllowed();
   fake = new FakeEditor();
   fake.install();
 }
@@ -166,13 +192,7 @@ afterEach(() => {
   process.off("unhandledRejection", onRejection);
   fake.uninstall();
   assert.deepEqual(rejections, [], "unhandled rejections");
-  // Every git run is a lock-free read, a write with literal paths (R11,
-  // R15), or a commit, which names no paths and must not export the flag to
-  // hooks (R26, INV §8 P30).
-  for (const p of fake.allProcs.filter((x) => x.program === "git")) {
-    assert.ok(["--no-optional-locks", "rev-parse", "--literal-pathspecs", "commit"].includes(p.args[0]), p.args.join(" "));
-    if (p.args[0] === "commit") assert.ok(!p.args.includes("--literal-pathspecs"), p.args.join(" "));
-  }
+  assertProcsAllowed();
 });
 
 test("load: placeholder mounted at once, then the real title; both options on every mount", async () => {
@@ -190,7 +210,7 @@ test("load: placeholder mounted at once, then the real title; both options on ev
   assert.ok(texts(lastMount().spec).includes("Changes 5"));
   assert.equal(lastMount().rows, 0);
   assertEveryMountHasOptions();
-  assert.equal(fake.named("unmountFloatingWidget").length, 0);
+  assert.equal(sectionUnmounts().length, 0);
   assert.deepEqual(fake.loudCalls(), []);
 });
 
@@ -200,7 +220,14 @@ test("no section in a non-repository; nothing logged above debug; no retries", a
   assert.equal(mounts().length, 0);
   // The one widget call takes down a section a previous instance of the
   // plugin left mounted across a reload (a no-op when there is none).
-  assert.deepEqual(fake.widgetCalls().map((c) => c.name), ["unmountFloatingWidget"]);
+  // The legacy panel at load (R28), then the placeholder taken down (R1).
+  assert.deepEqual(
+    fake.widgetCalls().map((c) => [c.name, c.args[0]]),
+    [
+      ["unmountFloatingWidget", 1],
+      ["unmountFloatingWidget", fake.panel],
+    ],
+  );
   assert.deepEqual(fake.loudCalls(), []);
   assert.equal(fake.gitCalls().length, 1, "one rev-parse, then quiet until the authority changes");
 });
@@ -210,7 +237,7 @@ test("no section when git cannot run (code -1), even where .git exists", async (
   await fake.advance(30_000);
   // The placeholder is the only mount, and it is taken down again.
   assert.equal(mounts().length, 1);
-  assert.equal(fake.named("unmountFloatingWidget").length, 1);
+  assert.equal(sectionUnmounts().length, 1);
   assert.deepEqual(fake.loudCalls(), []);
   assert.equal(fake.gitCalls().length, 1);
 });
@@ -414,7 +441,7 @@ test("container with a bind mount: exit_code 128 gives no section", async () => 
   fake.label = "Container:abc";
   await load({ status: "", code: 128, inspect: BIND_INSPECT });
   await fake.advance(10_000);
-  assert.equal(fake.named("unmountFloatingWidget").length, 1);
+  assert.equal(sectionUnmounts().length, 1);
   assert.equal(mounts().length, 1);
   assert.deepEqual(fake.loudCalls(), []);
 });
@@ -432,7 +459,7 @@ test("authority_changed re-detects the mode and refreshes; detach goes back to r
   assert.ok(fake.procs.some((p) => p.program === "docker"));
   assert.ok(fake.gitCalls().length >= 1 && fake.gitCalls().every((p) => p.via === "host"));
   assert.equal(fake.named("updateFloatingWidget").length, 1, "same title, rows updated within 5 s");
-  assert.equal(fake.named("unmountFloatingWidget").length, 0);
+  assert.equal(sectionUnmounts().length, 0);
   fake.clear();
   fake.label = "";
   await fake.emit("authority_changed", { label: "" });
@@ -460,7 +487,7 @@ test("volume workspace: one notice row, no git at all, nothing polled", async ()
   await fake.emit("authority_changed", { label: "" });
   await fake.advance(1_000);
   assert.equal(lastMount().title, "Git · main ↑1 ↓0");
-  assert.equal(fake.named("unmountFloatingWidget").length, 0);
+  assert.equal(sectionUnmounts().length, 0);
 });
 
 test("attaching to a volume container never shows the host's rows", async () => {
@@ -483,32 +510,33 @@ test("a first run that times out keeps the placeholder and is retried; a later s
   assert.equal(fake.kills, 1, "the first status timed out");
   assert.equal(mounts().length, 1);
   assert.equal(lastMount().title, "Git");
-  assert.equal(fake.named("unmountFloatingWidget").length, 0);
+  assert.equal(sectionUnmounts().length, 0);
   // A run that fails with an ordinary code does not give up either.
   repo.statusOutcome = () => ({ code: 1, stdout: "", stderr: "transient" });
   await fake.advance(40_000);
-  assert.equal(fake.named("unmountFloatingWidget").length, 0);
+  assert.equal(sectionUnmounts().length, 0);
   repo.statusOutcome = undefined;
   await fake.advance(5_000);
   assert.equal(lastMount().title, "Git · main ↑1 ↓0");
   assert.ok(hasFileRows(lastShown()));
-  assert.equal(fake.named("unmountFloatingWidget").length, 0);
+  assert.equal(sectionUnmounts().length, 0);
   assert.deepEqual(fake.loudCalls(), []);
 });
 
-test("every mount is scoped to the window active at load, and the workspace is read once", async () => {
+test("every mount is scoped to the window active at load, as its workspace's panel; its folder is read once, from listWindows (R28)", async () => {
   fake.window = 7;
+  fake.windows = [{ id: 7, stable_id: "ws-7", root: "/repo" }];
+  assert.equal(fake.panel, panelOf("ws-7"));
   const repo: Repo = { status: ACCEPTANCE, code: 0, inspect: BIND_INSPECT, pwd: BIND_PWD };
   await load(repo);
   await fake.advance(200);
-  // Another window becomes active, with another folder.
-  fake.window = 9;
+  // `getCwd` names another folder by now: the section keeps its window's.
   fake.cwd = "/elsewhere";
   repo.status = ACCEPTANCE.replace("# branch.head main", "# branch.head other");
   await fake.emit("focus_gained", {});
   await fake.advance(1000);
   assert.equal(lastMount().title, "Git · other ↑1 ↓0");
-  // Attaching re-detects against the load-time workspace (/repo): still bind.
+  // Attaching re-detects against the window's folder (/repo): still bind.
   fake.label = "Container:abc";
   await fake.emit("authority_changed", { label: fake.label });
   await fake.advance(1000);
@@ -516,6 +544,8 @@ test("every mount is scoped to the window active at load, and the workspace is r
   assert.ok(fake.gitCalls().some((p) => p.via === "host"));
   assert.equal(mounts().length, 3);
   assertEveryMountHasOptions(7);
+  for (const c of fake.named("mountSidebarSection")) assert.equal(c.args[0], fake.panel);
+  assert.equal(fake.named("getCwd").length, 0);
   for (const p of fake.procs) if (p.program !== "pwd") assert.equal(p.cwd, "/repo", `${p.program} ${p.args[0]}`);
 });
 
@@ -585,7 +615,7 @@ test("detaching from a volume container into a non-git folder removes the notice
   await fake.emit("authority_changed", { label: "" });
   await fake.advance(1000);
   assert.equal(fake.gitCalls().length, 1, "one rev-parse");
-  assert.equal(fake.named("unmountFloatingWidget").length, 1);
+  assert.equal(sectionUnmounts().length, 1);
   fake.clear();
   await fake.advance(60_000);
   assert.deepEqual(fake.procs, []);
@@ -597,7 +627,7 @@ test("trust_changed retries after a blocked first run", async () => {
   const repo: Repo = { status: ACCEPTANCE, code: -1 };
   await load(repo);
   await fake.advance(1000);
-  assert.equal(fake.named("unmountFloatingWidget").length, 1, "no section");
+  assert.equal(sectionUnmounts().length, 1, "no section");
   assert.equal(fake.gitCalls().length, 1);
   repo.code = 0;
   await fake.emit("trust_changed", { level: "trusted" });
@@ -626,7 +656,7 @@ test("trust_changed during a first run: the stale run's failure does not cancel 
   // The run started before the trust change comes back blocked.
   blocked.resolve({ code: -1, stdout: "", stderr: "denied by workspace trust" });
   await fake.advance(1000);
-  assert.equal(fake.named("unmountFloatingWidget").length, 0);
+  assert.equal(sectionUnmounts().length, 0);
   assert.equal(fake.gitCalls().length, 3, "the retry ran");
   assert.equal(lastMount().title, "Git · main ↑1 ↓0");
   assert.ok(hasFileRows(lastShown()));
@@ -768,7 +798,7 @@ test("container detection that fails shows the retry notice, never host rows, an
   assert.equal(lastMount().title, "Git · main ↑1 ↓0");
   assert.ok(hasFileRows(lastShown()));
   assert.ok(fake.gitCalls().every((p) => p.via === "host"));
-  assert.equal(fake.named("unmountFloatingWidget").length, 0);
+  assert.equal(sectionUnmounts().length, 0);
 });
 
 test("a local run in flight across an attach to a volume container never draws host rows", async () => {
@@ -880,15 +910,20 @@ test("a workspace below the repository root mounts the placeholder at load", asy
 // R14: the diff on a click or Enter
 // ---------------------------------------------------------------------------
 
+/** b.md and a.ts on disk under `root`, as the acceptance fixture has them. */
+function acceptanceOnDisk(root = "/repo"): void {
+  fake.files.add(`${root}/b.md`);
+  fake.contents.set(`${root}/b.md`, "# b\nchanged\n");
+  fake.files.add(`${root}/a.ts`);
+  fake.contents.set(`${root}/a.ts`, "export const a = 4;\n");
+}
+
 /** The acceptance repository with b.md on disk as the fixture has it. */
 async function loadAcceptance(extra: Partial<Repo> = {}): Promise<Repo> {
   const repo: Repo = { status: ACCEPTANCE, code: 0, blobs: ACC_BLOBS, ...extra };
   await load(repo);
   await fake.advance(200);
-  fake.files.add("/repo/b.md");
-  fake.contents.set("/repo/b.md", "# b\nchanged\n");
-  fake.files.add("/repo/a.ts");
-  fake.contents.set("/repo/a.ts", "export const a = 4;\n");
+  acceptanceOnDisk();
   fake.clear();
   return repo;
 }
@@ -1140,7 +1175,9 @@ test("authority_changed in the middle of a build leaves no buffers", async () =>
   await click(5, "c:b.md");
   await fake.advance(50);
   assert.equal(fake.openBuffers().size, 2, "sources made, composite pending");
-  await fake.emit("authority_changed", { label: "" });
+  // An attach: the label changes.
+  fake.label = "Container:abc";
+  await fake.emit("authority_changed", { label: fake.label });
   release();
   await fake.advance(50);
   assert.equal(shownBuffers().length, 0);
@@ -1335,7 +1372,7 @@ test("+ on b.md: exactly one literal add in the root, then b.md is listed under 
   fake.clear();
   await fake.widget("action", { index: 5, key: "c:b.md", via: "click" });
   await fake.advance(2000);
-  const ws = fake.gitCalls().filter((p) => p.args[0] === "--literal-pathspecs");
+  const ws = writeCalls();
   assert.deepEqual(ws.map((p) => [p.args, p.cwd, p.via]), [[["--literal-pathspecs", "add", "--", "b.md"], "/repo", "target"]]);
   // A status run followed the write.
   const order = fake.gitCalls().map((p) => p.args[0]);
@@ -1525,8 +1562,7 @@ test("in a bind-mounted dev container, writes run on the host in the root (R13, 
   await fake.advance(200);
   await fake.widget("action", { index: 5, key: "c:b.md", via: "click" });
   await fake.advance(50);
-  const w = fake.gitCalls().filter((p) => p.args[0] === "--literal-pathspecs");
-  assert.deepEqual(w.map((p) => [p.via, p.cwd]), [["host", "/repo"]]);
+  assert.deepEqual(writeCalls().map((p) => [p.via, p.cwd]), [["host", "/repo"]]);
 });
 
 test("a write queued across a trust change is not run, and says why; after the end it is not run and says nothing (R15)", async () => {
@@ -1706,7 +1742,8 @@ test("a group op across an authority change stops and only logs", async () => {
   await fake.widget("activate", { index: 1, key: "g:c", via: "space" });
   await fake.advance(50);
   assert.equal(writes().length, 1);
-  await fake.emit("authority_changed", { label: "" });
+  fake.label = "Container:abc";
+  await fake.emit("authority_changed", { label: fake.label });
   gate.resolve({ code: 0, stdout: "", stderr: "" });
   await fake.advance(1000);
   assert.equal(writes().length, 1, "no more chunks after the restart");
@@ -1881,7 +1918,7 @@ test("Esc on the menu (panel 2 cancel) changes nothing and leaves the section li
   await fake.widget("cancel", {}, { panel: 2, widgetKey: "menu:diff" });
   await fake.advance(1000);
   assert.deepEqual(writes(), []);
-  assert.equal(fake.named("unmountFloatingWidget").length, 0);
+  assert.equal(sectionUnmounts().length, 0);
   assert.ok(fake.armedTimers() > 0, "refresh still armed");
   // Still refreshing, and still drawing.
   repo.status = raw({ records: [untracked("later.txt")] });
@@ -2323,7 +2360,7 @@ test("Focus with nothing selected selects the first row, then moves the keyboard
   await loadAcceptance();
   await fake.command(FOCUS);
   assert.deepEqual(mutations(), [{ kind: "setSelectedIndex", widgetKey: "git", index: 0 }]);
-  assert.deepEqual(focusCalls(), [[1, "focus", 0]]);
+  assert.deepEqual(focusCalls(), [[fake.panel, "focus", 0]]);
   // The selection order: the row first, then the keyboard.
   const names = fake.widgetCalls().map((c) => c.name);
   assert.deepEqual(names, ["widgetMutate", "floatingPanelControl"]);
@@ -2339,14 +2376,14 @@ test("Focus keeps an existing selection (R22)", async () => {
   fake.clear();
   await fake.command(FOCUS);
   assert.deepEqual(mutations(), []);
-  assert.deepEqual(focusCalls(), [[1, "focus", 0]]);
+  assert.deepEqual(focusCalls(), [[fake.panel, "focus", 0]]);
 });
 
 test("Focus under the placeholder and the volume notice moves the keyboard in, with no message (R22, A18)", async () => {
   await load({ status: ACCEPTANCE, code: 0, statusOutcome: () => "hang" });
   fake.clear();
   await fake.command(FOCUS);
-  assert.deepEqual(focusCalls(), [[1, "focus", 0]]);
+  assert.deepEqual(focusCalls(), [[fake.panel, "focus", 0]]);
   assert.deepEqual(mutations(), [], "no rows to select under the placeholder");
   assert.deepEqual(statuses(), []);
   restartFake();
@@ -2356,7 +2393,7 @@ test("Focus under the placeholder and the volume notice moves the keyboard in, w
   assert.deepEqual(texts(lastShown()), [VOLUME_NOTICE]);
   fake.clear();
   await fake.command(FOCUS);
-  assert.deepEqual(focusCalls(), [[1, "focus", 0]]);
+  assert.deepEqual(focusCalls(), [[fake.panel, "focus", 0]]);
   assert.deepEqual(statuses(), []);
   assert.deepEqual(fake.gitCalls(), []);
 });
@@ -2368,7 +2405,7 @@ test("Focus is not listed outside a repository; run from a key binding there, it
   fake.clear();
   await fake.fire("gitSidebar_focus");
   assert.deepEqual(focusCalls(), []);
-  assert.deepEqual(statuses(), ["the Git section is not shown"]);
+  assert.deepEqual(statuses(), [NOT_SHOWN]);
 });
 
 test("load, refreshes and remounts never send focus: only the Focus command does (R22, R1)", async () => {
@@ -2760,7 +2797,7 @@ test("auto-reveal waits while the keyboard is in the section, by its focus or th
   assert.deepEqual(selects(), [5]);
   // Into the section by Alt+Shift+N: only the chrome event counts here.
   fake.clear();
-  await chrome("section", "git_sidebar", 1);
+  await chrome("section", "git_sidebar", fake.panel);
   await switchTo(8, "/repo/gone.ts");
   assert.deepEqual(selects(), []);
   // Out of it with no blur, as after a remount (P28 c).
@@ -2853,7 +2890,7 @@ test("the diff's hint waits while the keyboard is in the section, then shows onc
   await chrome("editor");
   assert.deepEqual(statuses(), [DIFF_HINT]);
   // Back to the section and into the diff again: said once per diff.
-  await chrome("section", "git_sidebar", 1);
+  await chrome("section", "git_sidebar", fake.panel);
   await chrome("editor");
   assert.deepEqual(statuses(), [DIFF_HINT]);
 });
@@ -2880,7 +2917,7 @@ test("a waiting hint shows on a tab change to its diff with the keyboard in the 
   await click(4, "c:a.ts");
   await fake.advance(50);
   const [second] = shownBuffers();
-  await fake.emit("buffer_closed", { buffer_id: second });
+  await fake.emit("buffer_closed", { buffer_id: second, window_id: 1 });
   await fake.advance(50);
   fake.activeBuffer = 99;
   await chrome("editor");
@@ -2902,7 +2939,7 @@ test("a diff opened with the keyboard outside the section, as from the palette, 
   assert.equal(shownBuffers().length, 1);
   assert.deepEqual(statuses(), [DIFF_HINT]);
   // Nothing waits: a later move into the editor says nothing more.
-  await chrome("section", "git_sidebar", 1);
+  await chrome("section", "git_sidebar", fake.panel);
   await chrome("editor");
   assert.deepEqual(statuses(), [DIFF_HINT]);
 });
@@ -2940,4 +2977,536 @@ test("a restart during the summary read: the commit is logged, not left unreport
   await fake.advance(50);
   assert.ok(!statuses().some((s) => s.startsWith("committed")));
   assert.ok(fake.named("debug").some((c) => String(c.args[0]).includes("committed abc1234: first (finished after a restart)")));
+});
+
+// ---------------------------------------------------------------------------
+// R28: every window
+// ---------------------------------------------------------------------------
+
+const B_STATUS = ACCEPTANCE.replace("# branch.head main", "# branch.head feature-b");
+const PANEL_A = panelOf("ws-1");
+const PANEL_B = panelOf("ws-2", "/b");
+const ROWS_CTX = "git-sidebar-rows";
+const SHOWN_CTX = "git-sidebar-shown";
+/** A write in /b that fails on a held lock, and what the status bar says. */
+const LOCKED: ProcResult = { code: 128, stdout: "", stderr: "fatal: Unable to create '/b/.git/index.lock': File exists.\n" };
+const LOCKED_MSG = "could not stage b.md: Unable to create '.git/index.lock': File exists.";
+/** Every write fails on the lock, after 300 ms. */
+const lockedWrite = (): ProcOutcome => ({ result: LOCKED, ms: 300 });
+
+/** Window 1 on /repo (the launch window), 2 on /b (a repository on
+ *  feature-b), 3 on /plain (no repository). */
+function threeWindows(): void {
+  fake.windows = [
+    { id: 1, stable_id: "ws-1", root: "/repo" },
+    { id: 2, stable_id: "ws-2", root: "/b" },
+    { id: 3, stable_id: "ws-3", root: "/plain" },
+  ];
+  fake.files.add("/b/.git");
+}
+
+/** Two windows on /repo: the launch window, and one a tab was extracted
+ *  into (INV §8 P31 e). */
+const twins = () => [
+  { id: 1, stable_id: "ws-1", root: "/repo" },
+  { id: 5, stable_id: "ws-co", root: "/repo" },
+];
+
+/** `a` answers in /repo, `b` in /b; /plain is no repository. */
+function windowsScript(a: Repo, b: Repo): (c: ProcCall) => ProcOutcome {
+  const inA = repoScript(a);
+  const inB = repoScript({ root: "/b", ...b });
+  const plain = repoScript({ status: "", code: 128 });
+  return (c) => (c.cwd.startsWith("/plain") ? plain(c) : c.cwd.startsWith("/b") ? inB(c) : inA(c));
+}
+
+/** Load in window 1 with three windows; window 1 shows its rows. */
+async function loadWindows(a: Repo = { status: ACCEPTANCE, code: 0 }, b: Repo = { status: B_STATUS, code: 0 }): Promise<void> {
+  threeWindows();
+  await load(a, { script: windowsScript(a, b) });
+  await fake.advance(200);
+}
+
+/** `loadWindows`, then a switch to window 2, which shows B's rows. */
+async function loadInB(a?: Repo, b?: Repo): Promise<void> {
+  await loadWindows(a, b);
+  await fake.switchWindow(2);
+  await fake.advance(500);
+}
+
+const inB = (p: ProcCall) => p.cwd.startsWith("/b");
+const sectionMounts = (panel: number) => fake.named("mountSidebarSection").filter((c) => c.args[0] === panel);
+const sectionUpdates = (panel: number) => fake.named("updateFloatingWidget").filter((c) => c.args[0] === panel);
+/** The panel ids mounted since the last clear, each once. */
+const mountedPanels = () => [...new Set(fake.named("mountSidebarSection").map((c) => c.args[0]))];
+/** The status messages said while `window` was active. */
+const statusesIn = (window: number) => fake.named("setStatus").filter((c) => c.window === window).map((c) => c.args[0] as string);
+
+test("a switch to another repository's window mounts its own section, scoped to it, with its own panel and rows; the first one stays (R28)", async () => {
+  const a: Repo = { status: ACCEPTANCE, code: 0 };
+  await loadWindows(a);
+  assert.equal(lastMount().title, "Git · main ↑1 ↓0");
+  fake.clear();
+  await fake.switchWindow(2);
+  await fake.advance(500);
+  assert.deepEqual(
+    fake.named("mountSidebarSection").map((c) => [c.args[0], c.args[2]]),
+    [
+      [PANEL_B, "Git"],
+      [PANEL_B, "Git · feature-b ↑1 ↓0"],
+    ],
+  );
+  assertEveryMountHasOptions(2);
+  assert.notEqual(PANEL_A, PANEL_B);
+  assert.ok(fake.gitCalls().length > 0);
+  for (const p of fake.gitCalls()) assert.ok(inB(p), `${p.args.join(" ")} in ${p.cwd}`);
+  assert.deepEqual(sectionUnmounts(PANEL_A), [], "window 1's section is not taken down");
+  // Back in window 1: no remount, and current status within 2 s (R8).
+  fake.clear();
+  a.status = ACCEPTANCE.replace("? new/c.txt\0", "");
+  await fake.switchWindow(1);
+  await fake.advance(2000);
+  assert.deepEqual(fake.named("mountSidebarSection"), []);
+  assert.equal(sectionUpdates(PANEL_A).length, 1);
+  for (const p of fake.gitCalls()) assert.equal(p.cwd, "/repo");
+});
+
+test("only the active window refreshes; triggers refresh it alone (R28, R11)", async () => {
+  await loadInB();
+  fake.clear();
+  await fake.advance(30_000);
+  assert.ok(fake.gitCalls().length >= 3, "B polls");
+  for (const p of fake.gitCalls()) assert.ok(inB(p), `only B: ${p.cwd}`);
+  fake.clear();
+  for (const ev of ["after_file_save", "after_file_revert", "focus_gained", "after_file_explorer_change"]) await fake.emit(ev, {});
+  await fake.advance(500);
+  assert.ok(fake.gitCalls().length > 0);
+  for (const p of fake.gitCalls()) assert.ok(inB(p), `only B: ${p.cwd}`);
+});
+
+test("a folder with no repository: no section and no palette commands; checked again on each activation (R28, R1)", async () => {
+  await loadWindows();
+  assert.equal(fake.contextOn(ROWS_CTX, 1), true);
+  // A context left set in window 3, as by an earlier load of the plugin.
+  fake.window = 3;
+  getEditor().setContext(ROWS_CTX, true);
+  fake.window = 1;
+  fake.clear();
+  await fake.switchWindow(3);
+  await fake.advance(500);
+  assert.deepEqual(fake.named("mountSidebarSection"), [], "no .git under /plain");
+  assert.equal(fake.contextOn(ROWS_CTX, 3), false);
+  assert.equal(fake.contextOn(SHOWN_CTX, 3), false);
+  assert.deepEqual(listedNow(), []);
+  assert.deepEqual(fake.loudCalls(), []);
+  assert.equal(fake.gitCalls().filter((p) => p.cwd === "/plain").length, 1, "one rev-parse");
+  // Away and back: asked again, once.
+  await fake.switchWindow(2);
+  await fake.advance(500);
+  fake.clear();
+  await fake.switchWindow(3);
+  await fake.advance(500);
+  assert.equal(fake.gitCalls().filter((p) => p.cwd === "/plain").length, 1);
+  assert.equal(fake.contextOn(ROWS_CTX, 2), true, "B's contexts stay with B");
+});
+
+test("contexts follow the active window, also after a stale switch event (R28, R18, R22, INV §8 P33)", async () => {
+  await loadInB(undefined, { status: B_STATUS, code: 0, statusOutcome: () => "hang" });
+  // B shows its placeholder (its status hangs): Focus listed, no row commands.
+  assert.equal(fake.contextOn(SHOWN_CTX, 2), true);
+  assert.equal(fake.contextOn(ROWS_CTX, 2), false);
+  assert.deepEqual(listedNow(), [FOCUS]);
+  assert.equal(fake.contextOn(ROWS_CTX, 1), true, "A's are A's");
+  // A→B→A, fast: the event for B is handled with A active again.
+  fake.window = 1;
+  await fake.emit("active_window_changed", { previous_id: 1, active_id: 2 });
+  assert.equal(fake.contextOn(ROWS_CTX, 1), true);
+  assert.ok(listedNow().includes("Git Sidebar: Stage All"));
+});
+
+test("palette commands and Focus act on the active window's section (R28, R18, R22)", async () => {
+  await loadInB();
+  fake.clear();
+  await fake.command("Git Sidebar: Stage All");
+  await fake.advance(1000);
+  assert.ok(writeCalls().length > 0);
+  for (const w of writeCalls()) assert.ok(inB(w), w.cwd);
+  fake.clear();
+  await fake.command(FOCUS);
+  assert.deepEqual(focusCalls(), [[PANEL_B, "focus", 0]]);
+  // In the folder with no repository, a bound key says so.
+  await fake.switchWindow(3);
+  await fake.advance(500);
+  fake.clear();
+  await fake.fire("gitSidebar_focus");
+  assert.deepEqual(statuses(), [NOT_SHOWN]);
+  assert.deepEqual(focusCalls(), []);
+});
+
+test("widget events are routed by panel, whatever window they name; other panels are ignored (R28, INV §11.4)", async () => {
+  await loadInB();
+  fake.clear();
+  // B's button, in an event that names window 1.
+  await fake.emit("widget_event", { window_id: 1, panel_id: PANEL_B, widget_key: "git", event_type: "action", payload: { index: 5, key: "c:b.md" }, focus_key: "git" });
+  await fake.advance(500);
+  assert.deepEqual(
+    writeCalls().map((p) => [p.cwd, p.args.at(-1)]),
+    [["/b", "b.md"]],
+  );
+  // The legacy panel, or anyone else's: nothing.
+  fake.clear();
+  await fake.widget("cancel", {}, { panel: 1 });
+  await fake.advance(3000);
+  assert.ok(fake.gitCalls().some(inB), "B still refreshes");
+});
+
+test("a switch closes the right-click menu; a choice after it does nothing (R28, R17)", async () => {
+  await loadWindows();
+  await rightClick(5, "c:b.md", 3, 10);
+  assert.equal(menuMounts().length, 1);
+  fake.clear();
+  await fake.switchWindow(2);
+  await fake.advance(500);
+  assert.deepEqual(
+    fake.named("unmountFloatingWidget").map((c) => c.args[0]),
+    [2],
+  );
+  fake.clear();
+  await choose("stage");
+  await fake.advance(500);
+  assert.deepEqual(writes(), []);
+});
+
+test("closing an inactive window ends only its section: no buffer closes, and the active window keeps refreshing (R28, INV §8 P31 f)", async () => {
+  await loadInB(undefined, { status: B_STATUS, code: 0, blobs: ACC_BLOBS });
+  acceptanceOnDisk("/b");
+  // A diff open in B.
+  await click(5, "c:b.md");
+  await fake.advance(50);
+  assert.equal(shownBuffers().length, 1);
+  await fake.switchWindow(1);
+  await fake.advance(500);
+  fake.clear();
+  await fake.closeWindow(2);
+  await fake.advance(50);
+  assert.deepEqual(fake.named("closeBuffer"), []);
+  assert.deepEqual(fake.named("closeCompositeBuffer"), []);
+  fake.clear();
+  await fake.advance(30_000);
+  assert.ok(fake.gitCalls().length >= 3, "A still polls");
+  for (const p of fake.gitCalls()) assert.equal(p.cwd, "/repo");
+  assert.deepEqual(sectionMounts(PANEL_B), []);
+  assert.ok(fake.armedTimers() > 0);
+});
+
+test("a status that settles after a switch draws into the parked section and leaves the active window's timer alone (R28)", async () => {
+  const a: Repo = { status: ACCEPTANCE, code: 0 };
+  await loadWindows(a);
+  const pending = deferred();
+  a.statusOutcome = () => pending.outcome;
+  await fake.emit("after_file_save", {});
+  await fake.advance(500);
+  await fake.switchWindow(2);
+  await fake.advance(500);
+  fake.clear();
+  pending.resolve({ code: 0, stdout: ACCEPTANCE.replace("? new/c.txt\0", ""), stderr: "" });
+  await fake.advance(10);
+  assert.equal(sectionUpdates(PANEL_A).length, 1, "A's parked section updated");
+  assert.equal(fake.contextOn(ROWS_CTX, 2), true, "B's contexts untouched");
+  await fake.advance(5000);
+  assert.ok(fake.gitCalls().some(inB), "B still polls");
+  assert.ok(!fake.gitCalls().some((p) => p.cwd === "/repo"), "A does not");
+});
+
+test("a rev-parse done after a switch starts no status, and does not give up; the next activation refreshes (R28)", async () => {
+  threeWindows();
+  const rp = deferred();
+  const a: Repo = { status: ACCEPTANCE, code: 0 };
+  const base = windowsScript(a, { status: B_STATUS, code: 0 });
+  let first = true;
+  await load(a, {
+    script: (c) => {
+      if (first && c.cwd === "/repo" && c.args[1] === "--show-toplevel") {
+        first = false;
+        return rp.outcome;
+      }
+      return base(c);
+    },
+  });
+  await fake.advance(150);
+  await fake.switchWindow(2);
+  await fake.advance(500);
+  fake.clear();
+  rp.resolve({ code: 0, stdout: "/repo\n", stderr: "" });
+  await fake.advance(3000);
+  assert.ok(!fake.gitCalls().some((p) => p.cwd === "/repo"), "no status for A");
+  assert.deepEqual(sectionUnmounts(PANEL_A), [], "A did not give up");
+  await fake.switchWindow(1);
+  await fake.advance(500);
+  assert.ok(fake.gitCalls().some((p) => p.cwd === "/repo" && p.args.includes("status")));
+  assert.equal(lastMount().title, "Git · main ↑1 ↓0");
+});
+
+test("stage all stops at a switch, and says how far it got once its window is active again (R28, R16)", async () => {
+  const records = manyUntracked(1200, "some/fairly/deep/directory/file-");
+  await loadInB(undefined, { status: raw({ records }), code: 0, onWrite: () => ({ result: { code: 0, stdout: "", stderr: "" }, ms: 300 }) });
+  fake.clear();
+  await fake.widget("activate", { index: 1, key: "g:c", via: "space" });
+  await fake.advance(150);
+  assert.equal(writes().length, 1, "the first chunk is running");
+  await fake.switchWindow(1);
+  await fake.advance(3000);
+  assert.equal(writes().length, 1, "no chunk starts while A is active");
+  assert.deepEqual(statusesIn(1), []);
+  await fake.switchWindow(2);
+  const done = pathsOf(writes()[0]).length;
+  assert.deepEqual(statusesIn(2), [`staged ${done} of 1200; the rest not run: another window became active`]);
+});
+
+test("a write queued behind another is not run once its window is inactive; both outcomes wait for the window, in order (R28, R15)", async () => {
+  await loadInB(undefined, { status: B_STATUS, code: 0, onWrite: lockedWrite });
+  fake.clear();
+  await fake.widget("action", { index: 5, key: "c:b.md" });
+  await fake.widget("action", { index: 4, key: "c:a.ts" });
+  await fake.advance(50);
+  await fake.switchWindow(1);
+  await fake.advance(2000);
+  assert.equal(writes().length, 1, "the second write did not start");
+  assert.deepEqual(statusesIn(1), [], "nothing about B shown in A");
+  await fake.switchWindow(2);
+  assert.deepEqual(statusesIn(2), [`${LOCKED_MSG} · stage a.ts: not run; another window became active before it started`]);
+});
+
+test("a diff build overtaken by a switch opens nothing and leaves no buffers (R28, R14)", async () => {
+  await loadWindows({ status: ACCEPTANCE, code: 0, blobs: ACC_BLOBS });
+  acceptanceOnDisk();
+  fake.clear();
+  await click(5, "c:b.md");
+  await fake.switchWindow(2);
+  await fake.advance(500);
+  assert.deepEqual(shownBuffers(), []);
+  assert.deepEqual(fake.named("createVirtualBuffer"), []);
+  assert.equal(fake.openBuffers().size, 0);
+});
+
+test("two windows on one folder each get a section, with ids from their stable ids whatever the order (R28, INV §8 P31 e)", async () => {
+  fake.windows = twins();
+  await loadAcceptance();
+  await fake.switchWindow(5);
+  await fake.advance(500);
+  assert.deepEqual(mountedPanels(), [panelOf("ws-co")]);
+  assert.notEqual(panelOf("ws-co"), PANEL_A);
+  // The other window first, in a new run: the same ids.
+  restartFake();
+  fake.windows = twins();
+  fake.window = 5;
+  await load({ status: ACCEPTANCE, code: 0 });
+  assert.deepEqual(mountedPanels(), [panelOf("ws-co")]);
+});
+
+test("a window id used again gets a section of its own (R28)", async () => {
+  await loadInB();
+  await fake.switchWindow(1);
+  await fake.closeWindow(2);
+  fake.windows = [...(fake.windows ?? []), { id: 2, stable_id: "ws-9", root: "/b" }];
+  fake.clear();
+  await fake.switchWindow(2);
+  await fake.advance(500);
+  assert.deepEqual(mountedPanels(), [panelOf("ws-9", "/b")]);
+});
+
+test("load unmounts the legacy panel once, before the first mount (R28)", async () => {
+  await load({ status: ACCEPTANCE, code: 0 });
+  const calls = fake.widgetCalls().map((c) => [c.name, c.args[0]]);
+  assert.deepEqual(calls[0], ["unmountFloatingWidget", 1]);
+  assert.deepEqual(calls[1], ["mountSidebarSection", fake.panel]);
+  assert.equal(calls.filter(([n, id]) => n === "unmountFloatingWidget" && id === 1).length, 1);
+});
+
+test("a window attached while away finds out where git runs again, once (R28, R13)", async () => {
+  await loadInB({ status: ACCEPTANCE, code: 0, inspect: BIND_INSPECT, pwd: BIND_PWD });
+  fake.clear();
+  // Fresh switches to window 1, attached meanwhile: its authority hook comes
+  // first, then the switch (INV §11.4).
+  fake.label = "Container:abc";
+  fake.window = 1;
+  await fake.emit("authority_changed", { label: fake.label });
+  await fake.switchWindow(1);
+  await fake.advance(1000);
+  assert.equal(fake.procs.filter((p) => p.program === "pwd").length, 1);
+  assert.ok(fake.gitCalls().length > 0);
+  for (const p of fake.gitCalls()) assert.equal(p.via, "host");
+});
+
+test("a tab change in a window with no section yet makes it, as the first focus announcement has no window switch (R28, INV §11.3)", async () => {
+  await loadWindows();
+  fake.clear();
+  fake.window = 2;
+  await switchTo(7, "/b/README.md", 2);
+  await fake.advance(500);
+  assert.equal(sectionMounts(PANEL_B).at(-1)?.args[2], "Git · feature-b ↑1 ↓0");
+});
+
+test("authority_changed on a switch between windows of different authorities restarts neither: their own labels did not change (R28, R13)", async () => {
+  const slow = deferred();
+  const b: Repo = { status: B_STATUS, code: 0, inspect: inspectResult({ Type: "bind", Source: "/b", Destination: "/workspaces/b" }), onWrite: () => slow.outcome };
+  // `pwd` in the container runs with no cwd, which the script answers from
+  // the first repository: there, B's container folder.
+  await loadWindows({ status: ACCEPTANCE, code: 0, pwd: pwdResult("/workspaces/b") }, b);
+  // B is attached to a container: its label is its own from the start.
+  fake.label = "Container:abc";
+  await fake.switchWindow(2);
+  await fake.advance(500);
+  assert.equal(fake.allProcs.filter((p) => p.program === "pwd").length, 1);
+  // A stage in B that is still running when the user goes to A and back.
+  await fake.widget("action", { index: 5, key: "c:b.md" });
+  await fake.advance(50);
+  // Fresh moves the active window, then sends the authority hook, then the
+  // switch (INV §11.4).
+  fake.label = "";
+  fake.window = 1;
+  await fake.emit("authority_changed", { label: "" });
+  await fake.switchWindow(1);
+  await fake.advance(500);
+  fake.label = "Container:abc";
+  fake.window = 2;
+  await fake.emit("authority_changed", { label: fake.label });
+  await fake.switchWindow(2);
+  await fake.advance(500);
+  assert.equal(fake.allProcs.filter((p) => p.program === "pwd").length, 1, "B's mode is kept: no detection again");
+  fake.clear();
+  slow.resolve(LOCKED);
+  await fake.advance(500);
+  assert.deepEqual(statusesIn(2), [LOCKED_MSG], "the outcome is not lost to a restart");
+});
+
+test("two windows on one repository share its write queue: the second window's write waits for the first's (R28, R15)", async () => {
+  const gate = deferred();
+  let first = true;
+  const repo: Repo = {
+    status: ACCEPTANCE,
+    code: 0,
+    onWrite: () => {
+      if (!first) return undefined;
+      first = false;
+      return gate.outcome;
+    },
+  };
+  fake.windows = twins();
+  await load(repo);
+  await fake.advance(200);
+  // A slow write in window 1, then the user goes to window 5 on the same repository.
+  await fake.widget("action", { index: 5, key: "c:b.md" });
+  await fake.advance(50);
+  await fake.switchWindow(5);
+  await fake.advance(500);
+  fake.clear();
+  await fake.widget("action", { index: 4, key: "c:a.ts" });
+  await fake.advance(500);
+  assert.deepEqual(writes(), [], "no second git while the first holds index.lock");
+  gate.resolve({ code: 0, stdout: "", stderr: "" });
+  await fake.advance(500);
+  assert.deepEqual(writes().map((w) => w.at(-1)), ["a.ts"]);
+});
+
+test("a diff build overtaken by a switch after its buffers exist closes them once its window is active again (R28, R14, INV §11.4)", async () => {
+  await loadWindows({ status: ACCEPTANCE, code: 0, blobs: ACC_BLOBS });
+  acceptanceOnDisk();
+  let release!: () => void;
+  fake.compositeGate = new Promise<void>((r) => (release = r));
+  await click(5, "c:b.md");
+  await fake.advance(50);
+  assert.equal(fake.openBuffers().size, 2, "sources made, composite pending");
+  await fake.switchWindow(2);
+  await fake.advance(500);
+  fake.clear();
+  release();
+  await fake.advance(50);
+  assert.deepEqual(shownBuffers(), []);
+  assert.deepEqual(fake.named("closeBuffer"), [], "nothing closed from window 2");
+  assert.deepEqual(fake.named("closeCompositeBuffer"), []);
+  await fake.switchWindow(1);
+  await fake.advance(50);
+  assert.equal(fake.named("closeCompositeBuffer").length, 1);
+  assert.equal(fake.openBuffers().size, 0);
+  assert.equal(fake.compositeStates().size, 0);
+  for (const c of [...fake.named("closeBuffer"), ...fake.named("closeCompositeBuffer")]) assert.equal(c.window, 1);
+});
+
+test("a diff tab closed just before a switch is cleaned up on the way back (R28, R14)", async () => {
+  await loadWindows({ status: ACCEPTANCE, code: 0, blobs: ACC_BLOBS });
+  acceptanceOnDisk();
+  await click(5, "c:b.md");
+  await fake.advance(50);
+  const [composite] = shownBuffers();
+  // The host handles the switch before the plugin hears of the close.
+  await fake.switchWindow(2);
+  await fake.advance(500);
+  fake.clear();
+  await fake.closeTab(composite);
+  await fake.advance(50);
+  assert.deepEqual(fake.named("closeCompositeBuffer"), []);
+  await fake.switchWindow(1);
+  await fake.advance(50);
+  assert.deepEqual(fake.named("closeCompositeBuffer").map((c) => c.args[0]), [composite]);
+  assert.equal(fake.openBuffers().size, 0);
+  assert.equal(fake.compositeStates().size, 0);
+});
+
+test("on return, the diff hint waiting for its diff does not replace the messages that waited (R28, R20)", async () => {
+  await loadInB(undefined, { status: B_STATUS, code: 0, blobs: ACC_BLOBS, onWrite: lockedWrite });
+  acceptanceOnDisk("/b");
+  // A diff opened from a row: the keyboard stays in the section, the hint waits.
+  await fake.widget("focus", {});
+  await click(5, "c:b.md");
+  await fake.advance(50);
+  assert.equal(shownBuffers().length, 1);
+  await fake.widget("action", { index: 5, key: "c:b.md" });
+  await fake.advance(50);
+  await fake.widget("blur", {});
+  await fake.switchWindow(1);
+  await fake.advance(1000);
+  assert.deepEqual(statusesIn(1), [], "the failure waits for window 2");
+  fake.clear();
+  await fake.switchWindow(2);
+  await fake.emit("chrome_focus_changed", { window_id: 2, region: "editor", plugin: null, panel_id: null });
+  await fake.advance(50);
+  assert.deepEqual(statusesIn(2), [LOCKED_MSG]);
+});
+
+test("a message said in the window before its switch event is handled comes after the ones that waited, with them (R28)", async () => {
+  const slow = deferred();
+  await loadInB(undefined, { status: B_STATUS, code: 0, onWrite: () => slow.outcome });
+  await fake.widget("action", { index: 5, key: "c:b.md" });
+  await fake.advance(50);
+  await fake.switchWindow(1);
+  await fake.advance(50);
+  slow.resolve(LOCKED);
+  await fake.advance(50);
+  fake.clear();
+  // Window 2 is active again; its `active_window_changed` is not handled yet.
+  fake.window = 2;
+  await fake.command("Git Sidebar: View File");
+  await fake.emit("active_window_changed", { previous_id: 1, active_id: 2 });
+  await fake.advance(50);
+  // The palette's View File on the row the press selected, which is deleted on disk here.
+  assert.deepEqual(statusesIn(2), [`${LOCKED_MSG} · b.md is deleted`]);
+});
+
+test("a press on a section's panel handled after a switch to another window does nothing (R28)", async () => {
+  await loadInB({ status: ACCEPTANCE, code: 0, blobs: ACC_BLOBS });
+  fake.clear();
+  for (const [event_type, payload] of [
+    ["action", { index: 5, key: "c:b.md" }],
+    ["activate", { index: 5, key: "c:b.md", via: "space" }],
+    ["select", { index: 5, key: "c:b.md", via: "click" }],
+    ["context", { key: "c:b.md", col: 3, row: 10 }],
+  ] as const) {
+    await fake.widget(event_type, payload, { panel: PANEL_A });
+  }
+  await fake.advance(500);
+  assert.ok(!fake.gitCalls().some((p) => p.cwd === "/repo"), "no git for window 1");
+  assert.deepEqual(menuMounts(), []);
+  assert.deepEqual(fake.named("createVirtualBuffer"), []);
+  assert.deepEqual(statusesIn(2), []);
 });

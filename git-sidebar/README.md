@@ -48,7 +48,12 @@ A **Git** section in [Fresh](https://github.com/sinelaw/fresh)'s file-explorer s
   }
   ```
 - **Follows the editor.** When you switch to a file the section lists, while the keyboard is not in the section, its row is selected and scrolled into view. A file in both groups selects its Changes row, unless one of its two rows is already selected. Nothing else happens: no diff opens, the keyboard stays where it was, and a collapsed group or section stays collapsed (a file in a collapsed group is not selected). A refresh never moves the selection, even when it newly lists the file you are editing.
-- Collapse the whole section from its header (▼/▶). Fresh remembers the collapsed state and the height you drag it to for each workspace.
+- Collapse the whole section from its header (▼/▶). Fresh remembers the collapsed state for each workspace, and the height you drag the divider to.
+- **Every window.** In Fresh's Orchestrator each project is a window of its own, and each window whose folder is in a git repository has its own section for that repository.
+  - Switching windows keeps each section's rows, selection, open groups, diff tab and collapsed state, and the window you switch to refreshes at once.
+  - Only the window you are in refreshes, and the commands act on its section.
+  - Two windows on one folder, such as a tab extracted into a window of its own, each have their own section. Stages, unstages and commits from windows on one repository still run one at a time.
+  - The divider between the explorer and the section belongs to the explorer, which every window shares, so it is at the same height in every window.
 - It keeps itself current: on save, revert, editor focus and file-explorer changes, and every 2 s for changes made outside the editor. Git is never kept busy more than 25% of the time.
 - Outside a git repository, or where git cannot run, there is no section.
 
@@ -78,7 +83,10 @@ Then restart Fresh. Requires Fresh 0.5.9 or later and `git` on `PATH`.
 - No discarding, stashing, pushing, or staging part of a file. The diff is a snapshot: it does not follow later edits, and shows the file as saved on disk.
 - Commit takes a one-line message only, and commits only what is staged: it never stages for you, and has no amend, sign-off or message body. Hooks and signing run as git's configuration says; a signing key that asks for its passphrase in a terminal is expected to fail with git's reason, since Fresh runs git with no terminal (not tested). In a bind-mounted dev container the commit runs on the host, with the host's identity, hooks and signing settings.
 - Refreshing never takes `.git/index.lock` (it runs `git --no-optional-locks status`); staging, unstaging and committing do, like any git write.
-- Only the workspace's repository: no submodules or nested repositories. A repository created after Fresh started appears after a restart.
+- Only the workspace's repository: no submodules or nested repositories. A repository created in a window's folder appears the next time you switch to that window, or after a restart.
+- A window's section appears when you first switch to it after Fresh starts. The Orchestrator's preview of a window you have not visited yet shows none.
+- No git starts for a window you are not in. When you switch away, git already running finishes, but a stage, unstage or commit still waiting its turn does not run, and Stage All stops after the part already running. When you come back, the status bar shows every message about that window, in order; a message repeated back to back shows once.
+- Updating from a version without per-window sections resets the section's saved collapsed state once.
 - At most 500 rows per group, then a `… N more` row.
 - Unstaging a staged deletion of `foo` also unstages a staged `foo/bar`: an index cannot hold a file and a directory at the same path.
 - Under `core.autocrlf` or `eol`/`text` attributes, a Changes diff compares the blob as stored (LF) with the file on disk (CRLF), so every line shows as changed. Showing it as git does would mean running the repository's filters on every click.

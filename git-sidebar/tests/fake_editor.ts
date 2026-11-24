@@ -1,13 +1,20 @@
 // A fake of the part of Fresh's EditorAPI the plugin uses: a call log,
 // processes that resolve with the real result shapes (`{code}` from
 // `runOnTarget`, `{exit_code}` from `spawnHostProcess`), host timers and
-// `delay` on a manual clock, and an event emitter.
+// `delay` on a manual clock, and an event emitter. Windows (R28): a list
+// for `listWindows`, contexts stored per window and written to the active
+// one, and helpers that switch and close windows as the host does (INV §11).
+
+import { panelIdFor, windowKey } from "../lib/windows.ts";
 
 export interface ProcCall {
   via: "target" | "host";
   program: string;
   args: string[];
   cwd: string;
+  /** The window active when it started, and that window's root (R28). */
+  window: number;
+  windowRoot: string | null;
 }
 
 export interface ProcResult {
@@ -30,6 +37,8 @@ export function deferred(): { outcome: ProcOutcome; resolve: (r: ProcResult) => 
 export interface Call {
   name: string;
   args: unknown[];
+  /** The window active when the call was made. */
+  window: number;
 }
 
 export const WIDGET_CALLS = new Set([
@@ -40,6 +49,19 @@ export const WIDGET_CALLS = new Set([
   "floatingPanelControl",
   "mountFloatingWidget",
 ]);
+
+/** A window as `listWindows` gives it (the fields the plugin reads). */
+export interface FakeWindow {
+  id: number;
+  stable_id: string;
+  root: string;
+}
+
+/** The panel id of the section of the window whose workspace is
+ *  `stableId` at `root`, when no other section holds it. */
+export function panelOf(stableId: string, root = "/repo"): number {
+  return panelIdFor(windowKey(stableId, root), new Set());
+}
 
 /** Which panel and widget a `widget_event` comes from. */
 interface WidgetFrom {
@@ -60,6 +82,9 @@ export class FakeEditor {
   label = "";
   cwd = "/repo";
   window = 1;
+  /** What `listWindows` gives; null: the active window alone, at `cwd`,
+   *  with stable id `ws-<id>`. */
+  windows: FakeWindow[] | null = null;
   /** Return values that replace an API call's default, by call name. Each
    *  entry is consumed by one call. */
   returns = new Map<string, unknown[]>();
@@ -113,7 +138,10 @@ export class FakeEditor {
   private composites = new Set<number>();
   private nextBuffer = 100;
   private commands = new Map<string, string>();
-  private contexts = new Set<string>();
+  /** Contexts by window: `setContext` writes to the active window's. */
+  private contexts = new Map<number, Set<string>>();
+  /** The window each buffer the plugin made was opened in. */
+  private bufferWindow = new Map<number, number>();
 
   /** Installs `getEditor`, `registerHandler` and the clock as globals. */
   install(): void {
@@ -169,13 +197,72 @@ export class FakeEditor {
 
   private contextOf = new Map<string, string | null>();
 
-  private listed(name: string): boolean {
-    const ctx = this.contextOf.get(name) ?? null;
-    return ctx === null || this.contexts.has(ctx);
+  private contextsOf(window: number): Set<string> {
+    let set = this.contexts.get(window);
+    if (set === undefined) {
+      set = new Set();
+      this.contexts.set(window, set);
+    }
+    return set;
   }
 
-  contextOn(name: string): boolean {
-    return this.contexts.has(name);
+  private listed(name: string): boolean {
+    const ctx = this.contextOf.get(name) ?? null;
+    return ctx === null || this.contextsOf(this.window).has(ctx);
+  }
+
+  /** Whether context `name` is set in `window` (default: the active one). */
+  contextOn(name: string, window = this.window): boolean {
+    return this.contextsOf(window).has(name);
+  }
+
+  /** What `listWindows` gives now. */
+  windowList(): FakeWindow[] {
+    return this.windows ?? [{ id: this.window, stable_id: `ws-${this.window}`, root: this.cwd }];
+  }
+
+  /** The panel id of window `id`'s section (when no other section holds
+   *  it): what the plugin derives from the window's workspace. */
+  panelOfWindow(id: number): number {
+    const w = this.windowList().find((x) => x.id === id);
+    return w === undefined ? -1 : panelOf(w.stable_id, w.root);
+  }
+
+  /** The panel `widget()` sends by default: the active window's section. */
+  get panel(): number {
+    return this.panelOfWindow(this.window);
+  }
+
+  /** The user switches to window `id`: it becomes active, then
+   *  `active_window_changed` and `active_buffer_changed {reason:"window"}`
+   *  fire, as in the host (INV §8 P31 b). The `chrome_focus_changed` the
+   *  host sends only when the region changes, and the `blur` of a parked
+   *  section, are the test's to send. */
+  async switchWindow(id: number): Promise<void> {
+    const previous = this.window;
+    this.window = id;
+    await this.emit("active_window_changed", { previous_id: previous, active_id: id });
+    await this.emit("active_buffer_changed", {
+      window_id: id,
+      buffer_id: this.activeBuffer,
+      previous: { window_id: previous, buffer_id: this.activeBuffer },
+      reason: "window",
+    });
+  }
+
+  /** Window `id`, not the active one, closes, as the host does it (INV §8
+   *  P31 f): `buffer_closed` for each of its buffers, `cancel` on its
+   *  section's panel (named by the active window), then `window_closed`. */
+  async closeWindow(id: number): Promise<void> {
+    const panel = this.panelOfWindow(id);
+    for (const [buffer, w] of this.bufferWindow) {
+      if (w !== id) continue;
+      this.composites.delete(buffer);
+      await this.closeTab(buffer);
+    }
+    if (this.windows !== null) this.windows = this.windows.filter((w) => w.id !== id);
+    await this.widget("cancel", {}, { panel });
+    await this.emit("window_closed", { id });
   }
 
   /** Run a palette command as the user would. */
@@ -196,7 +283,7 @@ export class FakeEditor {
   /** The user closes a buffer's tab. */
   async closeTab(id: number): Promise<void> {
     if (!this.open.delete(id)) return;
-    await this.emit("buffer_closed", { buffer_id: id, window_id: this.window });
+    await this.emit("buffer_closed", { buffer_id: id, window_id: this.bufferWindow.get(id) ?? this.window });
   }
 
   armedTimers(): number {
@@ -215,7 +302,8 @@ export class FakeEditor {
 
   async widget(event_type: string, payload: Record<string, unknown> = {}, from: WidgetFrom = {}): Promise<void> {
     const widget_key = from.widgetKey ?? "git";
-    await this.emit("widget_event", { window_id: 1, panel_id: from.panel ?? 1, widget_key, event_type, payload, focus_key: widget_key });
+    // The active window's id, whichever section sent it (INV §11.4).
+    await this.emit("widget_event", { window_id: this.window, panel_id: from.panel ?? this.panel, widget_key, event_type, payload, focus_key: widget_key });
   }
 
   async flush(): Promise<void> {
@@ -243,7 +331,7 @@ export class FakeEditor {
   }
 
   private record(name: string, args: unknown[]): void {
-    this.calls.push({ name, args });
+    this.calls.push({ name, args, window: this.window });
   }
 
   /** Something to fire `ms` from now, in creation order among equals. */
@@ -263,6 +351,7 @@ export class FakeEditor {
       this.later(0, () => {
         const id = this.nextBuffer++;
         this.open.add(id);
+        this.bufferWindow.set(id, this.window);
         r(id);
       }),
     );
@@ -273,13 +362,14 @@ export class FakeEditor {
     // Fire-and-forget, like the host: the close and its event come later.
     this.later(0, () => {
       if (!this.open.delete(id)) return;
-      for (const h of this.handlers.get("buffer_closed") ?? []) void h({ buffer_id: id, window_id: this.window });
+      for (const h of this.handlers.get("buffer_closed") ?? []) void h({ buffer_id: id, window_id: this.bufferWindow.get(id) ?? this.window });
     });
     return true;
   }
 
   private spawn(via: "target" | "host", program: string, args: string[], cwd: string) {
-    const call = { via, program, args: [...args], cwd };
+    const windowRoot = this.windowList().find((w) => w.id === this.window)?.root ?? null;
+    const call = { via, program, args: [...args], cwd, window: this.window, windowRoot };
     this.procs.push(call);
     this.allProcs.push(call);
     const shape = (r: ProcResult) =>
@@ -324,7 +414,9 @@ export class FakeEditor {
       };
     return {
       getCwd: rec("getCwd", () => this.cwd),
-      activeWindow: rec("activeWindow", () => this.window),
+      // A read the plugin makes before every git run (R28), not recorded.
+      activeWindow: () => this.window,
+      listWindows: rec("listWindows", () => this.windowList()),
       getAuthorityLabel: rec("getAuthorityLabel", () => this.label),
       pathJoin: (...parts: string[]) => parts.join("/").replace(/\/+/g, "/"),
       // As documented: the parent, or "" for a root or a path with no parent.
@@ -429,8 +521,8 @@ export class FakeEditor {
         return true;
       }),
       setContext: rec("setContext", (name: string, on: boolean) => {
-        if (on) this.contexts.add(name);
-        else this.contexts.delete(name);
+        if (on) this.contextsOf(this.window).add(name);
+        else this.contextsOf(this.window).delete(name);
         return true;
       }),
       setTimeout: rec("setTimeout", (ms: number, name: string) => {

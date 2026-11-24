@@ -77,6 +77,19 @@ node $D eval 'const o = []; for (const b of editor.listBuffers()) if (b.name !==
 
 A script runs in its own realm. It sees `editor.*` but none of the plugin's module state, because git-sidebar exports no plugin API. To reach the plugin, use `cmd` or the screen.
 
+### Several windows (R28)
+
+Each window gets its own section. To check that, make a second repository and a window on it, then switch to it. Make the window in one `eval` and switch in the next: `listWindows()` does not list a new window within the same script.
+
+```bash
+GS_LIVE_BASE=/tmp/gs-drive/fix bash tests/live/fixture.sh b >/dev/null && git -C /tmp/gs-drive/fix/b checkout -q -b feature-b
+node $D eval 'return editor.createWindow("/private/tmp/gs-drive/fix/b", "b");'
+node $D eval 'const w = editor.listWindows().find((x) => x.root.endsWith("/fix/b")); return editor.setActiveWindow(w.id);'
+node $D click "1 │" && node $D keys C-b    # a new window starts with its explorer hidden
+node $D wait 'Git · feature-b'
+node $D eval 'return editor.setActiveWindow(1);'   # back to the fixture's window
+```
+
 ## Run (human path)
 
 Install from the checkout (**Package: Install from URL**, `/path/to/fresh-plugins#git-sidebar`), restart Fresh, and press Ctrl+B. See the root `CLAUDE.md`, "Trying a plugin in Fresh".
@@ -101,7 +114,8 @@ npm run check     # tsc, node --test, fresh --check-plugin; read the exit code, 
 - **The workspace path is `/private/tmp/…` on macOS** and `/tmp/…` on Linux. `getCwd()` and `state.json` hold the realpath.
 - **Linux draws a few labels differently:** `File Explorer (Ctrl+E)` and `Palette: Ctrl+P`, where macOS draws `File Explorer` and `⌃P`. The section's rows are the same, so match on those.
 - **A container without `--init` keeps every exited Fresh as a zombie,** because `sleep infinity` as PID 1 reaps nothing. `stop` reads `/proc/<pid>/status` and counts a zombie as gone.
-- **Not covered:** `--simple` restores and saves no session, so the divider and collapsed state across restarts (P2) can't be tested here. Dev-container runs (P7, P8) need the fixture under `$HOME` for colima (`fixture.sh <name> --devcontainer …`).
+- **`cmd` and `eval` can switch windows.** Each runs from the fixture's folder, and Fresh may make that folder's window active for the call, so a palette opened afterwards can be the fixture window's (seen with `fresh --cmd command list`). Switch back explicitly, then check through keys and the screen.
+- **Not covered:** `--simple` restores and saves no session, so the divider and collapsed state across restarts (P2, P32) can't be tested here. Dev-container runs (P7, P8) need the fixture under `$HOME` for colima (`fixture.sh <name> --devcontainer …`).
 
 ## Troubleshooting
 

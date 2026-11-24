@@ -122,6 +122,8 @@ export type PaletteCommand = "viewDiff" | "viewFile" | "toggle" | "stageAll" | "
 export type PaletteTarget = { ok: true; key: string } | { ok: false; message: string };
 
 export const NOTHING_SELECTED = "no row is selected in the Git section";
+/** Focus, or a key bound to it, where the active window has no section (R22, R28). */
+export const NOT_SHOWN = "the Git section is not shown";
 export const NOTHING_STAGED = "nothing staged to commit";
 
 export function paletteTarget(cmd: PaletteCommand, selectedKey: string | null, status: Status | null, entries: EntryMap): PaletteTarget {

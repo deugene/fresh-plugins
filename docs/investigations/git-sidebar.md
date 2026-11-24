@@ -682,6 +682,41 @@ Then a verification pass of the staged change, through the driver with its defau
 - **A pre-commit hook that runs `git reset -q` makes git record an empty commit** instead of refusing, as a terminal commit does, so the plugin reports a commit.
 - **A terminal `git reset` just before the prompt's Enter** made the commit find nothing staged: `could not commit: nothing is staged` in 3 runs, with a hook printing `lint ok`. A first run instead failed with `Unable to create '.git/index.lock': File exists.`, git's reason shown and no lock left behind. What held the lock was not identified.
 
+### P31–P34: one section per window (2026-11-24)
+
+Fresh 0.5.9, launched without `--simple`, so the daemon saves workspaces and restores them on the next launch. It ran in tmux session `gs-mw` under `HOME=/tmp/gs-mw/home` and `XDG_RUNTIME_DIR=/tmp/gs-mw/run`, with the driver's token terminal in `init.ts`. The probe package is `/tmp/gs-mw/probe/mw-probe/mw_probe.ts`, not in the repo.
+- It mounts one tree section per window, with the plugin's real options (`closable:false`, `startBlurred:true`, `scope:{window}`).
+- The mounts happen at load and in `active_window_changed`, synchronously, for a root with a `.git`.
+- Its panel id is `3 + fnv1a(stable_id) % (2^32 − 3)`.
+- It logs every window hook, `widget_event` and `chrome_focus_changed`.
+
+The windows held two acceptance fixtures, `/tmp/gs-mw/fix/a` (the launch folder) and `b`. Windows were made with `createWindow`, switched with `setActiveWindow` through `fresh --cmd script run`, and quit with Quit → "Quit and Stop All". Background in §11.
+
+**P31: a section per window. Pass.**
+
+| # | Check | Result |
+|---|---|---|
+| a | `stable_id` at load | `listWindows()` at load lists only window 1, `{id:1, stable_id:"ws-18eb070c450a98d8-0", root:"/private/tmp/gs-mw/fix/a"}`. The section mounts as panel 1164453195 |
+| b | A new window | `createWindow(b)` → `window_created {id:2,…}`. `setActiveWindow(2)` → `active_window_changed {previous_id:1, active_id:2}`; in the handler `activeWindow()` is 2 and `getCwd()` is B's root. Mount of panel 1903869748 scoped to window 2 → `true`. Then `active_buffer_changed {window_id:2, reason:"window"}` and `chrome_focus_changed {window_id:2}` |
+| c | Only its own section | B shows `Probe · b` and not A's. Back in A, only `Probe · a` |
+| d | `widget_event` | A click in B: `panel 1903869748 window 2 select`. In A: `panel 1164453195 window 1 select`. No WARN or ERROR in the log |
+| e | Two windows on one root | Extract Tab to New Workspace on A made window 3, `{root:"/private/tmp/gs-mw/fix/a", label:"a (2)", stable_id:"ws-18eb0740584f6c00-2"}`: `window_created`, then `active_window_changed`, and the probe mounted panel 2569877109 |
+| f | Closing a window | `closeWindow(3)` from window 1: `active_buffer_changed {previous.window_id:3}`, then `widget_event panel 2569877109 window 1 cancel {}`, then `window_closed {id:3}`. The `cancel` names the *active* window |
+
+**P32: layout across switches and a restart.**
+
+| # | Check | Result |
+|---|---|---|
+| a | Drag the divider in B | B's header moved from row 20 to row 12. In A, A's header was at row 12 too. The divider is the explorer's height, and the explorer is one editor-wide section, so **the height is shared by all windows** |
+| b | Collapse | Collapsing A's section left B's open, and the other way round: **collapsed state is per window** |
+| c | What is saved | Each window's file holds `{"kind":"explorer","scope":"editor","rows":9}` and only its own panel, by id: A `{"id":1164453195,"scope":"window","collapsed":true}`, B `{"id":1903869748,…,"collapsed":false}` |
+| d | Relaunch, the launch window | A came back collapsed. The log shows `dropped 1 sidebar placeholder(s) no plugin mounted after restore` about 140 ms before the plugin's load mount: in daemon mode the placeholder expires first, and the layout comes back through the host's hint (§2) |
+| e | Relaunch, a window shown later | With B saved collapsed and A open: `loadWorkspaces()`, then `setActiveWindow(B)` → `Materialized window Window-2 from workspace` → the mount from `active_window_changed` → B collapsed, A open. No placeholder dropped: **the mount claimed B's restored placeholder**. Explorer rows 9 in both |
+
+**P33: contexts per window. Pass.** `setContext("mwprobe-a", true)` while A was active. The palette in A listed `MW Probe: In a`, in B it did not, and back in A it did again.
+
+**P34: a parked section. Pass.** While A was active, `updateFloatingWidget(1903869748, …)` on B's section returned `true`. On switching to B it showed the new rows (`b bumped 1`). No WARN or ERROR.
+
 ## 9. Follow-up: opening, diffs, staging and the title (2026-11-24)
 
 **Ticket.** "Click on file does not open it in tab. Diff numbers near the branch do not show actual changes count (I changed one line in README, it's shown in Changes but the numbers show 0 0)." Added: stage and unstage per file and per group; view file and view diff per file row, the diff side by side (Changes: index vs working tree; Staged: HEAD vs index).
@@ -809,7 +844,7 @@ Same sources as above (`DTS`, `SRC`, `EP`), plus the third-party `git-review` co
 - ~~**Re-click.**~~ Closed by P21: with `cardBorders: true` at `itemHeight: 1`, a click, a button press and a right-click on the selected row all reach the plugin.
 - ~~**Command length.**~~ Handled: stage all and unstage all run in commands of at most 16 KiB of paths each, with a rename's two paths in the same command. They are not atomic, and a failure reports how many paths it got through.
 - **Line endings (follow-up, not fixed).** Under `core.autocrlf` or `eol`/`text` attributes, a Changes diff compares the raw LF blob with the CRLF file on disk, so every line shows as changed. `git cat-file --filters` would give the file as git compares it, but it runs the repository's smudge filters on every click.
-- **Windows and the rows context (not fixable in 0.5.9).** `setContext` acts on the active window, so with several windows the palette commands follow whichever window was active when the context last changed. The reload half is fixed: load clears a context a previous load left set.
+- ~~**Windows and the rows context.**~~ Fixed with one section per window (§11.5): `setContext` writes to the active window, so each section sets its contexts only while its window is active, and both are set again on every switch. Load still clears the contexts a previous load left set in the active window.
 - **Status that is not UTF-8 in a bind-mounted dev container (found, not fixed).** Through `spawnHostProcess`, a status whose output holds one path that is not UTF-8 comes back as `""` with rc 0 (§8 P17). The section then shows empty groups and the title `Git · HEAD`. `runOnTarget` (local) is lossy instead, and the rows show U+FFFD.
 - **Lossy text of the same length (low).** A blob refusal compares UTF-8 lengths. A blob in which three bad bytes become one U+FFFD (3 bytes), such as a truncated 4-byte sequence, keeps its length and is shown with U+FFFD in it.
 - **Untracked symbolic links.** `?` records carry no mode, so an untracked link's diff shows its target's contents (README Limits).
@@ -940,3 +975,77 @@ No live probe was run while writing this section. UNCONFIRMED marks each claim o
 - ~~**P27, the focus command.**~~ Closed by §8 P27: `"focus"` expands a collapsed section and shows a hidden column, so `"reveal"` is not used.
 - ~~**P28, auto-reveal.**~~ Closed by §8 P28: no echo, and the row scrolls into view. The panel's `blur` comes before `active_buffer_changed`, and `chrome_focus_changed` after it.
 - ~~**P29, conflicts.**~~ Closed by §8 P29: resolution starts on the newly opened file. With merge_conflict disabled the call logs an ERROR, so the plugin checks `listPlugins()` first.
+
+## 11. Multiple windows (2026-11-24)
+
+**Ticket.** "Why does git-sidebar disappear when I switch project in the orchestrator or reopen the Fresh editor? Can I install it once so it's shown in every project?" The package is installed once, in `~/.config/fresh/plugins/packages/git-sidebar`. The plugin loads once per Fresh process. It mounted its section only in the window active at load, which the spec put out of scope.
+
+Sources: `SRC` paths as above (`app/` is `SRC/fresh-editor/src/app/`), `DTS`, `EP`, and the user's log `~/.local/state/fresh/logs/fresh-server-33807.log`. Live results are §8 P31–P34.
+
+### 11.1 Windows and their sections (high)
+
+- **A window is an Orchestrator session.** Each one has its own root, explorer tree, tabs, authority, trust, contexts and status message. One Fresh process holds them all, and the plugin loads once for all of them.
+- **Panel ids are per plugin, not per window.**
+  - The registry key is `PanelKey {plugin, id}` (`SRC/fresh-editor-core/src/widgets/registry.rs:26-40,565,744-746`), and the sidebar keeps "one section per identity, wherever it is" (`app/sidebar.rs:8-10,806-808`).
+  - A second `mountSidebarSection` with the same id and another window's scope moves the one section (`app/plugin_dispatch.rs:6461-6484`, `app/sidebar.rs:654-690`). The user's log shows `git_sidebar:1` re-scoped this way.
+  - So a section per window needs a panel id per window. Id 0 is the prompt toolbar's (`registry.rs:42-49`). Ids pass through `f64 as u64` (`SRC/fresh-plugin-runtime/src/backend/quickjs_backend.rs:8777,8822,8846`).
+- **Parked sections.** A section whose window is not active is parked whole, with its rows, collapsed state and panel. A focused one is blurred first (`app/sidebar.rs:931-970`).
+  - `updateFloatingWidget`, `widgetMutate` and `unmountFloatingWidget` work on a parked section (`app/plugin_dispatch.rs:5968,6558,6594-6598`; P34). An unmount of a parked section sends no `cancel`.
+  - `floatingPanelControl` sees only sections on the column, and warns otherwise (`app/plugin_dispatch.rs:6654-6657`, `app/editor_accessors.rs:1105-1127`).
+- **The divider is the editor's.** The explorer is one editor-wide section (`scope:"editor"`). So the height dragged between it and the Git section is the same in every window (P32 a). Collapsed state is the section's own, and so per window (P32 b).
+
+### 11.2 Saved layout and restore (high)
+
+- **Each window's workspace file** holds the editor-wide sections and its own: `{"kind":{"kind":"panel","plugin":…,"id":…},"scope":"window","title":…,"rows":…,"collapsed":…}` (`SRC/fresh-editor/src/workspace.rs:627-660`, `app/sidebar.rs:754-787`). The title is stored but does not identify the section; the key does (`app/sidebar.rs:827,902-907`).
+- **Lazy restore.** A window other than the launch window is restored when it is first shown: `set_active_window` → `materialize_window` → `restore_sidebar_sections`, while still inactive, then the switch (`app/window_actions.rs:709,721`, `app/workspace.rs:284-294,561,832-849`). The restore parks a placeholder, which a mount of the same key claims within about 4 frames (`app/sidebar.rs:832-899`). After that the layout survives as an editor-wide hint keyed `{plugin, id}`, which a later first mount takes (`:666-669,1055-1069`).
+  - If the key is already mounted somewhere when the window is restored, its saved layout only becomes a hint (`:833-835`). So a section must not be mounted for a window before that window is first shown.
+  - P32 e: a synchronous mount from `active_window_changed` claims the placeholder.
+- **Window ids are not durable.** They are re-derived on every boot (`app/orchestrator_persistence.rs:1039-1041`), so a panel id taken from one would not match its saved state.
+- **Roots are not unique.** Extract Tab to New Workspace makes a co-tenant window on the same root, with a numbered label, and it persists (`app/window_actions.rs:173,197,1069-1079`; P31 e).
+- **`WindowInfo.stable_id`** is minted once per workspace and survives restarts, relabels and moves (`DTS:970-983`; P31 a, e). It is empty only for a workspace file written before stable ids.
+- **So the Git section's panel id comes from `stable_id`,** and from the root only when `stable_id` is empty.
+
+### 11.3 When windows appear (high)
+
+- **`window_created`** fires only from `createWindow` and `createWindowWithTerminal`, co-tenant extraction included (`app/window_actions.rs:310-317,634-641`). It never fires for windows restored at startup, for `loadWorkspaces()` or for a window being restored. The type file's "or when sessions are restored at startup" (`DTS:9341-9342`) does not match the code.
+- **`listWindows()`** lists every window known so far, restored or not (`app/plugin_dispatch.rs:456-539`). At boot that is the launch folder's workspaces only. The Orchestrator then calls `loadWorkspaces()`, which adds the rest without restoring them (`app/orchestrator_persistence.rs:1101-1115`, `EP/orchestrator.ts:2750-2758`). `WindowInfo.root` is the path `getCwd()` gives in that window (`app/plugin_dispatch.rs:406,525`).
+- **`active_window_changed {previous_id, active_id}`** fires after the window is restored and active, and `getCwd()` already gives its root (`app/window_actions.rs:795`, `app/focus_announcer.rs:121-124`; P31 b). The first focus announcement fires `active_buffer_changed` without it (`focus_announcer.rs:131`).
+
+### 11.4 Events and APIs across windows (high)
+
+- **`widget_event` carries the active window's id,** not the section's (`app/widget_runtime.rs:272-283`). So does the `cancel` sent when a window closes. The host closes only an inactive window (`app/window_actions.rs:1470-1476`): `buffer_closed` for each of its buffers, then the `cancel`, then `window_closed {id}` (`:1496-1529`, `app/sidebar.rs:973-1028`; P31 f). Route by `panel_id`.
+- **Hooks for the active window only:**
+  - `chrome_focus_changed`. It is also deduplicated editor-wide, so none fires on returning to a window (`app/mod.rs:784`, `app/focus_announcer.rs:74-95`).
+  - `active_buffer_changed` (`:161-181`).
+  - `after_file_explorer_change`.
+  - auto-revert's `after_file_revert`.
+  - `trust_changed` (`app/action_dispatch.rs:26-71`).
+- **`authority_changed`** fires for the active window, and on a switch when the label differs. That is after the active pointer moves, and before `active_window_changed` (`app/editor_accessors.rs:668-684,769-796`, `app/window_actions.rs:753`). Neither it nor `trust_changed` carries a window id.
+- **`buffer_closed`** fires for any window, with its `window_id`; buffer ids are global (`app/mod.rs:584-598`). `focus_gained` is editor-wide.
+- **APIs that act on the active window** (`app/plugin_dispatch.rs`, `app/plugin_commands.rs`, `quickjs_backend.rs` as cited):
+  - `getCwd`, `getAuthorityLabel`, `setStatus`, `prompt`;
+  - `setContext`: contexts are stored per window and written to the active one (`app/plugin_dispatch.rs:6857-6869`; P33);
+  - `showBuffer`, `createVirtualBuffer`, `createCompositeBuffer`, `closeCompositeBuffer`, `getActiveBufferId`, `findBufferByPath`;
+  - `runOnTarget`, which runs on the active window's authority (`app/plugin_commands.rs:3604-3617`);
+  - `floatingPanelControl`.
+- **Other cross-window behaviour:**
+  - `spawnHostProcess` always runs on the host, but its trust check is the active window's.
+  - `closeBuffer` on another window's buffer can leave that window's split pointing at it (`app/buffer_close.rs:313-319,614-619`).
+  - `openFile` may switch to another window that already has the file open (`app/file_open_orchestrators.rs:310-321`).
+  - `openMachine({kind:"window", window})` runs a command on a given window's authority (`DTS:8829`). The plugin does not use it (spec, out of scope).
+- **Built-ins with per-window state.**
+  - `EP/search_replace.ts:2663-2700`: a panel per window, swapped on `active_window_changed`.
+  - `EP/live_diff.ts:1478` and `EP/compare_files.ts:712`: work deferred until the window is active.
+  - `EP/orchestrator.ts:385,18966-19048`: a map by window id.
+  - `EP/markdown_toc.ts` re-scopes its one section per buffer.
+
+### 11.5 Consequences for the plugin
+
+- One section per window, mounted synchronously when its window first becomes active (at load for the launch window), with a panel id from `stable_id`.
+- Widget events are routed by panel. Commands, Focus, the timer and the diff's Enter act on the active window's section.
+- Git starts only for the active window. `runOnTarget` would use whichever authority is active, so a window's reads and writes stop when another window becomes active.
+- Contexts are written only while a section's window is active, and set again on every switch. That also fixes §9.6's contexts item.
+- A message about an inactive window waits until it is active again, because `setStatus` would show it in another window.
+- Closing an inactive window's diff buffers waits until that window is active again: `closeCompositeBuffer` acts on the active window.
+- Windows on one repository share its write queue, so their writes never hold `.git/index.lock` at once.
+- `authority_changed` restarts a section only when its own window's label changed: the hook also comes on a plain switch between windows with different authorities.
