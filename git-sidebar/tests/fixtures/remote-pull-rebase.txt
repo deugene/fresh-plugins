@@ -1,0 +1,6 @@
+rc 0
+--- stdout
+--- stderr
+From ../pull
+ * branch            main       -> FETCH_HEAD
+Rebasing (1/1)Successfully rebased and updated refs/heads/main.

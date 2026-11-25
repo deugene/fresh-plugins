@@ -1,12 +1,12 @@
 {
   "$schema": "https://raw.githubusercontent.com/sinelaw/fresh/main/crates/fresh-editor/plugins/schemas/package.schema.json",
   "name": "git-sidebar",
-  "version": "0.1.0",
-  "description": "Git section in the file-explorer sidebar: the branch, Staged Changes and Changes, kept current",
+  "version": "0.2.0",
+  "description": "Git section in the file-explorer sidebar: the branch, Staged Changes, Changes and a commit graph, kept current; stage, commit, pull and push",
   "license": "MIT",
   "type": "plugin",
   "repository": "https://github.com/deugene/fresh-plugins#git-sidebar",
-  "keywords": ["git", "sidebar", "status", "staged", "changes"],
+  "keywords": ["git", "sidebar", "status", "staged", "changes", "graph", "push", "pull"],
   "fresh": {
     "min_version": "0.5.9",
     "min_api_version": 2,

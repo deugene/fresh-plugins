@@ -1,0 +1,11 @@
+rc 1
+--- stdout
+Updating 76c56db..5ef9fc9
+--- stderr
+From ../pull
+ * branch            main       -> FETCH_HEAD
+   76c56db..5ef9fc9  main       -> origin/main
+error: Your local changes to the following files would be overwritten by merge:
+	f.txt
+Please commit your changes or stash them before you merge.
+Aborting

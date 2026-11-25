@@ -1,0 +1,9 @@
+rc 1
+--- stdout
+Auto-merging f.txt
+CONFLICT (content): Merge conflict in f.txt
+Automatic merge failed; fix conflicts and then commit the result.
+--- stderr
+From ../pull
+ * branch            main       -> FETCH_HEAD
+   5ef9fc9..b3d1664  main       -> origin/main

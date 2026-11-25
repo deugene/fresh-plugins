@@ -18,8 +18,11 @@ export const TOPLEVEL_ARGS = ["rev-parse", "--show-toplevel"];
  *  (R26): the message as git recorded it, after any hook rewrote it. A read
  *  of its own: `commit`'s summary is off (`-q`), and stdout can come back ""
  *  through `spawnHostProcess` (INV §8 P17). No signature check is printed
- *  (`log.showSignature`), and no optional lock is taken (R11). */
-export const HEAD_SUMMARY_ARGS = ["--no-optional-locks", "log", "-1", "--no-show-signature", "--format=%h%n%s", "HEAD"];
+ *  (`log.showSignature`), and no optional lock is taken (R11). `--` ends
+ *  the revisions: a top-level file or directory named `HEAD` (`head` on a
+ *  case-insensitive filesystem) makes git die as ambiguous otherwise (INV
+ *  §8 P40 b). */
+export const HEAD_SUMMARY_ARGS = ["--no-optional-locks", "log", "-1", "--no-show-signature", "--format=%h%n%s", "HEAD", "--"];
 
 /** The status message once a commit is made (R26), from the run of
  *  `HEAD_SUMMARY_ARGS`: its short id and the subject git recorded. When that
@@ -48,9 +51,15 @@ export function objectId(stdout: string): string | null {
   const id = stdout.trim();
   return /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(id) ? id : null;
 }
+
+/** A commit id as the section shows it: seven characters. */
+export function shortId(id: string): string {
+  return id.slice(0, 7);
+}
+
 const GIT_TIMEOUT_MS = 10_000;
-/** How long a stage, unstage or commit may take before the user is told
- *  git is still running. Writes are never killed (see `run`). */
+/** How long a stage, unstage, commit, pull or push may take before the
+ *  user is told git is still running. Writes are never killed (see `run`). */
 export const WRITE_TIMEOUT_MS = 60_000;
 
 const CONTAINER_PREFIX = "Container:";
@@ -172,6 +181,11 @@ export function gitReason(r: GitResult, root?: string): string {
   return reason.replace(new RegExp(`(^|[\\s'"\`(])${inside}`, "g"), "$1");
 }
 
+/** Why a read failed, for the user: `gitReason`, or that git timed out. */
+export function failReason(r: GitResult, root: string): string {
+  return r.timedOut ? "git timed out" : gitReason(r, root);
+}
+
 /** A failure that will not go away by retrying: not a repository or
  *  dubious ownership (128), a git too old for the arguments (129, a usage
  *  error), git not executable or not found (126, 127), or a run that could
@@ -283,16 +297,25 @@ export async function runOn(
 }
 
 /**
- * Run a stage or unstage in `cwd`, never killed (see `OnTimeout`), and
- * resolve with git's own result once it exits. One that outlives
- * `WRITE_TIMEOUT_MS` first calls `onSlow` with the left-running result
- * (`stderr`: `still running after 60 s`), so the user hears it (R15), and
- * is then awaited to its end. Anything chained on the returned promise, as
- * the write queue is, so waits until git lets go of `index.lock`: one write
- * at a time (INV §9.5).
+ * Run a stage, unstage, commit, pull or push in `cwd`, never killed (see
+ * `OnTimeout`), and resolve with git's own result once it exits. One that
+ * outlives `WRITE_TIMEOUT_MS` first calls `onSlow` with the left-running
+ * result (`stderr`: `still running after 60 s`), so the user hears it (R15,
+ * R36), and is then awaited to its end. Anything chained on the returned
+ * promise, as the write queue is, so waits until git lets go of
+ * `index.lock`: one write at a time (INV §9.5). `program` is `git`, or
+ * `env` for a pull or push, whose argv sets git's environment first (R36,
+ * INV §8 P39 j).
  */
-export async function runWrite(runner: Runner, mode: Mode, args: string[], cwd: string, onSlow: (left: GitResult) => void): Promise<GitResult> {
-  const r = await run(runner, mode, "git", args, cwd, WRITE_TIMEOUT_MS, "leave");
+export async function runWrite(
+  runner: Runner,
+  mode: Mode,
+  args: string[],
+  cwd: string,
+  onSlow: (left: GitResult) => void,
+  program = "git",
+): Promise<GitResult> {
+  const r = await run(runner, mode, program, args, cwd, WRITE_TIMEOUT_MS, "leave");
   if (r.finished === undefined) return r;
   try {
     onSlow(r);

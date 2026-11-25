@@ -1,17 +1,21 @@
-// The section's tree: two groups of file rows built from a parsed status, a
-// one-row notice, and the signature that tells whether anything changed.
+// The section's tree: two groups of file rows built from a parsed status,
+// then the Graph group (lib/graph.ts), a one-row notice, and the signature
+// that tells whether anything changed.
 
 import { trimSlash } from "./git.ts";
+import { GRAPH_KEY, graphGroupOf, graphKind, type GraphKind } from "./graph_keys.ts";
 import type { Entry, Marker, Status } from "./status.ts";
 
 export const TREE_KEY = "git";
 export const STAGED_KEY = "g:s";
 export const CHANGES_KEY = "g:c";
 const NOTICE_KEY = "n:notice";
-/** Rows listed per group before the `… K more` row (R11). */
-export const ROW_CAP = 500;
+/** Rows listed per group, and per commit's files, before the `… K more`
+ *  row (R11). A full update of ~3,000 rows costs about 40 ms (INV §8 P36 h). */
+export const ROW_CAP = 1000;
 
-const DIM = "editor.line_number_fg";
+/** De-emphasised text: a directory, an original path, an author (R5, R30). */
+export const DIM = "editor.line_number_fg";
 
 /** Theme keys only, resolved by the host at render time so a theme switch
  *  recolours the rows without a reload (R5). */
@@ -28,9 +32,11 @@ export const MARKER_COLOR: Record<Marker, string> = {
 
 export interface Segment {
   text: string;
-  /** `strikethrough` is drawn in tree text (DTS `TextStyle`; R24). Left
-   *  out, not false, on every other segment. */
-  style?: { fg: string; strikethrough?: boolean };
+  /** Theme keys, resolved by the host at render time (R5, R31).
+   *  `strikethrough` is drawn in tree text (DTS `TextStyle`; R24); `bg` and
+   *  `bold` draw a ref badge (R30, INV §8 P36 e). Each is left out, not
+   *  false, on a segment that does not use it. */
+  style?: { fg: string; bg?: string; bold?: boolean; strikethrough?: boolean };
 }
 
 export interface Node {
@@ -56,13 +62,16 @@ export interface TreeSpec {
   toggleOnClick: boolean;
 }
 
-/** What a row is, by its item key. */
-export type RowKind = { kind: "group" } | { kind: "file"; path: string } | { kind: "inert" };
+/** What a row is, by its item key: a Staged or Changes file, or one of the
+ *  Graph's kinds (`GraphKind`), whose `group` and `inert` the status groups
+ *  share. `file` is a Staged or Changes row only: a commit's file is
+ *  `commitFile`, so no check for `file` reaches a Graph row (R30, R32). */
+export type RowKind = { kind: "file"; path: string } | GraphKind;
 
 export function rowKind(key: string): RowKind {
   if (key === STAGED_KEY || key === CHANGES_KEY) return { kind: "group" };
   if (key.startsWith("s:") || key.startsWith("c:")) return { kind: "file", path: key.slice(2) };
-  return { kind: "inert" };
+  return graphKind(key) ?? { kind: "inert" };
 }
 
 /** The item key of a file row in the Staged (`s`) or Changes (`c`) group. */
@@ -70,11 +79,14 @@ function fileKey(prefix: "s" | "c", path: string): string {
   return `${prefix}:${path}`;
 }
 
-function node(segments: Segment[], depth: number, hasChildren: boolean): Node {
+/** A row of `segments`, its text their concatenation. */
+export function node(segments: Segment[], depth: number, hasChildren: boolean): Node {
   return { text: { text: segments.map((s) => s.text).join(""), segments }, depth, hasChildren };
 }
 
-function fileNode(e: Entry): Node {
+/** A file row at `depth`: a status row at 1 (R5), a commit's file at 2
+ *  (R32). It carries no button: `group` adds the status rows' one. */
+export function fileNode(e: Entry, depth = 1): Node {
   const path = trimSlash(e.path);
   const slash = path.lastIndexOf("/");
   const name = slash < 0 ? path : path.slice(slash + 1);
@@ -87,7 +99,7 @@ function fileNode(e: Entry): Node {
   const segments: Segment[] = [{ text: e.marker, style: { fg } }, { text: " " }, { text: name, style: nameStyle }];
   if (dir) segments.push({ text: `  ${dir}`, style: { fg: DIM } });
   if (e.orig !== undefined) segments.push({ text: `  ← ${e.orig}`, style: { fg: DIM } });
-  return node(segments, 1, false);
+  return node(segments, depth, false);
 }
 
 /** The button label of the row `key`, or null for none. */
@@ -100,29 +112,37 @@ function withButton(n: Node, key: string, label: ButtonLabel | undefined): Node 
   return n;
 }
 
-function group(
-  label: string,
-  key: string,
-  prefix: "s" | "c",
-  entries: Entry[] | null,
-  nodes: Node[],
-  keys: string[],
-  button: ButtonLabel | undefined,
-): void {
-  const count = entries === null ? "" : ` ${entries.length}`;
-  nodes.push(withButton(node([{ text: `${label}${count}` }], 0, true), key, entries === null ? undefined : button));
-  keys.push(key);
-  if (entries === null) return;
+/** Rows and their item keys, in order. */
+export interface RowList {
+  nodes: Node[];
+  keys: string[];
+}
+
+/** File rows for `entries` at `depth`, at most `ROW_CAP`, then a dimmed
+ *  `… K more` row keyed `moreKey` when there are more (R11, R32). `row`
+ *  gives an entry's node and key. */
+export function pushCapped(out: RowList, entries: Entry[], depth: number, moreKey: string, row: (e: Entry) => [Node, string]): void {
   for (const e of entries.slice(0, ROW_CAP)) {
-    const k = fileKey(prefix, e.path);
-    nodes.push(withButton(fileNode(e), k, button));
-    keys.push(k);
+    const [n, k] = row(e);
+    out.nodes.push(n);
+    out.keys.push(k);
   }
   if (entries.length > ROW_CAP) {
-    nodes.push(node([{ text: `… ${entries.length - ROW_CAP} more`, style: { fg: DIM } }], 1, false));
-    // `more:s` / `more:c`: no `s:` / `c:` prefix, so no file can have it.
-    keys.push(`more:${prefix}`);
+    out.nodes.push(node([{ text: `… ${entries.length - ROW_CAP} more`, style: { fg: DIM } }], depth, false));
+    out.keys.push(moreKey);
   }
+}
+
+function group(label: string, key: string, prefix: "s" | "c", entries: Entry[] | null, out: RowList, button: ButtonLabel | undefined): void {
+  const count = entries === null ? "" : ` ${entries.length}`;
+  out.nodes.push(withButton(node([{ text: `${label}${count}` }], 0, true), key, entries === null ? undefined : button));
+  out.keys.push(key);
+  if (entries === null) return;
+  // `more:s` / `more:c`: no `s:` / `c:` prefix, so no file can have it.
+  pushCapped(out, entries, 1, `more:${prefix}`, (e) => {
+    const k = fileKey(prefix, e.path);
+    return [withButton(fileNode(e), k, button), k];
+  });
 }
 
 /** Expansion and selection are left neutral: they only seed a (re)mount, and
@@ -150,16 +170,23 @@ function tree(nodes: Node[], itemKeys: string[]): TreeSpec {
   };
 }
 
-/** The two groups, Staged first, both always present (R3). `status` null is
- *  the placeholder drawn before the first status arrives: the groups without
- *  counts, rows or buttons. `label` puts each row's `+`/`−` on it, group
- *  rows included (R5). */
-export function buildTree(status: Status | null, label?: ButtonLabel): TreeSpec {
-  const nodes: Node[] = [];
-  const keys: string[] = [];
-  group("Staged Changes", STAGED_KEY, "s", status ? status.staged : null, nodes, keys, label);
-  group("Changes", CHANGES_KEY, "c", status ? status.changes : null, nodes, keys, label);
-  return tree(nodes, keys);
+/** The three groups, Staged first, then Changes, then Graph, all always
+ *  present (R3). `status` null is the placeholder drawn before the first
+ *  status arrives: the groups without counts, rows or buttons. `label` puts
+ *  each row's `+`/`−` on it, group rows included (R5). `graph` is the
+ *  Graph's rows (`graphPart`), listed under its group row, which shows no
+ *  count and has no button (R3, R30). */
+export function buildTree(status: Status | null, label?: ButtonLabel, graph?: RowList): TreeSpec {
+  const out: RowList = { nodes: [], keys: [] };
+  group("Staged Changes", STAGED_KEY, "s", status ? status.staged : null, out, label);
+  group("Changes", CHANGES_KEY, "c", status ? status.changes : null, out, label);
+  out.nodes.push(node([{ text: "Graph" }], 0, true));
+  out.keys.push(GRAPH_KEY);
+  if (graph !== undefined) {
+    out.nodes.push(...graph.nodes);
+    out.keys.push(...graph.keys);
+  }
+  return tree(out.nodes, out.keys);
 }
 
 export type Group = "staged" | "changes";
@@ -181,11 +208,12 @@ export function entryMap(status: Status): EntryMap {
 }
 
 /** The group a row belongs to, by its key: the group row itself, its file
- *  rows and its `… N more` row. Null for any other row (a notice). */
+ *  rows and its `… N more` row, and for the Graph every one of its rows
+ *  (`graphGroupOf`). Null for any other row (a notice). */
 function groupOf(key: string): string | null {
   if (key === STAGED_KEY || key.startsWith("s:") || key === "more:s") return STAGED_KEY;
   if (key === CHANGES_KEY || key.startsWith("c:") || key === "more:c") return CHANGES_KEY;
-  return null;
+  return graphGroupOf(key);
 }
 
 /** Where a selected row sits: its group, and its offset among that group's
@@ -251,7 +279,7 @@ export function reconcile(
  *
  * Otherwise the Changes row is tried first, then the Staged one, as VS Code
  * prefers. The first group that lists the file decides: when that group is
- * collapsed, or the file's row is not drawn (past the 500-row cap), nothing
+ * collapsed, or the file's row is not drawn (past the 1,000-row cap), nothing
  * is selected, and no group is expanded. A path outside the root, a
  * sibling such as `/repo2` included, is never listed.
  */

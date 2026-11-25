@@ -15,13 +15,15 @@ import {
   STAGED_KEY,
   VOLUME_NOTICE,
 } from "../lib/view.ts";
+import { GRAPH_KEY } from "../lib/graph.ts";
 import { H, manyUntracked, mod, raw, status as fixture, texts, untracked } from "./helpers.ts";
 
-test("groups: Staged first, Changes second, with true counts", () => {
+test("groups: Staged first, Changes second with true counts, then Graph with none (R3)", () => {
   const spec = buildTree(fixture("acceptance"));
   const groups = spec.nodes.filter((n) => n.depth === 0).map((n) => n.text.text);
-  assert.deepEqual(groups, ["Staged Changes 2", "Changes 5"]);
+  assert.deepEqual(groups, ["Staged Changes 2", "Changes 5", "Graph"]);
   assert.equal(spec.itemKeys[0], STAGED_KEY);
+  assert.equal(spec.itemKeys.at(-1), GRAPH_KEY);
   assert.ok(spec.nodes.every((n) => (n.depth === 0) === n.hasChildren));
   // Seeds are neutral: the plugin sets them on every spec it sends.
   assert.deepEqual(spec.expandedKeys, []);
@@ -41,15 +43,16 @@ test("acceptance rows: marker, name, dir and original path", () => {
     "D gone.ts",
     "U c.txt  new",
     "U d.txt  new",
+    "Graph",
   ]);
   assert.deepEqual(spec.itemKeys, [
-    "g:s", "s:a.ts", "s:moved.ts", "g:c", "c:a.ts", "c:b.md", "c:gone.ts", "c:new/c.txt", "c:new/d.txt",
+    "g:s", "s:a.ts", "s:moved.ts", "g:c", "c:a.ts", "c:b.md", "c:gone.ts", "c:new/c.txt", "c:new/d.txt", "g:g",
   ]);
 });
 
 test("empty groups are present with count 0", () => {
   const spec = buildTree(fixture("clean"));
-  assert.deepEqual(texts(spec), ["Staged Changes 0", "Changes 0"]);
+  assert.deepEqual(texts(spec), ["Staged Changes 0", "Changes 0", "Graph"]);
 });
 
 test("every tree uses the layout that lets presses on the selected row through (INV §8 P21)", () => {
@@ -61,10 +64,10 @@ test("every tree uses the layout that lets presses on the selected row through (
   }
 });
 
-test("placeholder before the first status: both groups, no counts, no rows", () => {
+test("placeholder before the first status: the three groups, no counts, no rows", () => {
   const spec = buildTree(null);
-  assert.deepEqual(texts(spec), ["Staged Changes", "Changes"]);
-  assert.deepEqual(spec.itemKeys, [STAGED_KEY, CHANGES_KEY]);
+  assert.deepEqual(texts(spec), ["Staged Changes", "Changes", "Graph"]);
+  assert.deepEqual(spec.itemKeys, [STAGED_KEY, CHANGES_KEY, GRAPH_KEY]);
 });
 
 test("colours are theme keys only, never RGB", () => {
@@ -110,22 +113,23 @@ test("keys are unique when a path is in both groups", () => {
   assert.ok(keys.includes("s:f.txt") && keys.includes("c:f.txt"));
 });
 
-test("1,200 untracked files: 500 rows plus `… 700 more` with the true count", () => {
+test("1,200 untracked files: 1,000 rows plus `… 200 more` with the true count (R11)", () => {
   const spec = buildTree(parseStatus(raw({ ab: null, records: manyUntracked(1200) })));
-  const changes = spec.nodes.slice(spec.itemKeys.indexOf(CHANGES_KEY));
+  const changes = spec.nodes.slice(spec.itemKeys.indexOf(CHANGES_KEY), spec.itemKeys.indexOf(GRAPH_KEY));
   assert.equal(changes[0].text.text, "Changes 1200");
-  assert.equal(changes.length, 1 + 500 + 1);
-  assert.equal(changes.at(-1)!.text.text, "… 700 more");
-  assert.equal(spec.itemKeys.at(-1), "more:c");
+  assert.equal(changes.length, 1 + 1000 + 1);
+  assert.equal(changes.at(-1)!.text.text, "… 200 more");
+  assert.equal(spec.itemKeys.at(-2), "more:c");
   assert.equal(rowKind("more:c").kind, "inert");
   assert.equal(rowKind("more:s").kind, "inert");
-  // Exactly 500 is not capped.
-  const spec500 = buildTree(parseStatus(raw({ ab: null, records: manyUntracked(500) })));
-  assert.ok(!spec500.itemKeys.includes("more:c"));
+  // Exactly 1,000 is not capped.
+  const spec1000 = buildTree(parseStatus(raw({ ab: null, records: manyUntracked(1000) })));
+  assert.ok(!spec1000.itemKeys.includes("more:c"));
+  assert.equal(spec1000.itemKeys.length, 3 + 1000);
 });
 
 test("a file named `~more` in an overflowing group keeps a unique, openable key", () => {
-  const spec = buildTree(parseStatus(raw({ ab: null, records: [untracked("~more"), ...manyUntracked(600, "~n")] })));
+  const spec = buildTree(parseStatus(raw({ ab: null, records: [untracked("~more"), ...manyUntracked(1100, "~n")] })));
   assert.equal(new Set(spec.itemKeys).size, spec.itemKeys.length, "item keys unique");
   assert.ok(spec.itemKeys.includes("c:~more"));
   assert.deepEqual(rowKind("c:~more"), { kind: "file", path: "~more" });
@@ -134,7 +138,7 @@ test("a file named `~more` in an overflowing group keeps a unique, openable key"
 test("directory rows: name is the last segment, dir its parent; their keys are listed", () => {
   const status = parseStatus(raw({ ab: null, records: [`1 .M S.M. 160000 160000 160000 ${H} ${H} libs/sub`, untracked("vendor/lib/")] }));
   const spec = buildTree(status);
-  assert.deepEqual(texts(spec), ["Staged Changes 0", "Changes 2", "M sub  libs", "U lib  vendor"]);
+  assert.deepEqual(texts(spec), ["Staged Changes 0", "Changes 2", "M sub  libs", "U lib  vendor", "Graph"]);
   const dirs = (s: Status) => [...entryMap(s)].filter(([, l]) => l.entry.dir).map(([k]) => k).sort();
   assert.deepEqual(dirs(status), ["c:libs/sub", "c:vendor/lib/"]);
   assert.deepEqual(dirs(fixture("acceptance")), []);
@@ -179,13 +183,14 @@ test("buttons: labels land in nodes[i].action, group rows included; signature() 
   /** The same labels on file rows only: null for the group rows. */
   const filesOnly = (key: string) => (key.startsWith("g:") ? null : label(key));
   const actions = (l?: (key: string) => string | null) => buildTree(acc, l).nodes.map((n) => n.action ?? null);
-  assert.deepEqual(actions(), [null, null, null, null, null, null, null, null, null]);
+  assert.deepEqual(actions(), [null, null, null, null, null, null, null, null, null, null]);
   assert.ok(buildTree(acc).nodes.every((n) => !("action" in n)), "no field without buttons");
-  assert.deepEqual(actions(filesOnly), [null, "-", "-", null, "+", "+", "+", "+", "+"]);
-  assert.deepEqual(actions(label), ["G", "-", "-", "G", "+", "+", "+", "+", "+"]);
+  assert.deepEqual(actions(filesOnly), [null, "-", "-", null, "+", "+", "+", "+", "+", null]);
+  // The Graph group never asks for a label: it has no button (R3).
+  assert.deepEqual(actions(label), ["G", "-", "-", "G", "+", "+", "+", "+", "+", null]);
   // A label of null means no button on that row.
   const some = buildTree(acc, (k) => (k === "c:b.md" ? "+" : null));
-  assert.deepEqual(some.nodes.map((n) => n.action ?? null), [null, null, null, null, null, "+", null, null, null]);
+  assert.deepEqual(some.nodes.map((n) => n.action ?? null), [null, null, null, null, null, "+", null, null, null, null]);
   assert.ok(!("action" in some.nodes[0]), "no field on a row without a button");
   // The placeholder never has buttons.
   assert.ok(buildTree(null, label).nodes.every((n) => !("action" in n)));
@@ -214,7 +219,7 @@ test("placeOf: a row's group and its offset in it", () => {
   assert.deepEqual(placeOf(["n:notice"], "n:notice"), { group: null, offset: -1 });
 });
 
-test("reconcile: a gone row's selection stays at its offset in its group, not its global index (R10, critique F1)", () => {
+test("reconcile: a gone row's selection stays at its offset in its group, not its global index (R10, spec decisions)", () => {
   const before = ["g:s", "s:a.ts", "s:moved.ts", "g:c", "c:b.md", "c:gone.ts", "c:new/c.txt"];
   const place = placeOf(before, "c:b.md");
   // b.md staged: Staged grew by one, so index 4 is now the Changes group row.
@@ -301,9 +306,32 @@ test("revealKey: the file's Changes row, else its Staged row; null when not list
   assert.equal(reveal("/repo/b.md", new Set([STAGED_KEY])), null);
   assert.equal(reveal("/repo/a.ts", new Set([STAGED_KEY])), null, "not its Staged row instead");
   assert.equal(reveal("/repo/moved.ts", new Set([CHANGES_KEY])), null);
-  // Past the 500-row cap: listed but not drawn.
-  const many = parseStatus(raw({ ab: null, records: manyUntracked(600) }));
+  // Past the 1,000-row cap: listed but not drawn.
+  const many = parseStatus(raw({ ab: null, records: manyUntracked(1200) }));
   const manySpec = buildTree(many);
   assert.equal(revealKey("/repo/f0400.txt", "/repo", entryMap(many), manySpec.itemKeys, both, null), "c:f0400.txt");
-  assert.equal(revealKey("/repo/f0550.txt", "/repo", entryMap(many), manySpec.itemKeys, both, null), null);
+  assert.equal(revealKey("/repo/f0999.txt", "/repo", entryMap(many), manySpec.itemKeys, both, null), "c:f0999.txt");
+  assert.equal(revealKey("/repo/f1000.txt", "/repo", entryMap(many), manySpec.itemKeys, both, null), null);
+});
+
+test("reconcile keeps a vanished Graph row's selection inside the Graph (R10, R30)", () => {
+  const keys = ["g:s", "g:c", "c:a", "g:g", "h:1", "hf:1:x", "hf:1:y", "h:2", "more:h"];
+  // hf:1:y is gone (the commit collapsed): its place in the Graph.
+  const place = placeOf(keys, "hf:1:y");
+  assert.deepEqual(place, { group: "g:g", offset: 2 });
+  const after = ["g:s", "g:c", "c:a", "c:b", "g:g", "h:1", "h:2", "more:h"];
+  assert.deepEqual(reconcile("hf:1:y", place, 6, after), { key: "more:h", index: 7 });
+  // A commit row that is still listed keeps its key, wherever it moved.
+  assert.deepEqual(reconcile("h:2", placeOf(keys, "h:2"), 7, after), { key: "h:2", index: 6 });
+  // Every commit gone (an unborn branch): the group row.
+  assert.deepEqual(reconcile("h:1", placeOf(keys, "h:1"), 4, ["g:s", "g:c", "g:g"]), { key: "g:g", index: 2 });
+});
+
+test("the Graph's rows follow the status rows; revealKey never picks one (R3, R23)", () => {
+  const acc = fixture("acceptance");
+  const spec = buildTree(acc, undefined, { nodes: [{ text: { text: "● x", segments: [{ text: "● x" }] }, depth: 1, hasChildren: true }], keys: ["h:1"] });
+  assert.deepEqual(spec.itemKeys.slice(-2), [GRAPH_KEY, "h:1"]);
+  // A commit lists a.ts too, but only status rows are revealed.
+  const keys = [...spec.itemKeys, "hf:1:a.ts"];
+  assert.equal(revealKey("/repo/a.ts", "/repo", entryMap(acc), keys, new Set([STAGED_KEY, CHANGES_KEY, GRAPH_KEY, "h:1"]), "hf:1:a.ts"), "c:a.ts");
 });

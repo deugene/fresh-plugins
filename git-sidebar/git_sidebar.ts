@@ -1,16 +1,23 @@
 // git-sidebar: a "Git" section under the file explorer with the current
-// branch and two groups, Staged Changes and Changes, kept current. A click
+// branch and three groups, Staged Changes, Changes and Graph, kept current. A click
 // or Enter on a file opens its side-by-side diff (R14), and Enter in the
 // diff opens the file at its line (R19, R20); `+`/`−` and Space stage and
 // unstage (R15, R16); a right-click opens the row's menu (R17), with
 // Resolve Conflict (R25) and Commit… (R26); the palette has the same
 // commands, and Focus (R18, R22). Switching to a listed file selects its
 // row (R23). Each window has a section of its own, for its own folder (R28).
+// Next and Previous Change move through the diff (R29). The Graph shows the
+// branch's history with each commit's files, their diffs, View Commit and
+// the copies (R30–R33, INV §12.3); Pull and Push sit beside Commit…
+// (R34–R36, INV §12.4).
 //
 // This file only wires the editor to the pure pieces in lib/: status parsing
 // (status.ts), the tree (view.ts), what each row offers (actions.ts), the
-// diff view (diff.ts), staging (stage.ts), refresh timing (scheduler.ts),
-// where git runs (git.ts) and each window's panel id (windows.ts).
+// diff view (diff.ts; its panes and marks, diff_view.ts; where it opens,
+// placement.ts), staging (stage.ts), refresh timing (scheduler.ts),
+// where git runs (git.ts), each window's panel id (windows.ts), and the
+// Graph: its reads (history.ts), lanes (lanes.ts), rows (graph.ts) and
+// when it reads the log (graph_state.ts).
 // Collapsing the whole section, its height and its position belong to the
 // host; the plugin keeps the section mounted and updates it in place.
 //
@@ -19,21 +26,20 @@
 // section they are about, and keeps what is the editor's alone: the timer,
 // the right-click menu, the keyboard's region and the palette.
 
-import { parseStatus, title as statusTitle, unpassable, type Status } from "./lib/status.ts";
+import { dirReason, nameReason, parseStatus, title as statusTitle, unpassable, type Status } from "./lib/status.ts";
 import {
   anchorArg,
-  badName,
   buttonLabel,
   conflicted,
-  dirReason,
+  isGraphCommand,
   menuChoice,
   menuItems,
   menuSpec,
-  nameReason,
   NO_ROWS,
   NOT_SHOWN,
   paletteTarget,
   rowAction,
+  type GraphCommand,
   type PaletteCommand,
 } from "./lib/actions.ts";
 import {
@@ -47,29 +53,48 @@ import {
   stageArgs,
   unstageAllPlan,
   unstageArgs,
+  utf8Length,
   type GroupPlan,
 } from "./lib/stage.ts";
 import {
   blobRefusal,
-  compositeHunks,
   contentToEntries,
   DIFF_HINT,
   DiffSlot,
   lineCount,
+  MAX_DIFF_BYTES,
+  NO_NEXT_CHANGE,
+  NO_PREVIOUS_CHANGE,
+  NO_SECTION_DIFF,
   openLine,
-  paneLabels,
   refusal,
   refusalMessage,
-  rowRefusal,
-  sides,
+  sideOf,
   sizeRefusal,
   sourceName,
-  tabTitle,
-  targetLine,
+  statusDiffTarget,
+  type DiffTarget,
   type Refusal,
   type Side,
   type View,
 } from "./lib/diff.ts";
+import {
+  centreLine,
+  diffLayout,
+  facingLine,
+  headerEntries,
+  headerPanel,
+  lineTotal,
+  onePaneHunks,
+  paint,
+  paneSides,
+  stepHunk,
+  viewHunks,
+  type PaneSide,
+  type SidePaint,
+  type ViewHunk,
+} from "./lib/diff_view.ts";
+import { isFile, splitCandidates } from "./lib/placement.ts";
 import {
   buildTree,
   CHANGES_KEY,
@@ -95,6 +120,7 @@ import {
   blobSizeArgs,
   containerId,
   detectMode,
+  failReason,
   gitReason,
   commitMessage,
   HEAD_SUMMARY_ARGS,
@@ -103,6 +129,7 @@ import {
   run,
   runOn,
   runWrite,
+  shortId,
   STATUS_ARGS,
   TOPLEVEL_ARGS,
   trimSlash,
@@ -112,6 +139,28 @@ import {
   type Runner,
 } from "./lib/git.ts";
 import { LEGACY_PANEL, panelIdFor, windowKey } from "./lib/windows.ts";
+import { commitDiffTarget, commitOf, GRAPH_KEY, type GraphRows } from "./lib/graph.ts";
+import { GraphState } from "./lib/graph_state.ts";
+import { commitMessageText, messageArgs, showArgs } from "./lib/history.ts";
+import {
+  classifyPull,
+  classifyPush,
+  configuredSsh,
+  HEAD_REF_ARGS,
+  parseRemotes,
+  parseUpstream,
+  publishArgs,
+  pullArgs,
+  pullTargetCheck,
+  pushArgs,
+  remoteArgv,
+  remoteEnv,
+  REMOTES_ARGS,
+  SSH_CONFIG_ARGS,
+  sshCommand,
+  upstreamArgs,
+  upstreamName,
+} from "./lib/remote.ts";
 
 const editor = getEditor();
 
@@ -123,10 +172,38 @@ const PLUGIN_NAME = "git_sidebar";
  *  window's section has its own panel id (`panelIdFor`, never 0 to 2). */
 const MENU = 2;
 const TICK = "gitSidebarTick";
-/** The diff view's keymap, read-only (R14): Enter opens the file (R19).
- *  Keys it does not bind fall through to Fresh's side-by-side keys, `n`,
- *  `p`, `]`, `[`, `q` and Esc (R20, INV §8 P25). */
+/** The diff view's keymap, read-only (R14), on its sources: in a buffer
+ *  group Fresh gives none of its side-by-side keys, so every key of R20 is
+ *  bound here (INV §8 P41 k, P42 f), and Enter opens the file (R19). Also
+ *  the palette context of Next and Previous Change: the host lists a
+ *  command whose context is the focused buffer's mode
+ *  (`command_registry.rs:236-243`, INV §8 P39 k), so they are listed
+ *  exactly while a section diff is the active tab (R29). Only the diff's
+ *  sources may have this mode. */
 const DIFF_MODE = "git-sidebar-diff";
+/** R20's keys. `j`/`k` name Fresh's built-in `scroll_down`/`scroll_up`,
+ *  which scroll the focused pane and its sync partner without moving the
+ *  cursor (H9, P42 f): action names, not API, so recheck them after a
+ *  Fresh upgrade. */
+const DIFF_KEYS: [string, string][] = [
+  ["Enter", "gitSidebar_diffEnter"],
+  ["n", "gitSidebar_nextChange"],
+  ["]", "gitSidebar_nextChange"],
+  ["p", "gitSidebar_prevChange"],
+  ["[", "gitSidebar_prevChange"],
+  ["q", "gitSidebar_diffClose"],
+  ["Escape", "gitSidebar_diffClose"],
+  ["Tab", "gitSidebar_diffSwitch"],
+  ["BackTab", "gitSidebar_diffSwitch"],
+  ["j", "scroll_down"],
+  ["k", "scroll_up"],
+];
+/** The namespace of the diff's decorations (R38, R39). */
+const DIFF_NS = "git-sidebar-diff";
+/** Scroll sync group ids are the plugin's, editor-wide, while split ids
+ *  repeat across windows (H13): one counter for every window's diffs. A
+ *  group goes away with its panes, so nothing removes one. */
+let syncSeq = 0;
 /** Set while the active window's section shows status rows: the palette
  *  commands are listed only then (R18, INV §8 P11). Contexts are stored per
  *  window, and written to the active one (INV §8 P33). */
@@ -138,6 +215,7 @@ const SHOWN_CONTEXT = "git-sidebar-shown";
 const BARE_TITLE = "Git";
 /** No rows: what a lookup in the rows sees under a notice. */
 const NO_ENTRIES: EntryMap = new Map();
+const NO_GRAPH: GraphRows = new Map();
 /** While the mode is being found again (after an attach or detach) git
  *  would run in the wrong place (R13). */
 const FINDING_MODE = "finding out where git runs; try again in a moment";
@@ -148,6 +226,9 @@ const OTHER_WINDOW = "another window became active";
 const WAITING_JOIN = " · ";
 /** The write queue's key for a commit: no row key looks like it. */
 const COMMIT_KEY = "commit";
+/** The prompt type of Publish's question (R35): every prompt hook fires for
+ *  every prompt, so its answers are told apart by it (INV §8 P39 h). */
+const PUBLISH_PROMPT = "git-sidebar-publish";
 /** The bundled plugin whose action starts conflict resolution (R25). */
 const MERGE_PLUGIN = "merge_conflict";
 /** Its "Merge: Start Resolution", which acts on the active buffer
@@ -208,6 +289,13 @@ let menu: { owner: Section; key: string } | null = null;
  *  return to a window (INV §11.4). Fresh starts with the keyboard in the
  *  editor, and sections mount blurred. */
 let keyboardRegion = "editor";
+
+/** An environment variable of Fresh's own, which git inherits (INV §8 P39
+ *  c): `getEnv` gives `undefined` for one that is not set. */
+function envVar(name: string): string | null {
+  const v: unknown = editor.getEnv(name);
+  return typeof v === "string" ? v : null;
+}
 /** The one host timer, for the active window's section: only it refreshes
  *  (R28, R11). Only `armActive` arms it. */
 const timer = new SingleTimer(
@@ -294,8 +382,9 @@ function makeSection(win: number, workspace: string, panel: number) {
    *  SHOWN_CONTEXT is set exactly while it is not null, while `win` is
    *  active (`setShown`, `syncContexts`). */
   let shown: { title: string; sig: string } | null = null;
-  /** Group expansion, owned here because a remount resets the host's. */
-  const expanded = new Set<string>([STAGED_KEY, CHANGES_KEY]);
+  /** Group and commit expansion, owned here because a remount resets the
+   *  host's. All three groups start expanded (R3). */
+  const expanded = new Set<string>([STAGED_KEY, CHANGES_KEY, GRAPH_KEY]);
   /** The selected row by key, the host's index for it, and its place in its
    *  group. The host keeps a selection by index, so rows inserted above it
    *  would move it (R10); when the row goes, the selection stays at its place
@@ -307,12 +396,16 @@ function makeSection(win: number, workspace: string, panel: number) {
   let shownKeys: string[] = [];
   /** The status rows shown now: the status they were built from, its file
    *  rows by key with their entry and group, and the status output itself
-   *  (`raw`), so a refresh with the same output builds nothing (R10). Null
-   *  under a notice, the placeholder, or no section. Every row action and
-   *  palette command reads this, so none acts on rows that are not on screen
-   *  (R13, R18). ROWS_CONTEXT is set exactly while it is not null, while
-   *  `win` is active. */
-  let rows: { status: Status; entries: EntryMap; raw: string } | null = null;
+   *  (`raw`), so a refresh with the same output builds nothing (R10); and
+   *  the Graph rows drawn with them (`graph`), by key, which its menus, the
+   *  palette, View File and the diff act on. Graph rows are kept out of
+   *  `entries`, which every write reads, so no write can reach one (R30,
+   *  R32: they have no button). Null under a notice, the placeholder, or no
+   *  section. Every row action and palette command reads this, so none acts
+   *  on rows that are not on screen (R13, R17, R18): in volume mode that
+   *  would be host git on the wrong folder. ROWS_CONTEXT is set exactly
+   *  while it is not null, while `win` is active. */
+  let rows: { status: Status; entries: EntryMap; raw: string; graph: GraphRows } | null = null;
   /** The window's one diff view (R14). */
   const slot = new DiffSlot();
   /** Whether the keyboard is in the section, so auto-reveal leaves the row
@@ -323,8 +416,33 @@ function makeSection(win: number, workspace: string, panel: number) {
    *  and parking the section sends `blur` (INV §11.1). */
   let sectionFocused = false;
   /** The diff view whose key hint waits for the keyboard to be in it (R20),
-   *  by its composite id, or null. */
-  let hintFor: number | null = null;
+   *  or null. */
+  let hintFor: View | null = null;
+  /** The Graph's commits, lanes, files and when to read the log (R30–R32). */
+  const graph = new GraphState({ runner, live: (e) => live(e), say: (m) => say(m) });
+  /** View Commit's one tab (R33): its buffer. Which View Commit is the
+   *  latest is the slot's generation (`DiffSlot.claim`), so a slower earlier
+   *  one, or one overtaken by a diff, opens nothing. */
+  let commitTab: number | null = null;
+  /** The split View Commit's tab was shown in, recorded then: a replacing
+   *  tab opens there (R37). `BufferInfo.splits` would not tell once another
+   *  tab of that split is the visible one (H15). */
+  let commitSplit: number | null = null;
+  /** The split that was last the active one while it showed a file or one
+   *  of the section's tabs: where a new section tab opens (R37). The dock
+   *  never shows a file (INV §13.1), so it is never this. Tracked on
+   *  `active_buffer_changed` (`track`); null until then. */
+  let lastSplit: number | null = null;
+  /** Set from the focus that places a section tab until the tab is made
+   *  (`enterTarget`): a frame between them may announce the target split's
+   *  own tab (H16, P42 d), which must neither move the selection (R23) nor
+   *  be tracked. A count: two builds can be placing at once. */
+  let placing = 0;
+  /** This window's open Publish prompt (R35): the answer it waits for.
+   *  Prompts are each window's own (INV §11.4), and the prompt hooks name
+   *  no window: a prompt is answered in the active window, so the hooks go
+   *  to its section (`answerPublish`). */
+  let publishAnswer: ((input: string | null) => void) | null = null;
 
   const sched = new Scheduler();
 
@@ -337,7 +455,7 @@ function makeSection(win: number, workspace: string, panel: number) {
   /** Diff views to close once `win` is active again: the calls that close
    *  them act on the active window (INV §11.4). If the window closes first,
    *  the host purges them with it. */
-  const leftovers: { composite: number | null; ids: number[] }[] = [];
+  const leftovers: number[][] = [];
 
   /** Whether `win` is the active window now. Read when it matters, never
    *  remembered: an event's window may already be stale (INV §11.4). */
@@ -484,6 +602,13 @@ function makeSection(win: number, workspace: string, panel: number) {
     return true;
   }
 
+  /** The section's tree for `status`: its groups with their buttons, and
+   *  the Graph's rows as they stand. The one builder, so a status change
+   *  never drops the Graph's rows and moves a selection in it (R10). */
+  function treeFor(status: Status, entries: EntryMap): TreeSpec {
+    return buildTree(status, (key) => buttonLabel(key, status, entries), graph.part(expanded));
+  }
+
   /** Draw a status; whether the section now shows it. */
   function showStatus(stdout: string): boolean {
     const status = parseStatus(stdout);
@@ -491,14 +616,19 @@ function makeSection(win: number, workspace: string, panel: number) {
     // The host refused it: the rows, their entries and the palette context
     // stay those of the status still on screen (R13, R18), and the next
     // refresh, whose output differs from theirs, draws this one again.
-    if (!show(statusTitle(status), buildTree(status, (key) => buttonLabel(key, status, entries)))) return false;
-    setRows({ status, entries, raw: stdout });
+    if (!show(statusTitle(status), treeFor(status, entries))) return false;
+    setRows({ status, entries, raw: stdout, graph: graph.rows() });
     return true;
   }
 
+  /** Draw the rows again for the status on screen: the Graph changed
+   *  (R30–R32). In place, under the same title. */
+  function redraw(): void {
+    if (rows === null) return;
+    if (show(statusTitle(rows.status), treeFor(rows.status, rows.entries))) rows.graph = graph.rows();
+  }
+
   function showNotice(text: string): void {
-    // No row action may run against rows that are not shown: in volume mode
-    // that would be host git on the wrong folder (R13).
     setRows(null);
     show(BARE_TITLE, noticeTree(text), true);
   }
@@ -605,7 +735,40 @@ function makeSection(win: number, workspace: string, panel: number) {
     // The output on screen already: nothing to parse or build (R10). A status
     // the host refused to draw releases nothing: its rows are not on screen,
     // and the next refresh draws it again.
-    if (r.stdout === rows?.raw || showStatus(r.stdout)) ops.release(seq);
+    if (!(r.stdout === rows?.raw || showStatus(r.stdout))) return;
+    ops.release(seq);
+    // The Graph, in the same tick: the scheduler times the whole refresh, so
+    // R11's 25% covers its reads too.
+    if (rows !== null) await refreshGraph(myEpoch, m, root, rows.status);
+  }
+
+  /**
+   * The Graph after a status (R30): the log when HEAD, the branch or the
+   * upstream moved, or something forced it (`GraphState.afterStatus`); then
+   * the files of expanded commits not read yet, such as after Load more or a
+   * switch back to the window; then the rows again if anything changed, with
+   * Load more's first new commit selected (R30). Every read checks `live`
+   * first (R28).
+   */
+  async function refreshGraph(myEpoch: number, m: Exclude<Mode, "volume">, r0: string, status: Status): Promise<void> {
+    let changed = await graph.afterStatus(status, m, r0, myEpoch, expanded.has(GRAPH_KEY));
+    if (myEpoch !== epoch) return;
+    // The host keeps a dropped key expanded otherwise: an update in place
+    // ignores the spec's seeds, and the commit could come back.
+    if (graph.prune(expanded)) pushExpanded();
+    for (const id of graph.unread(expanded)) {
+      if (await graph.ensureFiles(id, m, r0, myEpoch)) changed = true;
+      if (myEpoch !== epoch) return;
+    }
+    if (changed) redraw();
+    const first = graph.takeSelection();
+    if (first !== null) {
+      const index = shownKeys.indexOf(first);
+      if (index >= 0) {
+        recordSelection(first, index);
+        pushSelection(index);
+      }
+    }
   }
 
   const refreshNow = guardedAsync("refresh", () => refresh(epoch));
@@ -642,50 +805,107 @@ function makeSection(win: number, workspace: string, panel: number) {
     phase = "ended";
     epoch++;
     slot.invalidate();
+    // A Publish prompt still open: its flow sees the end and does nothing.
+    answerPublish(null);
     stop(false);
     armActive();
   }
 
+  /** Enter on a group or a commit row toggles it: the host does not (INV §8
+   *  P39 g), and pushing the keys sends no `expand` back. */
   function toggleGroup(key: string): void {
     if (expanded.has(key)) expanded.delete(key);
     else expanded.add(key);
     pushExpanded();
+    if (expanded.has(key)) onExpanded(key);
+  }
+
+  /** A row was just expanded, by the host or by Enter. The Graph group: read
+   *  the log now, as nothing ran while it was collapsed (R11, R30). A
+   *  commit: list its files (R32). */
+  function onExpanded(key: string): void {
+    if (key === GRAPH_KEY) {
+      graph.forceNext();
+      requestRefresh();
+      return;
+    }
+    const row = rowKind(key);
+    if (row.kind === "commit") void guardedAsync("files", () => loadFiles(row.id))();
+  }
+
+  /** A commit's files, read when it is expanded (R32), then drawn. A
+   *  failure says git's reason and lists none (`GraphState.ensureFiles`).
+   *  Drawn whether they were read now or kept from before: a commit
+   *  collapsed and expanded again keeps its files, but a redraw while it was
+   *  collapsed dropped its rows, and the host shows children only when sent
+   *  (INV §8 P36 d). An unchanged tree makes no widget call. */
+  async function loadFiles(id: string): Promise<void> {
+    if (!isActive()) return;
+    const ready = readiness();
+    if ("why" in ready) return;
+    const myEpoch = epoch;
+    await graph.ensureFiles(id, ready.mode, ready.root, myEpoch);
+    if (myEpoch === epoch) redraw();
+  }
+
+  /** Load more (R30): one more page of commits on a refresh now; the first
+   *  new one is selected once drawn (`refreshGraph`). A second press while it
+   *  loads does nothing: a double click loads one page (R30). */
+  function loadMore(): void {
+    if (graph.loadMore()) requestRefresh();
   }
 
   /** What a row action runs against: the rows shown, the root and where git
    *  runs; or why none can run now. Under a notice or the placeholder there
    *  are no rows to act on. */
-  type Readiness = { why: string } | { status: Status; entries: EntryMap; root: string; mode: Exclude<Mode, "volume"> };
+  type Readiness = { why: string } | { status: Status; entries: EntryMap; graph: GraphRows; root: string; mode: Exclude<Mode, "volume"> };
 
   function readiness(): Readiness {
     if (rows === null || root === null) return { why: NO_ROWS };
     if (mode === null) return { why: FINDING_MODE };
     if (mode === "volume") return { why: "the sources are in a container volume" };
-    return { status: rows.status, entries: rows.entries, root, mode };
+    return { status: rows.status, entries: rows.entries, graph: rows.graph, root, mode };
   }
 
-  /** The row's file as an absolute path, when it is a regular file that
-   *  View File may open; otherwise null, after saying why. */
+  /** The row's file in the working tree as an absolute path, when it is a
+   *  regular file that View File may open; otherwise null, after saying why.
+   *  A status row, or a commit's file (R7, R32), whose working-tree file
+   *  is opened: the one a commit changed may since be gone. A commit file's
+   *  key holds its path, so Enter in its diff (R19) opens it once its row
+   *  is no longer listed too. */
   function fileToOpen(key: string): string | null {
     const row = rowKind(key);
-    if (row.kind !== "file" || root === null) return null;
-    if (rows?.entries.get(key)?.entry.dir === true) {
-      say(dirReason(trimSlash(row.path)));
+    if (root === null) return null;
+    let rel: string;
+    let dir: boolean;
+    if (row.kind === "file") {
+      rel = row.path;
+      dir = rows?.entries.get(key)?.entry.dir === true;
+    } else if (row.kind === "commitFile") {
+      // The key's path is the entry's (`commitFileKey`).
+      const entry = rows?.graph.get(key)?.entry;
+      rel = row.path;
+      dir = entry?.dir === true;
+    } else {
+      return null;
+    }
+    if (dir) {
+      say(dirReason(trimSlash(rel)));
       return null;
     }
     // Status names it lossily (F6): the path names no file, so the stat below
     // would call it deleted.
-    if (unpassable(row.path)) {
-      say(nameReason(row.path));
+    if (unpassable(rel)) {
+      say(nameReason(rel));
       return null;
     }
-    const path = editor.pathJoin(root, row.path);
+    const path = editor.pathJoin(root, rel);
     // openFile on a missing path would create a new buffer, and `fileExists`
     // is true for a directory too (a deleted file's path reused by one, a
     // symlink to one).
     const stat = editor.fileStat(path) as { isFile?: unknown; isDir?: unknown } | null;
     if (stat?.isFile === true) return path;
-    say(stat?.isDir === true ? `${row.path} is a directory` : `${row.path} is deleted`);
+    say(stat?.isDir === true ? `${rel} is a directory` : `${rel} is deleted`);
     return null;
   }
 
@@ -788,35 +1008,46 @@ function makeSection(win: number, workspace: string, panel: number) {
     return why !== null ? { refused: why } : { text: blob.stdout };
   }
 
-  /** Drop a diff view's buffers: the composite's state first, when there is
-   *  a composite, then each of `ids`. `closeCompositeBuffer` only drops the
-   *  composite's state, and the buffer stays as an empty tab until
-   *  `closeBuffer` closes it (INV §9.4, P9 c). Nothing else drops that state,
-   *  so a user's close calls it too (P19). Both act on the active window
-   *  (INV §11.4), so another window's view waits until it is active again
-   *  (`leftovers`). */
-  function dropView(composite: number | null, ids: number[]): void {
+  /** Close buffers of a diff view or View Commit's tab, each once (a second
+   *  close of a buffer logs an ERROR, H14). Closing a diff's source closes
+   *  its group too (H4), so the sources are all a diff needs. `closeBuffer`
+   *  acts on the active window (INV §11.4), so another window's buffers wait
+   *  until it is active again (`leftovers`). */
+  function dropView(ids: Iterable<number>): void {
+    const list = [...ids];
+    if (list.length === 0) return;
     if (!isActive()) {
-      leftovers.push({ composite, ids });
+      leftovers.push(list);
       log(`window ${win}'s diff closes once it is active`);
       return;
     }
-    if (composite !== null) editor.closeCompositeBuffer(composite);
-    for (const id of ids) editor.closeBuffer(id, true);
+    for (const id of list) editor.closeBuffer(id, true);
   }
 
-  /** Close a diff view the plugin made: the composite and both sources. */
+  /** Close a diff view the plugin made: its sources not yet closed, which
+   *  takes its group with them (R14 "no leftovers"). Never `closeBufferGroup`
+   *  (it would leave the sources open) nor `removeScrollSyncGroup` (the sync
+   *  group goes with its panes, H13). */
   function closeView(v: View): void {
-    dropView(v.composite, [v.composite, v.left, v.right]);
+    const ids = [...v.open];
+    v.open.clear();
+    dropView(ids);
+  }
+
+  /** What the row `key` diffs (R14, R32): a Staged, Changes or conflicted
+   *  row through its status entry, a commit's file through the Graph's
+   *  rows; null for any other row, or one no longer listed. */
+  function diffTargetOf(key: string, status: Status, entries: EntryMap, graphRows: GraphRows): DiffTarget | null {
+    const listed = entries.get(key);
+    if (listed !== undefined) return statusDiffTarget(listed.entry, listed.group, status.oid === null, key);
+    const g = graphRows.get(key);
+    return g?.entry === undefined ? null : commitDiffTarget(g.commit, g.entry, key);
   }
 
   /**
-   * Open the row's side-by-side diff in the active split, replacing the one
-   * shown (R14). The tab opens in the split that was active before the click,
-   * and focus stays in the section (INV §8, P9 a, b). Every await re-checks
-   * the epoch, the slot's generation and the window: buffers open in the
-   * active window, so a build overtaken by a switch stops (R28). A stale
-   * build closes what it made.
+   * Open the row's side-by-side diff in the editor area (R37), replacing the
+   * one shown (R14), whichever row it is for: a status row or a commit's
+   * file (R32). The keyboard stays in the section (INV §8 P42 d, k).
    */
   async function openDiff(key: string): Promise<void> {
     // Its reads would run on the active window's authority, and its buffers
@@ -827,30 +1058,100 @@ function makeSection(win: number, workspace: string, panel: number) {
       say(ready.why);
       return;
     }
-    const { status, entries, root: r, mode: m } = ready;
-    const listed = entries.get(key);
-    if (listed === undefined) return;
-    const path = trimSlash(listed.entry.path);
+    const target = diffTargetOf(key, ready.status, ready.entries, ready.graph);
+    if (target === null) return;
     // A directory, a name that is not UTF-8 (F6), or a symbolic link.
-    const refused = rowRefusal(listed.entry, listed.group);
-    if (refused !== null) {
+    if (target.refusal !== null) {
       // This click is the latest: a slower build for an earlier click must
-      // not open its diff after this message (R14 "each later click").
+      // not open its diff after this message (R14 "each later click"), nor a
+      // slower View Commit its tab (R33).
       slot.invalidate();
-      say(refusalMessage(refused === "unpassable name" ? badName(listed.entry) : path, refused));
+      say(refusalMessage(target.refusal === "unpassable name" ? target.refusedName : target.path, target.refusal));
       return;
     }
+    await buildDiff(target, ready.mode, ready.root);
+  }
+
+  /** Whether split `id` exists in this window now, checked without
+   *  focusing it: a focus on a split that is gone logs a WARN (P42 e).
+   *  `listSplits` leaves out a split whose visible tab is a buffer group
+   *  (H3), so the split of the diff shown now counts too. */
+  function splitExists(id: number): boolean {
+    return id === slot.current()?.split || editor.listSplits().some((s) => s.splitId === id);
+  }
+
+  /**
+   * Make the split a new section tab belongs in the active one, right
+   * before the tab is made (R37): Fresh puts a buffer group, or a new
+   * virtual buffer's tab, in the active split, which may be the dock (H1,
+   * INV §13.1). The caller sets `placing` around this and the creation, and
+   * no `flush` may come between them: a frame between would announce the
+   * target's own tab (H16, P42 k).
+   *
+   * - A diff replacing the one shown (`replacing`): a focus on one of its
+   *   panels, so the new group lands in its split (P42 d (ii): one
+   *   announcement, for the new view, none for the old one; P42 l for one
+   *   pane).
+   * - Otherwise the first of `splitCandidates` that exists, `replacingSplit`
+   *   (View Commit's) first; the active split when none does.
+   *
+   * Never `showBuffer` or create a section tab without this.
+   */
+  function enterTarget(replacing: View | null, replacingSplit: number | null): void {
+    if (replacing !== null) {
+      editor.focusBufferGroupPanel(replacing.group, replacing.left !== null ? "left" : "right");
+      return;
+    }
+    const panes = editor.describeWorkspace().panes;
+    const target = splitCandidates({ replacing: replacingSplit, last: lastSplit, panes }).find(splitExists);
+    if (target !== undefined && target !== editor.getActiveSplitId()) editor.focusSplit(target);
+  }
+
+  /** Track the split the user works in (R37 "Which split"): the active
+   *  split, when buffer `id`, now its active tab, is a file or one of the
+   *  section's tabs. Never by its path: a terminal has one (H12). */
+  function track(id: number): void {
+    if (!isActive()) return;
+    const v = slot.current();
+    const sectionTab = id === commitTab || (v !== null && sideOf(v, id) !== null);
+    if (sectionTab || isFile(editor.getBufferInfo(id))) lastSplit = editor.getActiveSplitId();
+  }
+
+  /** One pane's decorations (R38 "Changes", R39): line and span tints,
+   *  blank rows facing the other side's lines, gutter marks and scrollbar
+   *  marks. */
+  function decorate(buffer: number, p: SidePaint): void {
+    for (const [a, b] of p.lines) editor.addOverlay(buffer, DIFF_NS, a, b, { bg: p.lineBg, extendToLineEnd: true });
+    for (const [a, b] of p.spans) editor.addOverlay(buffer, DIFF_NS, a, b, { bg: p.spanBg });
+    for (const f of p.fillers) {
+      for (let i = 0; i < f.count; i++) editor.addVirtualLine(buffer, f.anchor, "", { bg: p.fillerBg }, f.above, DIFF_NS, i);
+    }
+    const [r, g, b] = p.gutterColor;
+    if (p.gutter.length > 0) editor.setLineIndicators(buffer, p.gutter, DIFF_NS, p.gutterSymbol, r, g, b, 10);
+    if (p.markers.length > 0) editor.setScrollbarMarkers(buffer, DIFF_NS, p.markers);
+  }
+
+  /**
+   * Build and show the diff of `target` (R14, R38): a buffer group over
+   * hidden read-only sources, one pane when a side is empty (R38 "One
+   * side"). Every await re-checks the epoch, the slot's generation and the
+   * window: buffers open in the active window, so a build overtaken by a
+   * switch stops (R28). A stale build closes what it made.
+   */
+  async function buildDiff(target: DiffTarget, m: Exclude<Mode, "volume">, r: string): Promise<void> {
+    const { key, path } = target;
     const gen = slot.begin(key);
     // The same row's build is pending: a double-click (INV §9.1) joins it.
+    // Otherwise the generation moved: a View Commit still reading opens no
+    // tab after this diff (R14, R33).
     if (gen === null) return;
     const myEpoch = epoch;
     const stale = () => !live(myEpoch) || !slot.isCurrent(gen);
     const saidBefore = said;
     try {
-      const { left, right } = sides(listed.entry, listed.group, status.oid === null);
       // Both sides at once; a git object's side reads its id, its size, then
       // its content.
-      const got = await Promise.all([readSide(left, m, r, stale), readSide(right, m, r, stale)]);
+      const got = await Promise.all([readSide(target.left, m, r, stale), readSide(target.right, m, r, stale)]);
       if (stale()) return;
       // Judged left, then right.
       const reads: { text: string }[] = [];
@@ -866,12 +1167,14 @@ function makeSection(win: number, workspace: string, panel: number) {
         }
         reads.push(side);
       }
-      // One text per side feeds both its buffer and the line diff, as in
-      // git-review and audit_mode; the buffer drops the final newline once,
-      // in `contentToEntries` (R14).
       const [leftText, rightText] = reads.map((x) => x.text);
-      const [leftLabel, rightLabel] = paneLabels(listed.group, listed.entry);
-      // Hidden, read-only sources: the diff is a snapshot, not an editor (R14).
+      const [leftLabel, rightLabel] = target.labels;
+      // A zero-byte side gets no pane (R38 "One side", INV §8 P42 b).
+      const sides = paneSides(leftText.length, rightText.length);
+      // Hidden, read-only sources: the diff is a snapshot, not an editor
+      // (R14). Each holds its exact text: `compareBuffers` keeps each line's
+      // newline, so a change to the final newline alone is a change (H17,
+      // P42 i).
       const source = (label: string, text: string) =>
         editor.createVirtualBuffer({
           name: sourceName(label, path),
@@ -880,61 +1183,125 @@ function makeSection(win: number, workspace: string, panel: number) {
           editingDisabled: true,
           hiddenFromTabs: true,
           showLineNumbers: true,
-          entries: contentToEntries(text),
+          entries: text === "" ? [] : [{ text }],
         });
       // One at a time, each id kept as it comes: until the slot has the view,
       // nothing else knows these buffers, so a call that throws or rejects
-      // part-way closes what was made (R14 "no leftovers").
+      // part-way closes what was made (R14 "no leftovers"). Closing them
+      // also closes a group made over them (H4).
       const made: number[] = [];
       let view: View;
       try {
-        const a = (await source(leftLabel, leftText)).bufferId;
-        made.push(a);
+        let left: number | null = null;
+        let right: number | null = null;
+        if (sides !== "right") {
+          left = (await source(leftLabel, leftText)).bufferId;
+          made.push(left);
+          if (stale()) {
+            dropView(made);
+            return;
+          }
+        }
+        if (sides !== "left") {
+          right = (await source(rightLabel, rightText)).bufferId;
+          made.push(right);
+          if (stale()) {
+            dropView(made);
+            return;
+          }
+        }
+        // One line diff of the two buffers gives every decoration and the
+        // alignment (INV §13.3); a one-pane diff has none (R38 "One side").
+        let compared: CompareResult | null = null;
+        if (left !== null && right !== null) {
+          try {
+            compared = await editor.compareBuffers(left, right);
+          } catch (e) {
+            dropView(made);
+            if (!stale()) say(`could not compare ${path}: ${String(e)}`);
+            return;
+          }
+          if (stale()) {
+            dropView(made);
+            return;
+          }
+        }
+        // Placed in the editor area, never the dock (R37).
+        let group: BufferGroupResult;
+        placing++;
+        try {
+          enterTarget(slot.current(), null);
+          group = await editor.createBufferGroup(target.title, "", diffLayout(left, right));
+        } finally {
+          placing--;
+        }
         if (stale()) {
-          dropView(null, made);
+          dropView(made);
           return;
         }
-        const b = (await source(rightLabel, rightText)).bufferId;
-        made.push(b);
-        if (stale()) {
-          dropView(null, made);
-          return;
+        const g = group.groupId;
+        const panelSplit = (side: PaneSide): number | undefined => group.panelSplits[side];
+        // Each pane under its side's header, unwrapped: a borrowed panel
+        // takes `editor.line_wrap`, on by default (H7, R38 "Aligned").
+        for (const [side, buffer, label] of [
+          ["left", left, leftLabel],
+          ["right", right, rightLabel],
+        ] as const) {
+          if (buffer === null) continue;
+          editor.setPanelContent(g, headerPanel(side, sides), headerEntries(label));
+          editor.setLineWrap(buffer, panelSplit(side) ?? null, false);
         }
-        // An empty side gets hunks that cover its phantom line (INV §8 P22).
-        const hunks = compositeHunks(leftText, rightText, () => editor.computeLineDiff(leftText, rightText));
-        const pane = (bufferId: number, label: string) => ({ bufferId, label, editable: false, style: { gutterStyle: "both" } });
-        const opts: TsCreateCompositeBufferOptions = {
-          name: tabTitle(path, listed.group, listed.entry),
-          mode: DIFF_MODE,
-          layout: { type: "side-by-side", ratios: [0.5, 0.5], showSeparator: true },
-          sources: [pane(a, leftLabel), pane(b, rightLabel)],
-          // Always the list, even empty: with null the host builds no line
-          // alignment and draws neither pane (Fresh 0.5.9,
-          // composite_buffer_actions.rs:1190-1231; seen live on an R100 rename).
+        let hunks: ViewHunk[];
+        let at: number | null = null;
+        if (compared !== null && left !== null && right !== null) {
+          const p = paint(compared);
+          decorate(left, p.left);
+          decorate(right, p.right);
+          const [ls, rs] = [panelSplit("left"), panelSplit("right")];
+          if (ls !== undefined && rs !== undefined) {
+            const sync = ++syncSeq;
+            editor.createScrollSyncGroup(sync, ls, rs);
+            editor.setScrollSyncAnchors(sync, p.anchors);
+          }
+          hunks = viewHunks(compared);
+          // Both cursors on the first change, in view (R38 "Cursors").
+          const first = hunks[0];
+          if (first !== undefined) {
+            at = 0;
+            editor.setBufferCursor(left, first.left.jump);
+            editor.setBufferCursor(right, first.right.jump);
+            if (ls !== undefined) editor.scrollToLineCenter(ls, left, centreLine(first.left));
+          }
+        } else {
+          const side: PaneSide = left !== null ? "left" : "right";
+          hunks = onePaneHunks(side, lineTotal(side === "left" ? leftText : rightText));
+        }
+        view = {
+          group: g,
+          left,
+          right,
+          open: new Set(made),
+          key,
           hunks,
+          at,
+          rightLines: lineTotal(rightText),
+          // The host split: a panel's own is not the active split (P41 n).
+          split: editor.getActiveSplitId(),
+          panelSplits: { left: panelSplit("left"), right: panelSplit("right") },
         };
-        if (hunks.length > 0) opts.initialFocusHunk = 0;
-        view = { composite: await editor.createCompositeBuffer(opts), left: a, right: b, key, hunks, rightLines: lineCount(rightText) };
       } catch (e) {
-        dropView(null, made);
+        dropView(made);
         throw e;
       }
-      const { composite } = view;
-      if (stale()) {
-        closeView(view);
-        return;
-      }
-      // Show the new view, then close the one it replaces: one tab (R14).
+      // Shown, then the one it replaces closed: one tab (R14).
       const prev = slot.install(view);
-      editor.showBuffer(composite);
       if (prev !== null) closeView(prev);
-      // The diff's keys are Fresh's and Enter is ours; nothing else shows them
-      // (R20). They work only once the keyboard is in the diff, and a click or
-      // Enter on a row leaves it in the section (R14), so then the hint waits
-      // for it to move in (`hintIfInDiff`). Not over a message sent during the
-      // build, such as a write's outcome (R15, R26), which nothing would say
-      // again.
-      hintFor = sectionFocused ? composite : null;
+      // The diff's keys work only once the keyboard is in the diff, and a
+      // click or Enter on a row leaves it in the section (R14), so then the
+      // hint waits for it to move in (`hintIfInDiff`). Not over a message
+      // sent during the build, such as a write's outcome (R15, R26), which
+      // nothing would say again.
+      hintFor = sectionFocused ? view : null;
       if (!sectionFocused && said === saidBefore) say(DIFF_HINT);
     } finally {
       slot.done(gen);
@@ -1018,7 +1385,7 @@ function makeSection(win: number, workspace: string, panel: number) {
 
   /**
    * Stage all or unstage all (R16). The plan comes from a fresh status, not
-   * the rows on screen: it covers paths past the 500-row cap, and none that
+   * the rows on screen: it covers paths past the 1,000-row cap, and none that
    * have gone since (one vanished path fails a whole `git add`, P13 iii). The
    * commands run in order, re-checking the epoch and the window before each;
    * the first failure stops the rest. Not atomic: a failure or a switch to
@@ -1033,7 +1400,7 @@ function makeSection(win: number, workspace: string, panel: number) {
     const st = await run(runner, m, "git", STATUS_ARGS, r0);
     if (myEpoch !== epoch) return;
     if (st.code !== 0) {
-      say(`could not read the status: ${st.timedOut ? "git timed out" : gitReason(st, r0)}`);
+      say(`could not read the status: ${failReason(st, r0)}`);
       return;
     }
     const plan: GroupPlan = kind === "stageAll" ? stageAllPlan(parseStatus(st.stdout)) : unstageAllPlan(parseStatus(st.stdout));
@@ -1144,7 +1511,7 @@ function makeSection(win: number, workspace: string, panel: number) {
       say(ready.why);
       return;
     }
-    const before = paletteTarget("commit", selectedKey, ready.status, ready.entries);
+    const before = paletteTarget("commit", selectedKey, ready.status, ready.entries, ready.graph);
     if (!before.ok) {
       say(before.message);
       return;
@@ -1176,7 +1543,7 @@ function makeSection(win: number, workspace: string, panel: number) {
       say("nothing committed: the Git section no longer shows files");
       return;
     }
-    const now = paletteTarget("commit", selectedKey, rows.status, rows.entries);
+    const now = paletteTarget("commit", selectedKey, rows.status, rows.entries, rows.graph);
     if (!now.ok) {
       say(now.message);
       return;
@@ -1216,6 +1583,181 @@ function makeSection(win: number, workspace: string, panel: number) {
 
   function commitSoon(): void {
     void guardedAsync("commitFlow", commitFlow)();
+  }
+
+  /** Ask which remote to publish `branch` to (R35), with one suggestion per
+   *  remote; the first is highlighted, so Enter at once picks it (INV §8 P39
+   *  h). Resolves with the answer, typed or picked, or null for Esc. A
+   *  Publish asked again in this window answers its own older one with
+   *  null; another window's is left alone (INV §11.4). */
+  function askPublish(branch: string, remotes: string[]): Promise<string | null> {
+    answerPublish(null);
+    return new Promise((resolve) => {
+      publishAnswer = resolve;
+      editor.startPrompt(`Publish ${branch} to: `, PUBLISH_PROMPT);
+      editor.setPromptSuggestions(remotes.map((r) => ({ id: r, text: r, value: r })));
+    });
+  }
+
+  /** This window's Publish prompt answered: the input, or null for Esc. */
+  function answerPublish(input: string | null): void {
+    const answer = publishAnswer;
+    publishAnswer = null;
+    answer?.(input);
+  }
+
+  /**
+   * Pull or Push (R34, R35), from the palette or the Graph group's menu.
+   * Detached, or a Pull with no upstream: no git, a message. A Push with no
+   * upstream publishes (R35): the remotes are read, and with none no prompt
+   * opens; otherwise a prompt asks which remote, before anything is queued,
+   * as Commit… does, so declining leaves nothing queued (R35). Esc cancels,
+   * an answer that is not a listed remote too, and one given after a switch
+   * to another window does nothing (R28). The epoch is taken before the
+   * prompt opens, so a restart while it is open is caught (`stillAsked`).
+   * Then the write queue runs it, one at a time with stages, unstages and
+   * commits, in the order asked (R36); a second request while one is queued
+   * or not yet drawn is refused, and says so, as a second Commit… is (R26).
+   */
+  async function remoteFlow(kind: "pull" | "push"): Promise<void> {
+    const ready = readiness();
+    if ("why" in ready) {
+      say(ready.why);
+      return;
+    }
+    const { status } = ready;
+    const branch = status.branch;
+    if (branch === null) {
+      say(`HEAD is detached: check out a branch to ${kind}`);
+      return;
+    }
+    if (kind === "pull" && status.upstream === null) {
+      say(`${branch} has no upstream to pull from`);
+      return;
+    }
+    const busy = `a ${kind} is still finishing; try again in a moment`;
+    const ops = queueFor(ready.root);
+    if (ops.blocked(kind)) {
+      say(busy);
+      return;
+    }
+    // The epoch the request was made in, before any prompt opens (as in
+    // `commitFlow`): a restart while it is open stops the write.
+    const asked = epoch;
+    let publishTo: string | null = null;
+    if (kind === "push" && status.upstream === null) {
+      if (!isActive()) return;
+      const myEpoch = epoch;
+      const remotes = parseRemotes(await run(runner, ready.mode, "git", REMOTES_ARGS, ready.root));
+      if (!live(myEpoch)) return;
+      if (remotes.length === 0) {
+        say(`${branch} has no upstream, and there is no remote to publish it to`);
+        return;
+      }
+      const answer = await askPublish(branch, remotes);
+      if (phase === "ended") return;
+      if (!isActive()) {
+        say(`push not run: ${OTHER_WINDOW}`);
+        return;
+      }
+      if (answer === null) {
+        say("push cancelled");
+        return;
+      }
+      const picked = answer.trim();
+      if (!remotes.includes(picked)) {
+        say(`${picked === "" ? "no remote given" : `${picked} is not a remote`}; push cancelled`);
+        return;
+      }
+      publishTo = picked;
+    }
+    const queued = ops.enqueue(kind, guardedAsync(kind, () => remoteWrite(kind, branch, publishTo, asked)));
+    if (queued === null) say(busy);
+  }
+
+  /**
+   * The queued pull or push (R34–R36), after `groupWrite`: it runs only
+   * while still asked for (`stillAsked`), reads the branch's upstream and
+   * the repository's ssh command again, as they stand when it runs, and
+   * Fresh's own `GIT_SSH_COMMAND` and `GIT_SSH`, and checks the window again
+   * after those reads: git would run on another window's authority (R28).
+   * A pull integrates into HEAD, so it runs only while `branch`, the one on
+   * screen when it was asked for, is still checked out: the branch is
+   * switched in a terminal, or by a write queued before it (R34). A push
+   * names its branch in full, so it needs no such check. Then `env … git
+   * pull|push`, never killed: after 60 s it says git is still running (INV
+   * §8 P37 g, h). How it went is said; the queue's refresh shows the rest,
+   * the title's `↑A ↓B` and the Graph included.
+   */
+  async function remoteWrite(kind: "pull" | "push", branch: string, publishTo: string | null, asked: number): Promise<void> {
+    const where = stillAsked(kind, asked);
+    if (where === null) return;
+    const { m, r0 } = where;
+    const myEpoch = epoch;
+    // A switch to another window before git starts: it would run on that
+    // window's authority (R28). After a restart there is nothing to say.
+    const overtaken = (): boolean => {
+      if (live(myEpoch)) return false;
+      if (myEpoch === epoch) say(`${kind} not run; ${OTHER_WINDOW} before it started`);
+      return true;
+    };
+    let args: string[];
+    let name: string;
+    if (publishTo !== null) {
+      args = publishArgs(publishTo, branch);
+      name = `${publishTo}/${branch}`;
+    } else {
+      const u = parseUpstream(await run(runner, m, "git", upstreamArgs(branch), r0));
+      if (myEpoch !== epoch) return;
+      if (u === null) {
+        say(kind === "pull" ? `${branch} has no upstream to pull from` : `${branch} has no upstream any more; push again to publish it`);
+        return;
+      }
+      args = kind === "pull" ? pullArgs(u) : pushArgs(u, branch);
+      name = upstreamName(u);
+    }
+    if (overtaken()) return;
+    const configured = configuredSsh(await run(runner, m, "git", SSH_CONFIG_ARGS, r0), kind, r0);
+    if (overtaken()) return;
+    if ("refused" in configured) {
+      say(configured.refused);
+      return;
+    }
+    if (kind === "pull") {
+      const head = await run(runner, m, "git", HEAD_REF_ARGS, r0);
+      if (overtaken()) return;
+      const refused = pullTargetCheck(head, branch, r0);
+      if (refused !== null) {
+        say(refused);
+        return;
+      }
+    }
+    const ssh = sshCommand({
+      envCommand: envVar("GIT_SSH_COMMAND"),
+      configured: configured.command,
+      envSsh: envVar("GIT_SSH"),
+    });
+    const argv = remoteArgv(args, remoteEnv(ssh));
+    const r = await runWrite(
+      runner,
+      m,
+      argv,
+      r0,
+      (left) => {
+        if (myEpoch === epoch) say(`${kind}: git is ${left.stderr}`);
+      },
+      "env",
+    );
+    const outcome = kind === "pull" ? classifyPull(r, name, r0) : classifyPush(r, name, r0);
+    if (myEpoch !== epoch) {
+      log(`${kind} finished after a restart: ${outcome.message}`);
+      return;
+    }
+    say(outcome.message);
+  }
+
+  function remoteSoon(kind: "pull" | "push"): void {
+    void guardedAsync(kind, () => remoteFlow(kind))();
   }
 
   /**
@@ -1267,28 +1809,181 @@ function makeSection(win: number, workspace: string, panel: number) {
 
   function activate(key: string, space: boolean): void {
     const row = rowKind(key);
-    if (row.kind === "group") {
-      // Space does what the group's button does (R16); the host does not
-      // toggle a group on Enter, so Enter does (R7).
-      if (space) rowOp(key);
-      else toggleGroup(key);
+    switch (row.kind) {
+      case "group":
+        // Space does what the group's button does (R16); the host does not
+        // toggle a group on Enter, so Enter does (R7). The Graph group has no
+        // button: Space there does nothing.
+        if (space) rowOp(key);
+        else toggleGroup(key);
+        return;
+      case "file":
+        // Space does what the row's button does (R15); it never opens
+        // anything (R7). Enter is the keyboard twin of a click (R14).
+        if (space) rowOp(key);
+        else openDiffSoon(key);
+        return;
+      // Graph rows have no button: Space on one changes nothing (R30), and
+      // is not sent to `rowOp`, which can still say why no row acts. Enter
+      // toggles a commit, which the host does not do (INV §8 P39 g), opens a
+      // commit's file's diff (R32), and loads more (R30).
+      case "commit":
+        if (!space) toggleGroup(key);
+        return;
+      case "commitFile":
+        if (!space) openDiffSoon(key);
+        return;
+      case "loadMore":
+        if (!space) loadMore();
+        return;
+      case "inert":
+        return;
+    }
+  }
+
+  /**
+   * View Commit (R33): the commit as `git show` prints it, in a read-only tab
+   * of its own, coloured as a diff by its name `*<id7>:show.diff*` (INV §8
+   * P36 i). No mode: `DIFF_MODE` lists Next and Previous Change, which act
+   * on the section's diff only. A later View Commit replaces the tab, and a
+   * slower earlier one opens nothing. A read like any other: killed at its
+   * timeout, and nothing opens once the window is not active (R28). It and
+   * the diff supersede each other: whichever was asked for last opens. Text
+   * over 5 MiB is refused after it is read; "" with rc 0 is output that was
+   * not UTF-8 (INV §8 P17). It opens in the editor area, where the tab it
+   * replaces was, never in the dock (R37): a new virtual buffer's tab goes
+   * in the active split (INV §13.1).
+   */
+  async function viewCommit(key: string): Promise<void> {
+    if (!isActive()) return;
+    const ready = readiness();
+    if ("why" in ready) {
+      say(ready.why);
       return;
     }
-    if (row.kind !== "file") return;
-    if (space) {
-      // Space does what the row's button does (R15); it never opens anything (R7).
-      rowOp(key);
+    const commit = commitOf(key, ready.graph);
+    if (commit === null) return;
+    const id7 = shortId(commit.id);
+    // The latest request wins: a diff still being built opens nothing after
+    // this tab, and a later diff or View Commit makes this one stale (R14,
+    // R33).
+    const gen = slot.claim();
+    const myEpoch = epoch;
+    const stale = () => !live(myEpoch) || !slot.isCurrent(gen);
+    const r = await run(runner, ready.mode, "git", showArgs(commit.id), ready.root);
+    if (stale()) return;
+    if (r.code !== 0) {
+      say(`could not show ${id7}: ${failReason(r, ready.root)}`);
       return;
     }
-    // Enter is the keyboard twin of a click (R14).
-    openDiffSoon(key);
+    if (r.stdout === "") {
+      say(`${id7} could not be shown: its text is not UTF-8`);
+      return;
+    }
+    if (utf8Length(r.stdout) > MAX_DIFF_BYTES) {
+      say(`${id7} is larger than 5 MiB; not shown`);
+      return;
+    }
+    let made: VirtualBufferResult;
+    placing++;
+    try {
+      enterTarget(null, commitTab !== null ? commitSplit : null);
+      made = await editor.createVirtualBuffer({
+        name: `*${id7}:show.diff*`,
+        readOnly: true,
+        editingDisabled: true,
+        showLineNumbers: false,
+        entries: contentToEntries(r.stdout),
+      });
+    } finally {
+      placing--;
+    }
+    if (stale()) {
+      dropView([made.bufferId]);
+      return;
+    }
+    const prev = commitTab;
+    commitTab = made.bufferId;
+    editor.showBuffer(made.bufferId);
+    commitSplit = editor.getActiveSplitId();
+    if (prev !== null && prev !== made.bufferId) dropView([prev]);
+  }
+
+  /** Copy Commit ID (R33): the commit's full id to the clipboard, and a
+   *  message saying so. */
+  function copyId(key: string): void {
+    const commit = commitOf(key, rows?.graph ?? NO_GRAPH);
+    if (commit === null) return;
+    editor.setClipboard(commit.id);
+    // The short id: the status bar cuts a long message (spec decisions).
+    say(`copied the full id of ${shortId(commit.id)}`);
+  }
+
+  /** Copy Commit Message (R33): the commit's full message, read from git,
+   *  to the clipboard, and a message saying so. The read is a killed read,
+   *  and copies nothing once the window is not active (R28). */
+  async function copyMessage(key: string): Promise<void> {
+    const commit = commitOf(key, rows?.graph ?? NO_GRAPH);
+    if (commit === null) return;
+    const id7 = shortId(commit.id);
+    if (!isActive()) return;
+    const ready = readiness();
+    if ("why" in ready) {
+      say(ready.why);
+      return;
+    }
+    const myEpoch = epoch;
+    const r = await run(runner, ready.mode, "git", messageArgs(commit.id), ready.root);
+    if (!live(myEpoch)) return;
+    if (r.code !== 0) {
+      say(`could not read the message of ${id7}: ${failReason(r, ready.root)}`);
+      return;
+    }
+    // "" with rc 0 is also output that is not UTF-8 through
+    // `spawnHostProcess` (INV §8 P17): copy nothing rather than "".
+    const text = commitMessageText(r.stdout);
+    if (text === "") {
+      say(`nothing copied: the message of ${id7} is empty or not UTF-8`);
+      return;
+    }
+    editor.setClipboard(text);
+    say(`copied the message of ${id7}`);
+  }
+
+  function viewCommitSoon(key: string): void {
+    void guardedAsync("viewCommit", () => viewCommit(key))();
+  }
+
+  function copyMessageSoon(key: string): void {
+    void guardedAsync("copy", () => copyMessage(key))();
+  }
+
+  /** View Commit, the copies, Pull and Push: the same from the menu and the
+   *  palette. `key` is the commit's row for the first three; Pull and Push
+   *  act on the branch (R33–R35). */
+  function graphCommand(cmd: GraphCommand, key: string): void {
+    switch (cmd) {
+      case "viewCommit":
+        viewCommitSoon(key);
+        return;
+      case "copyId":
+        copyId(key);
+        return;
+      case "copyMessage":
+        copyMessageSoon(key);
+        return;
+      case "pull":
+      case "push":
+        remoteSoon(cmd);
+        return;
+    }
   }
 
   /** Open the row's menu at the pointer (R17), replacing one already open. A
-   *  row with no items (the `… N more` row, a notice, an empty group) opens
-   *  none. */
+   *  row with no items (the `… N more` row, Load more, a notice, an empty
+   *  group) opens none. */
   function openMenu(key: string, col: number, row: number): void {
-    const items = menuItems(key, rows?.status ?? null, rows?.entries ?? NO_ENTRIES);
+    const items = menuItems(key, rows?.status ?? null, rows?.entries ?? NO_ENTRIES, rows?.graph ?? NO_GRAPH);
     if (items.length === 0) return;
     // The anchor op is in 0.5.9's host but not in its type file; it works
     // from a sidebar section (INV §9.3, §8 P10). The menu takes the keyboard,
@@ -1310,7 +2005,15 @@ function makeSection(win: number, workspace: string, panel: number) {
       say(`${trimSlash(row.path)} is no longer listed`);
       return;
     }
+    if ((row.kind === "commit" || row.kind === "commitFile") && !rows?.graph.has(key)) {
+      say(`${row.kind === "commit" ? shortId(row.id) : row.path} is no longer listed`);
+      return;
+    }
     // Each choice routed by name: a new choice must never fall into a write.
+    if (isGraphCommand(choice)) {
+      graphCommand(choice, key);
+      return;
+    }
     switch (choice) {
       case "diff":
         openDiffSoon(key);
@@ -1329,6 +2032,25 @@ function makeSection(win: number, workspace: string, panel: number) {
       case "stageAll":
       case "unstageAll":
         rowOp(key);
+        return;
+    }
+  }
+
+  /** A click on the row `key`: a file row, a commit's file's too, opens its
+   *  diff (R14, R32), and Load more loads (R30). A row with children sends
+   *  `expand` instead (INV §8 P39 g). */
+  function clickRow(key: string): void {
+    switch (rowKind(key).kind) {
+      case "file":
+      case "commitFile":
+        openDiffSoon(key);
+        return;
+      case "loadMore":
+        loadMore();
+        return;
+      case "group":
+      case "commit":
+      case "inert":
         return;
     }
   }
@@ -1362,15 +2084,19 @@ function makeSection(win: number, workspace: string, panel: number) {
         return;
       case "select":
         select();
-        // A click on a file row opens its diff (R14); keyboard moves carry
-        // no `via` (INV §9.1). A click on the row already selected re-opens
-        // it: the tree's `cardBorders` lets that press through (INV §8 P21).
-        if (p.via === "click" && key !== null && rowKind(key).kind === "file" && isActive()) openDiffSoon(key);
+        // A click on a file row opens its diff (R14), a commit's file's too
+        // (R32); keyboard moves carry no `via` (INV §9.1). A click on the row
+        // already selected re-opens it: the tree's `cardBorders` lets that
+        // press through (INV §8 P21). A click on Load more loads (R30).
+        if (p.via === "click" && key !== null && isActive()) clickRow(key);
         return;
       case "expand":
+        // Every toggle by the host: a click (on a row with children it sends
+        // no `select`), the disclosure glyph, Right and Left (INV §8 P39 g).
         if (key !== null && p.expanded === true) expanded.add(key);
         if (key !== null && p.expanded === false) expanded.delete(key);
         select();
+        if (key !== null && p.expanded === true && isActive()) onExpanded(key);
         return;
       case "activate":
         select();
@@ -1391,32 +2117,84 @@ function makeSection(win: number, workspace: string, panel: number) {
   }
 
   /** Enter in a diff the section opened (R19): the row's file, at the line
-   *  under the diff's cursor (`targetLine`). Bound in DIFF_MODE; `n`, `p`,
-   *  `]`, `[`, `q` and Esc fall through to Fresh's own keys for a
-   *  side-by-side view (INV §8 P25). */
+   *  facing the cursor of the pane holding the keyboard (`facingLine`,
+   *  R19 "Either pane"). Bound in DIFF_MODE. The cursor is the focused
+   *  panel's (INV §8 P41 n), read at once. */
   async function diffEnter(): Promise<void> {
+    const d = activeDiff();
+    const line = d === null ? null : (editor.getPrimaryCursor()?.line ?? null);
+    // Another tab active, or a line not known yet (a huge text).
+    if (d === null || line === null) return;
+    await openAt(d.v.key, facingLine(d.v.hunks, d.side, line, d.v.rightLines), epoch);
+  }
+
+  /** The section diff of the active tab, and the side whose pane holds the
+   *  keyboard; null when the active tab is not it. */
+  function activeDiff(): { v: View; side: PaneSide } | null {
     const v = slot.current();
-    if (v === null) return;
-    const myEpoch = epoch;
-    const info = await editor.getCompositeCursorInfo();
-    // A restart, the view closed or replaced, or another window active,
-    // while the host answered.
-    if (!live(myEpoch) || slot.current() !== v || info === null) return;
-    await openAt(v.key, targetLine(info.lines, v.hunks, v.rightLines), myEpoch);
+    const side = v === null ? null : sideOf(v, editor.getActiveBufferId());
+    return v === null || side === null ? null : { v, side };
+  }
+
+  /**
+   * Next Change or Previous Change (R29), and `n`/`]`, `p`/`[` (R20): both
+   * panes' cursors to the next (previous) change, which the focused pane
+   * brings into view (the other follows through the scroll sync). At the
+   * last (first) change nothing moves, and a message says so. The commands
+   * are listed only while a section diff is the active tab (by `DIFF_MODE`,
+   * P39 k), but a key bound to one can run anywhere: then it says so.
+   */
+  function changeNav(dir: "next" | "prev"): void {
+    const d = activeDiff();
+    if (d === null) {
+      say(NO_SECTION_DIFF);
+      return;
+    }
+    const { v, side } = d;
+    const i = stepHunk(v.hunks, side, editor.getPrimaryCursor()?.position ?? 0, dir === "next" ? 1 : -1, v.at);
+    if (i === null) {
+      say(dir === "next" ? NO_NEXT_CHANGE : NO_PREVIOUS_CHANGE);
+      return;
+    }
+    v.at = i;
+    const h = v.hunks[i];
+    if (v.left !== null) editor.setBufferCursor(v.left, h.left.jump);
+    if (v.right !== null) editor.setBufferCursor(v.right, h.right.jump);
+    const split = v.panelSplits[side];
+    const buffer = side === "left" ? v.left : v.right;
+    if (split !== undefined && buffer !== null) editor.scrollToLineCenter(split, buffer, centreLine(h[side]));
+  }
+
+  /** `q` or Esc in the diff (R20): close it, leaving no buffer behind
+   *  (R14). The view is taken out first, so the closes it brings find no
+   *  view to close again (H14). */
+  function diffClose(): void {
+    const d = activeDiff();
+    if (d === null) return;
+    slot.take(d.v);
+    closeView(d.v);
+  }
+
+  /** Tab and Shift+Tab in the diff (R20): the keyboard to the other pane,
+   *  as a click there does (P42 f). A one-pane diff has none: nothing. */
+  function diffSwitch(): void {
+    const d = activeDiff();
+    if (d === null || d.v.left === null || d.v.right === null) return;
+    editor.focusBufferGroupPanel(d.v.group, d.side === "left" ? "right" : "left");
   }
 
   /**
    * The diff's key hint (R20), once the keyboard is in the diff it waits for:
-   * in the editor, not the section, with the diff's tab active. Said once per
-   * view; a view replaced or closed meanwhile drops it.
+   * in the editor, not the section, with one of the diff's panes the active
+   * buffer. Said once per view; a view replaced or closed meanwhile drops it.
    */
   function hintIfInDiff(): void {
     if (hintFor === null || sectionFocused || keyboardRegion !== "editor") return;
-    if (slot.current()?.composite !== hintFor) {
+    if (slot.current() !== hintFor) {
       hintFor = null;
       return;
     }
-    if (editor.getActiveBufferId() !== hintFor) return;
+    if (sideOf(hintFor, editor.getActiveBufferId()) === null) return;
     hintFor = null;
     say(DIFF_HINT);
   }
@@ -1438,15 +2216,18 @@ function makeSection(win: number, workspace: string, panel: number) {
    * group, a row past the cap, or one of the file's rows already selected
    * leaves the selection alone (`revealKey`). Only a tab change reveals: a
    * refresh never does (R10). A tab change to a diff also gives the hint
-   * that waits for it (R20).
+   * that waits for it (R20). It also tracks the split the user works in
+   * (`track`, R37). While a section tab is being placed, the target split's
+   * own tab may be announced (H16): it neither reveals nor is tracked.
    */
   function onActiveBuffer(e: HookEventMap["active_buffer_changed"]): void {
     // A tab change to a diff waiting for its hint, the keyboard in the editor.
     hintIfInDiff();
-    if (sectionFocused || rows === null || root === null) return;
     // A window switch back to this window is not a tab change: its active
     // tab is the one it had, whose row the user may have left since (R28).
-    if (e.reason === "window") return;
+    if (placing > 0 || e.reason === "window") return;
+    track(e.buffer_id);
+    if (sectionFocused || rows === null || root === null) return;
     // "" for a virtual buffer, such as a diff view, or one with no file.
     const path = editor.getBufferPath(e.buffer_id);
     if (path === "") return;
@@ -1457,15 +2238,33 @@ function makeSection(win: number, workspace: string, panel: number) {
     pushSelection(index);
   }
 
-  /** A buffer of this window closed. The user closed the diff tab (or
-   *  something closed a source): drop the composite's state, which closing
-   *  its buffer leaves in the host, then close the rest of the view, so
-   *  nothing is left behind (R14; `dropView`, as git-review's `buffer_closed`
-   *  → `closeDiff`). While another window is active, `dropView` keeps them
-   *  until this one is: a window that closes takes them with it. */
+  /** A buffer of this window closed. A source of the diff shown, with no
+   *  `buffer_group_closed` first: a window closing (H4). Close the rest of
+   *  the view, so nothing is left behind (R14). While another window is
+   *  active, `dropView` keeps them until this one is: a window that closes
+   *  takes them with it. A closed view's sources closing find no view. */
   function onBufferClosed(e: HookEventMap["buffer_closed"]): void {
-    const closed = slot.onClosed(e.buffer_id);
-    if (closed !== null) dropView(closed.composite, closed.rest);
+    // View Commit's tab: one buffer, closed with its tab (R33).
+    if (e.buffer_id === commitTab) {
+      commitTab = null;
+      commitSplit = null;
+    }
+    const v = slot.onClosed(e.buffer_id);
+    if (v !== null) closeView(v);
+  }
+
+  /** A buffer group of this window closed: the diff's tab closed by the
+   *  user (its `×`, Close Tab), which leaves the sources open, or a source
+   *  closed from outside, which closes the group first (H4). Close the
+   *  sources still open, each once (R14, H14): a source whose close closed
+   *  the group is already gone here (`getBufferInfo` null, P42 j), and its
+   *  `buffer_closed` comes after. Another window's view waits for it to be
+   *  active (`leftovers`, checked the same way then). */
+  function onGroupClosed(e: HookEventMap["buffer_group_closed"]): void {
+    const v = slot.onGroupClosed(e.group_id);
+    if (v === null) return;
+    if (isActive()) for (const id of v.open) if (editor.getBufferInfo(id) === null) v.open.delete(id);
+    closeView(v);
   }
 
   // -------------------------------------------------------------------------
@@ -1473,9 +2272,13 @@ function makeSection(win: number, workspace: string, panel: number) {
   // -------------------------------------------------------------------------
 
   function paletteCommand(cmd: PaletteCommand): void {
-    const t = paletteTarget(cmd, selectedKey, rows?.status ?? null, rows?.entries ?? NO_ENTRIES);
+    const t = paletteTarget(cmd, selectedKey, rows?.status ?? null, rows?.entries ?? NO_ENTRIES, rows?.graph ?? NO_GRAPH);
     if (!t.ok) {
       say(t.message);
+      return;
+    }
+    if (isGraphCommand(cmd)) {
+      graphCommand(cmd, t.key);
       return;
     }
     switch (cmd) {
@@ -1551,6 +2354,8 @@ function makeSection(win: number, workspace: string, panel: number) {
    *  section goes away again. */
   function start(): void {
     if (looksLikeRepo(workspace)) show(BARE_TITLE, buildTree(null));
+    // Where a file is shown now, before any tab change (R37).
+    track(editor.getActiveBufferId());
     requestRefresh();
   }
 
@@ -1571,7 +2376,11 @@ function makeSection(win: number, workspace: string, panel: number) {
    *  up tries again: its folder may be a repository now. */
   function activated(): void {
     sayDeferred();
-    for (const v of leftovers.splice(0)) dropView(v.composite, v.ids);
+    // Only those still open: one closed meanwhile, as a source whose close
+    // closed its group, would be closed twice (H14, P42 j).
+    for (const ids of leftovers.splice(0)) dropView(ids.filter((id) => editor.getBufferInfo(id) !== null));
+    // Refs that moved neither HEAD nor the upstream show now (R30).
+    graph.forceNext();
     if (checkAuthority()) return;
     if (phase === "gaveUp") restart(false);
     else requestRefresh();
@@ -1597,9 +2406,14 @@ function makeSection(win: number, workspace: string, panel: number) {
     onChrome,
     onActiveBuffer,
     onBufferClosed,
+    onGroupClosed,
     paletteCommand,
     focusSection,
     diffEnter,
+    changeNav,
+    diffClose,
+    diffSwitch,
+    answerPublish,
   };
   return api;
 }
@@ -1717,6 +2531,9 @@ registerHandler(
     await activeSection()?.diffEnter();
   }),
 );
+// `q`/Esc and Tab/Shift+Tab in the diff (R20), bound in DIFF_MODE.
+registerHandler("gitSidebar_diffClose", guarded("diff close", () => activeSection()?.diffClose()));
+registerHandler("gitSidebar_diffSwitch", guarded("diff switch", () => activeSection()?.diffSwitch()));
 
 editor.on(
   "chrome_focus_changed",
@@ -1743,7 +2560,32 @@ editor.on(
   }),
 );
 
+// Group ids are per window: routed by the window, then matched by id.
+editor.on(
+  "buffer_group_closed",
+  guarded("buffer_group_closed", (e: HookEventMap["buffer_group_closed"]) => {
+    sections.get(e.window_id)?.onGroupClosed(e);
+  }),
+);
+
 editor.on("active_window_changed", guarded("active_window_changed", onActivated));
+// Publish's prompt (R35): only its own type's answers (INV §8 P39 h). The
+// payloads name no window, and a prompt is answered in the active window,
+// whose own it is (INV §11.4): its section's prompt gets the answer.
+editor.on(
+  "prompt_confirmed",
+  guarded("prompt_confirmed", (e: HookEventMap["prompt_confirmed"]) => {
+    if (e.prompt_type !== PUBLISH_PROMPT) return;
+    activeSection()?.answerPublish(e.input);
+  }),
+);
+editor.on(
+  "prompt_cancelled",
+  guarded("prompt_cancelled", (e: HookEventMap["prompt_cancelled"]) => {
+    if (e.prompt_type !== PUBLISH_PROMPT) return;
+    activeSection()?.answerPublish(null);
+  }),
+);
 editor.on(
   "window_closed",
   guarded("window_closed", (e: HookEventMap["window_closed"]) => drop(e.id)),
@@ -1765,6 +2607,11 @@ const COMMANDS: { name: string; description: string; cmd: PaletteCommand }[] = [
   { name: "Git Sidebar: Unstage All", description: "Unstage every file under Staged Changes", cmd: "unstageAll" },
   { name: "Git Sidebar: Commit…", description: "Commit what is staged, with a one-line message", cmd: "commit" },
   { name: "Git Sidebar: Resolve Conflict", description: "Open the conflicted file selected in the Git section and start Fresh's merge resolution", cmd: "resolve" },
+  { name: "Git Sidebar: View Commit", description: "Show the commit selected in the Git section's Graph", cmd: "viewCommit" },
+  { name: "Git Sidebar: Copy Commit ID", description: "Copy the id of the commit selected in the Git section's Graph", cmd: "copyId" },
+  { name: "Git Sidebar: Copy Commit Message", description: "Copy the message of the commit selected in the Git section's Graph", cmd: "copyMessage" },
+  { name: "Git Sidebar: Pull", description: "Pull the current branch from its upstream", cmd: "pull" },
+  { name: "Git Sidebar: Push", description: "Push the current branch to its upstream, or publish it", cmd: "push" },
 ];
 const FOCUS_HANDLER = "gitSidebar_focus";
 
@@ -1776,7 +2623,7 @@ function paletteCommand(cmd: PaletteCommand): void {
     s.paletteCommand(cmd);
     return;
   }
-  const t = paletteTarget(cmd, null, null, NO_ENTRIES);
+  const t = paletteTarget(cmd, null, null, NO_ENTRIES, NO_GRAPH);
   if (!t.ok) editor.setStatus(t.message);
 }
 
@@ -1784,6 +2631,13 @@ function focusSection(): void {
   const s = activeSection();
   if (s !== undefined) s.focusSection();
   else editor.setStatus(NOT_SHOWN);
+}
+
+/** Next or Previous Change (R29) in the active window's section diff. */
+function changeNav(dir: "next" | "prev"): void {
+  const s = activeSection();
+  if (s !== undefined) s.changeNav(dir);
+  else editor.setStatus(NO_SECTION_DIFF);
 }
 
 guarded("palette", () => {
@@ -1796,6 +2650,15 @@ guarded("palette", () => {
   // Listed whenever the section is shown at all (R22).
   registerHandler(FOCUS_HANDLER, guarded(FOCUS_HANDLER, focusSection));
   editor.registerCommand("Git Sidebar: Focus", "Move the keyboard to the Git section", FOCUS_HANDLER, SHOWN_CONTEXT);
+  // Listed while a section diff is the active tab, by its mode (R29).
+  for (const [dir, name, description] of [
+    ["next", "Next Change", "Move to the next change in the Git section's diff"],
+    ["prev", "Previous Change", "Move to the previous change in the Git section's diff"],
+  ] as const) {
+    const handler = `gitSidebar_${dir === "next" ? "nextChange" : "prevChange"}`;
+    registerHandler(handler, guarded(handler, () => changeNav(dir)));
+    editor.registerCommand(`Git Sidebar: ${name}`, description, handler, DIFF_MODE);
+  }
 })();
 
 // ---------------------------------------------------------------------------
@@ -1832,7 +2695,7 @@ guarded("load", () => {
   // Other windows' are set again when they become active (`syncContexts`).
   editor.setContext(ROWS_CONTEXT, false);
   editor.setContext(SHOWN_CONTEXT, false);
-  editor.defineMode(DIFF_MODE, [["Enter", "gitSidebar_diffEnter"]], true);
+  editor.defineMode(DIFF_MODE, DIFF_KEYS, true);
   // The section of the plugin before R28, kept by the host across a reload
   // after an update (INV §2). Unmounting an id that is not mounted is a no-op.
   editor.unmountFloatingWidget(LEGACY_PANEL);

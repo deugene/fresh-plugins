@@ -1,0 +1,5 @@
+rc 0
+--- stdout
+--- stderr
+To ../push.git
+   bae155e..2d5ce01  main -> main

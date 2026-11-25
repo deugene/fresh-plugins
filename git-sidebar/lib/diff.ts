@@ -1,11 +1,12 @@
 // The side-by-side diff of one row (R14): which two versions it compares,
 // when it is refused, its tab title, and the one slot that keeps at most one
-// diff view open.
+// diff view open. How the view is laid out and decorated is diff_view.ts.
 
-import { dirReason, nameReason } from "./actions.ts";
+import { trimSlash } from "./git.ts";
 import { utf8Length } from "./stage.ts";
-import { unpassable, type Entry } from "./status.ts";
+import { badName, dirReason, nameReason, unpassable, type Entry } from "./status.ts";
 import type { Group } from "./view.ts";
+import type { PaneSide, ViewHunk } from "./diff_view.ts";
 
 /** One side of a diff: nothing, a git object (`:0:<p>`, `HEAD:<p>`), or the
  *  working-tree file (repository-relative). */
@@ -142,6 +143,41 @@ export function paneLabels(group: Group, entry: Entry): [string, string] {
   return [...comparison(group, entry).panes];
 }
 
+/**
+ * What a diff view compares, whatever row asked for it (R14, R32): its row's
+ * key, the file's path (repository-relative, for the tab and Enter's file,
+ * R19), the two sides, their pane labels (no `:`, R21), the tab title, and
+ * why it is refused before anything is read, with the name that refusal
+ * names.
+ */
+export interface DiffTarget {
+  key: string;
+  path: string;
+  left: Side;
+  right: Side;
+  labels: [string, string];
+  title: string;
+  refusal: Refusal | null;
+  refusedName: string;
+}
+
+/** A Staged, Changes or conflicted row's diff (R14): today's `sides`,
+ *  `paneLabels`, `tabTitle` and `rowRefusal`, unchanged. */
+export function statusDiffTarget(entry: Entry, group: Group, unborn: boolean, key: string): DiffTarget {
+  const path = trimSlash(entry.path);
+  const { left, right } = sides(entry, group, unborn);
+  return {
+    key,
+    path,
+    left,
+    right,
+    labels: paneLabels(group, entry),
+    title: tabTitle(path, group, entry),
+    refusal: rowRefusal(entry, group),
+    refusedName: badName(entry),
+  };
+}
+
 /** A diff source buffer's name, `*<label>:<path>*` with no space (R21).
  *  Fresh picks a virtual buffer's grammar from its name: it strips the
  *  `*`s and takes the text after the last `:` (`detected_language.rs:
@@ -155,16 +191,11 @@ export function sourceName(label: string, path: string): string {
   return `*${label}:${path}*`;
 }
 
-/** `content` without the trailing newline, as one span, for a composite
- *  source buffer. A final newline otherwise adds a phantom last line with no
- *  view line in the composite. Applied once, to the same text that goes to
- *  `computeLineDiff`: the host's line diff keeps each line's newline, so
- *  its line indices are this text's lines, and a change to the final
- *  newline alone is still a hunk (`fresh-core/src/diff.rs:36-55`).
- *  Vendored from Fresh 0.5.9's `audit_mode.ts:5124-5141` (`contentToLines`
- *  and `contentToEntries`): built-in plugin helpers cannot be imported.
- *  Their split, pop and join only ever drop one trailing "\n", so that is
- *  all this does. */
+/** `content` without the trailing newline, for View Commit's tab (R33),
+ *  where a final newline would add an empty last line. Not for the diff's
+ *  sources: they hold the exact texts, since `compareBuffers` keeps each
+ *  line's newline and a change to the final newline alone is a change (H17,
+ *  INV §8 P42 i). Only ever drops one trailing "\n". */
 export function contentToText(content: string): string {
   return content.endsWith("\n") ? content.slice(0, -1) : content;
 }
@@ -174,85 +205,15 @@ export function contentToEntries(content: string): { text: string }[] {
   return text.length > 0 ? [{ text }] : [];
 }
 
-/** The lines a text shows in a buffer: none for "", and a final newline
- *  adds no line (`contentToText`). The same count a diff source has. */
+/** The lines a text shows in a file's tab, as `openFile` counts them for
+ *  R19's clamp: none for "", and a final newline adds no line. */
 export function lineCount(text: string): number {
   const shown = contentToText(text);
   return shown === "" ? 0 : shown.split("\n").length;
 }
 
-/** A line hunk as `computeLineDiff` returns it and `createCompositeBuffer`
- *  takes it. `ops` (one char per line: `' '`, `'-'`, `'+'`) makes the host
- *  build the rows from it alone. */
-export interface Hunk {
-  oldStart: number;
-  oldCount: number;
-  newStart: number;
-  newCount: number;
-  ops?: string;
-}
 
-/** The hunks to align the composite with. A side whose buffer is empty
- *  (added, untracked, deleted, or a file that is just a newline) counts as
- *  one line in Fresh 0.5.9 but draws none. Built from plain line hunks, the
- *  alignment then gets a row for that phantom line 0, and every frame logs
- *  "ViewLine missing for composite buffer" and bumps the status bar's
- *  warning count (`composite_buffer.rs:251-375`, INV §8 P22). So for an
- *  empty side, one hunk covers the phantom line with its count while `ops`
- *  lists only the other side's real lines.
- *
- *  `lineDiff` (the host's `computeLineDiff` of the two texts) is called
- *  only when both sides have lines: an empty side's hunk needs no line
- *  diff, and the call would copy the other side, up to 5 MiB, through the
- *  bridge for nothing (untracked, added and deleted files, an unborn
- *  branch). */
-export function compositeHunks(leftText: string, rightText: string, lineDiff: () => Hunk[]): Hunk[] {
-  const left = lineCount(leftText);
-  const right = lineCount(rightText);
-  if (left === 0 && right === 0) return [{ oldStart: 0, oldCount: 1, newStart: 0, newCount: 1, ops: "" }];
-  if (left === 0) return [{ oldStart: 0, oldCount: 1, newStart: 0, newCount: right, ops: "+".repeat(right) }];
-  if (right === 0) return [{ oldStart: 0, oldCount: left, newStart: 0, newCount: 1, ops: "-".repeat(left) }];
-  return lineDiff();
-}
 
-/** The buffers of one diff view: the composite tab and its two hidden
- *  sources; and, for Enter in it (R19), the row it is for, the hunks it was
- *  aligned with and the right side's line count. */
-export interface View {
-  composite: number;
-  left: number;
-  right: number;
-  key: string;
-  hunks: Hunk[];
-  rightLines: number;
-}
-
-/**
- * The 0-based line on the diff's right side that Enter goes to (R19), from
- * `getCompositeCursorInfo().lines` (each pane's line on the cursor's row,
- * null where the pane shows none; INV §8 P25 c), or null for the file's
- * last line. The right side is the working tree for a Changes or
- * conflicted row and the staged version for a Staged row, so either way it
- * is the line R19 names.
- *
- * - The row shows a right line: that line.
- * - It shows only a left line (a removed line): the next right line. Without
- *   `ops`, the host pairs a hunk's lines by position
- *   (`composite_buffer.rs:314-350`), so a row with no right line is at an
- *   offset of at least `newCount` in its hunk, and the next right line is
- *   `newStart + newCount`, when the right side has one.
- * - Otherwise (no such line, or the hunk covers an empty side through
- *   `ops`, `compositeHunks`): null, the last line.
- */
-export function targetLine(lines: (number | null)[], hunks: Hunk[], rightLines: number): number | null {
-  const [left, right] = lines;
-  if (right !== null && right !== undefined) return right;
-  if (left === null || left === undefined) return null;
-  const h = hunks.find((x) => left >= x.oldStart && left < x.oldStart + x.oldCount);
-  if (h === undefined) return null;
-  const next = h.newStart + h.newCount;
-  return next < rightLines ? next : null;
-}
 
 /**
  * The 1-based line `openFile` gets for the 0-based `target` (null: the last
@@ -269,11 +230,50 @@ export function openLine(target: number | null, count: number | null): number | 
   return Math.min(target ?? count - 1, count - 1) + 1;
 }
 
-/** The status message shown when a diff opens (R20): Fresh's own keys for
- *  a side-by-side view (INV §8 P25), and Enter (R19). Short: at 140
- *  columns, with the explorer shown, the status bar cuts a message after
- *  about 70 characters, and a longer hint lost its `q/Esc`. */
-export const DIFF_HINT = "n/] next change, p/[ previous, Enter open file, q/Esc close";
+/** R29's messages: Next or Previous Change ran where it could not move. */
+export const NO_NEXT_CHANGE = "no next change";
+export const NO_PREVIOUS_CHANGE = "no previous change";
+/** Next or Previous Change, or a key bound to it, outside a section diff. */
+export const NO_SECTION_DIFF = "no diff from the Git section is the active tab";
+
+/** The status message shown when a diff opens (R20): every key of the
+ *  diff, Tab and Shift+Tab (`(S-)Tab`) and `j`/`k` included, and Enter
+ *  (R19). Most needed first, as the status bar cuts it: at 140 columns,
+ *  with the explorer shown, after about 70 characters, and after about 52
+ *  beside a TypeScript file's language and LSP labels (INV §8 P43 c). Then
+ *  only the pane and scroll keys are lost; a hint that ended with `q/Esc`
+ *  lost that. */
+export const DIFF_HINT = "q/Esc close, n/] next, p/[ prev, Enter file, (S-)Tab pane, j/k scroll";
+
+/**
+ * A diff view as a buffer group (R38, INV §13.3): the group (its id is the
+ * window's), the sources it shows (null where a side has no pane, R38 "One
+ * side"), those not yet reported closed (`open`: each is closed exactly
+ * once, H14), the row it is for, the hunks it moves through (R20, R29) and
+ * maps Enter by (R19), the hunk the cursors were last put on (`stepHunk`'s
+ * `at`), the right side's line count, the host split it was shown in
+ * (R37), and each pane's split.
+ */
+export interface View {
+  group: number;
+  left: number | null;
+  right: number | null;
+  open: Set<number>;
+  key: string;
+  hunks: ViewHunk[];
+  at: number | null;
+  rightLines: number;
+  split: number;
+  panelSplits: Partial<Record<PaneSide, number>>;
+}
+
+/** Which side buffer `id` is in `v`, or null when it is not one of its
+ *  sources. */
+export function sideOf(v: View, id: number): PaneSide | null {
+  if (id === v.left) return "left";
+  if (id === v.right) return "right";
+  return null;
+}
 
 /**
  * The one diff slot (R14 "one tab"). Each build gets a generation; a build
@@ -310,6 +310,14 @@ export class DiffSlot {
     this.pending = null;
   }
 
+  /** A request that is not a build, View Commit (R33), is now the latest:
+   *  every pending build is stale, and its generation is current until the
+   *  next `begin`, `claim` or `invalidate`. */
+  claim(): number {
+    this.invalidate();
+    return this.gen;
+  }
+
   /** The view shown now, or null. */
   current(): View | null {
     return this.view;
@@ -322,14 +330,32 @@ export class DiffSlot {
     return prev;
   }
 
-  /** Buffer `id` closed (the user closed the tab, or something closed a
-   *  source): the current view's composite, whose state only
-   *  `closeCompositeBuffer` drops (INV §9.4), and its other buffers, to be
-   *  closed too; null when `id` is not part of it. */
-  onClosed(id: number): { composite: number; rest: number[] } | null {
-    const v = this.view;
-    if (v === null || (id !== v.composite && id !== v.left && id !== v.right)) return null;
+  /** Take `v` out if it is the view shown now (the plugin closes it: `q`,
+   *  Esc, a replace): whether it was. Taken out first, so the closes it
+   *  brings find no view (R14). */
+  take(v: View): boolean {
+    if (this.view !== v) return false;
     this.view = null;
-    return { composite: v.composite, rest: [v.composite, v.left, v.right].filter((b) => b !== id) };
+    return true;
+  }
+
+  /** Source `id` reported closed (`buffer_closed`): it leaves its view's
+   *  `open`. The view shown now, taken out, when `id` was one of its
+   *  sources: its `open` holds the sources still to close. Null otherwise. */
+  onClosed(id: number): View | null {
+    const v = this.view;
+    if (v === null || sideOf(v, id) === null) return null;
+    v.open.delete(id);
+    this.view = null;
+    return v;
+  }
+
+  /** Group `groupId` of this window closed (`buffer_group_closed`): the
+   *  view shown now, taken out, when it is that group's; null otherwise. */
+  onGroupClosed(groupId: number): View | null {
+    const v = this.view;
+    if (v === null || v.group !== groupId) return null;
+    this.view = null;
+    return v;
   }
 }

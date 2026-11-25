@@ -1,6 +1,8 @@
 // Parsing of `git status --porcelain=v2 --branch -z -uall` into the two
 // groups the section shows, and the section title.
 
+import { shortId, trimSlash } from "./git.ts";
+
 /** The status letter shown on a row (spec R5). */
 export type Marker = "M" | "A" | "D" | "R" | "C" | "T" | "U" | "!";
 
@@ -38,7 +40,7 @@ export interface Status {
 /** Status letters shown as they are; anything else shows as M. */
 const LETTERS = new Set("MTADRC");
 
-function marker(letter: string): Marker {
+export function marker(letter: string): Marker {
   return LETTERS.has(letter) ? (letter as Marker) : "M";
 }
 
@@ -75,7 +77,8 @@ function isSubmodule(record: string): boolean {
   return record[5] === "S";
 }
 
-function byPath(a: Entry, b: Entry): number {
+/** Entries in path order, as both groups and a commit's files list them. */
+export function byPath(a: Entry, b: Entry): number {
   return a.path < b.path ? -1 : a.path > b.path ? 1 : 0;
 }
 
@@ -140,7 +143,23 @@ export function unpassable(p: string): boolean {
 
 /** `Git · <branch>` plus ` ↑A ↓B` when the branch has an upstream (R2). */
 export function title(s: Status): string {
-  const head = s.branch ?? (s.oid ? s.oid.slice(0, 7) : "HEAD");
+  const head = s.branch ?? (s.oid ? shortId(s.oid) : "HEAD");
   const ab = s.ab ? ` ↑${s.ab.ahead} ↓${s.ab.behind}` : "";
   return `Git · ${head}${ab}`;
+}
+
+/** Why a row whose name git can't be passed back is refused (`unpassable`). */
+export function nameReason(path: string): string {
+  return `${path}: the name is not valid UTF-8, so git can't be passed it back`;
+}
+
+/** The name `nameReason` gives for `e`: its path, or its original path when
+ *  only that one is not UTF-8 (a rename or copy from such a name). */
+export function badName(e: Entry): string {
+  return e.orig !== undefined && !unpassable(e.path) && unpassable(e.orig) ? e.orig : trimSlash(e.path);
+}
+
+/** Why a directory row (a submodule or nested repository) is refused. */
+export function dirReason(path: string): string {
+  return `${path} is a directory (submodule or nested repository)`;
 }

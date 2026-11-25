@@ -8,6 +8,9 @@ import type { TreeSpec } from "../lib/view.ts";
 /** A recorded `git status` output, tests/fixtures/<name>.z. */
 export const fixture = (name: string): string => readFileSync(new URL(`./fixtures/${name}.z`, import.meta.url), "utf8");
 
+/** Any recorded output, tests/fixtures/<file>, as git printed it. */
+export const recorded = (file: string): string => readFileSync(new URL(`./fixtures/${file}`, import.meta.url), "utf8");
+
 /** A recorded `git status` output, parsed. */
 export const status = (name: string): Status => parseStatus(fixture(name));
 

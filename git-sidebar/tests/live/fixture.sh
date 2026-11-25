@@ -11,6 +11,16 @@
 #   new/c.txt, new/d.txt untracked             old.ts   renamed to moved.ts, staged
 #   gone.ts   deleted, unstaged                build/   ignored
 #
+# Two names build other repositories instead, for the Graph (spec A29–A36):
+#   graph       A30's history: main c1 (root) → c2, tagged v1 → c3; feat from
+#               c2 with f1, f2; main merges feat as M (c3, f2), then c4.
+#               origin/main is at M (↑1 ↓0) and origin/HEAD points at it.
+#               c2 renames x.txt to y.txt and deletes gone.txt; c3 adds a
+#               PNG. In the working tree b.md is modified, and two.txt (20
+#               lines) has two changes. <base>/graph-2 is a second clone of
+#               the same bare origin, for pushes from "someone else".
+#   graph-long  120 commits on one line, for Load more.
+#
 # --devcontainer <image>  adds .devcontainer/devcontainer.json using <image>,
 #                         with the workspace bind-mounted (the default).
 # --volume                adds a devcontainer.json whose workspace is the
@@ -45,6 +55,47 @@ rm -rf "$dir" "$origin"
 mkdir -p "$dir"
 
 g() { git -C "$dir" -c user.name=fixture -c user.email=fixture@example.invalid -c commit.gpgsign=false "$@"; }
+
+if [ "$name" = graph-long ]; then
+  git init -q -b main "$dir"
+  for i in $(seq -w 1 120); do printf '%s\n' "$i" > "$dir/n.txt"; g add n.txt; g commit -q -m "n$i"; done
+  echo "$dir"
+  exit 0
+fi
+
+if [ "$name" = graph ]; then
+  second="$base/$name-2"
+  rm -rf "$second"
+  git init -q -b main "$dir"
+  git init -q --bare -b main "$origin"
+  printf 'export const a = 1;\n' > "$dir/a.ts"
+  printf '# b\n' > "$dir/b.md"
+  printf 'content that is renamed\nline 2\nline 3\n' > "$dir/x.txt"
+  printf 'export const gone = 1;\n' > "$dir/gone.txt"
+  seq 1 20 | sed 's/^/line /' > "$dir/two.txt"
+  g add -A; g commit -q -m c1
+  g mv x.txt y.txt; g rm -q gone.txt; printf 'export const a = 2;\n' > "$dir/a.ts"; g add -A; g commit -q -m c2
+  g tag v1
+  # A 1x1 PNG.
+  printf '\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01\x08\x06\0\0\0\x1f\x15\xc4\x89\0\0\0\rIDATx\x9cc\xf8\xff\xff?\0\x05\xfe\x02\xfe\xa7\x35\x81\x84\0\0\0\0IEND\xaeB`\x82' > "$dir/logo.png"
+  g add logo.png; g commit -q -m c3
+  g checkout -q -b feat HEAD~1
+  printf 'one\n' > "$dir/feat.txt"; g add feat.txt; g commit -q -m f1
+  printf 'one\ntwo\n' > "$dir/feat.txt"; g commit -q -am f2
+  g checkout -q main
+  g merge -q --no-ff -m M feat
+  g remote add origin "$origin"
+  g push -q -u origin main
+  git -C "$origin" symbolic-ref HEAD refs/heads/main
+  g remote set-head origin -a >/dev/null
+  printf 'export const a = 4;\n' > "$dir/a.ts"; g commit -q -am c4
+  git clone -q "$origin" "$second"
+  # The working tree: b.md modified, two.txt with two changes.
+  printf '# b\nchanged\n' > "$dir/b.md"
+  sed -i.bak -e 's/^line 5$/line 5 changed/' -e 's/^line 15$/line 15 changed/' "$dir/two.txt" && rm "$dir/two.txt.bak"
+  echo "$dir"
+  exit 0
+fi
 
 git init -q -b main "$dir"
 git init -q --bare -b main "$origin"

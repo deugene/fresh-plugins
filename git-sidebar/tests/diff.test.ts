@@ -2,10 +2,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { Entry } from "../lib/status.ts";
 import {
-  compositeHunks,
   contentToEntries,
   contentToText,
   DIFF_HINT,
+  sideOf,
   DiffSlot,
   lineCount,
   MAX_DIFF_BYTES,
@@ -18,9 +18,8 @@ import {
   sides,
   sizeRefusal,
   sourceName,
+  statusDiffTarget,
   tabTitle,
-  targetLine,
-  type Hunk,
   type Side,
   type View,
 } from "../lib/diff.ts";
@@ -129,10 +128,22 @@ test("contentToEntries drops one trailing newline, and gives no span for empty t
   assert.deepEqual(contentToEntries("\n"), []);
 });
 
-/** A view of buffers `composite`, `left` and `right`, for row `c:a`. */
-const view = (composite: number, left: number, right: number): View => ({ composite, left, right, key: "c:a", hunks: [], rightLines: 1 });
 
-test("DiffSlot: a stale build, a joined build, a replace and a user close", () => {
+/** A two-pane view of sources 5 (left) and 6 (right) in group `group`. */
+const groupView = (group: number, left: number | null = 5, right: number | null = 6): View => ({
+  group,
+  left,
+  right,
+  open: new Set([left, right].filter((x): x is number => x !== null)),
+  key: "c:a",
+  hunks: [],
+  at: null,
+  rightLines: 1,
+  split: 0,
+  panelSplits: {},
+});
+
+test("DiffSlot: a stale build, a joined build, a replace and a source closing (R14)", () => {
   const slot = new DiffSlot();
   assert.equal(slot.current(), null);
   const a = slot.begin("c:a")!;
@@ -142,29 +153,45 @@ test("DiffSlot: a stale build, a joined build, a replace and a user close", () =
   assert.ok(slot.isCurrent(b));
   slot.done(a);
   assert.equal(slot.begin("c:b"), null, "a stale build ending does not end the current one");
-  assert.equal(slot.install(view(1, 2, 3)), null);
+  const first = groupView(1, 2, 3);
+  assert.equal(slot.install(first), null);
   slot.done(b);
   // Done: the same key builds again (a fresh snapshot).
   const c = slot.begin("c:b")!;
   assert.ok(slot.isCurrent(c));
-  assert.deepEqual(slot.install(view(4, 5, 6)), view(1, 2, 3));
-  assert.deepEqual(slot.current(), view(4, 5, 6), "the view shown now");
+  const second = groupView(4, 5, 6);
+  assert.equal(slot.install(second), first);
+  assert.equal(slot.current(), second, "the view shown now");
   slot.done(c);
-  // The replaced view's buffers closing is not the current view's business.
-  assert.equal(slot.onClosed(1), null);
+  // The replaced view's sources closing is not the current view's business.
   assert.equal(slot.onClosed(2), null);
-  // The user closes the tab: drop the composite's state, close the two sources.
-  assert.deepEqual(slot.onClosed(4), { composite: 4, rest: [5, 6] });
+  assert.equal(slot.onClosed(3), null);
+  // A source closing takes the rest of the view with it.
+  assert.equal(slot.onClosed(6), second);
+  assert.deepEqual([...second.open], [5]);
   assert.equal(slot.current(), null, "closed: no view for Enter to act on");
   assert.equal(slot.onClosed(5), null, "already handled");
-  // A source closing takes the rest of the view with it.
-  assert.equal(slot.install(view(7, 8, 9)), null, "the closed view is gone: nothing to replace");
-  assert.deepEqual(slot.onClosed(9), { composite: 7, rest: [7, 8] });
   // invalidate: every pending build is stale, and the key may start again.
   const d = slot.begin("c:x")!;
   slot.invalidate();
   assert.ok(!slot.isCurrent(d));
   assert.notEqual(slot.begin("c:x"), null);
+});
+
+test("DiffSlot.claim: View Commit's generation, which stales a pending build and is staled by the next request (R14, R33)", () => {
+  const slot = new DiffSlot();
+  const build = slot.begin("c:a")!;
+  const v1 = slot.claim();
+  assert.ok(!slot.isCurrent(build), "a claim stales the pending build");
+  assert.ok(slot.isCurrent(v1));
+  assert.notEqual(slot.begin("c:a"), null, "the claim ended the pending build: the same key builds again");
+  assert.ok(!slot.isCurrent(v1), "a later build stales the claim");
+  const v2 = slot.claim();
+  const v3 = slot.claim();
+  assert.ok(!slot.isCurrent(v2), "a later claim stales the earlier one");
+  assert.ok(slot.isCurrent(v3));
+  slot.invalidate();
+  assert.ok(!slot.isCurrent(v3), "a refused row or a restart stales it too");
 });
 
 test("a git object's side is binary unless its text is exactly its size in UTF-8 bytes (R14, F5)", () => {
@@ -215,29 +242,6 @@ test("a directory row, or one with a name git can't be passed back, is refused b
   assert.equal(refusalMessage(bad, "unpassable name"), `${bad}: the name is not valid UTF-8, so git can't be passed it back`);
 });
 
-test("compositeHunks: an empty side's phantom line is covered, so no row points at it (INV §8 P22)", () => {
-  const plain = [{ oldStart: 1, oldCount: 1, newStart: 1, newCount: 2 }];
-  /** The line diff, counting its calls: only needed when both sides have lines. */
-  let calls = 0;
-  const diff = (hunks: Hunk[]) => () => {
-    calls++;
-    return hunks;
-  };
-  // Both sides have lines: the line diff is used as it is.
-  assert.deepEqual(compositeHunks("a\nb\n", "a\nc\nd\n", diff(plain)), plain);
-  assert.equal(calls, 1);
-  calls = 0;
-  // Untracked or added: every right line an addition, the left count 1.
-  assert.deepEqual(compositeHunks("", "x\ny\n", diff([])), [{ oldStart: 0, oldCount: 1, newStart: 0, newCount: 2, ops: "++" }]);
-  // A left side that is only a newline is an empty buffer too.
-  assert.deepEqual(compositeHunks("\n", "\nz", diff([])), [{ oldStart: 0, oldCount: 1, newStart: 0, newCount: 2, ops: "++" }]);
-  // Deleted: every left line a deletion, the right count 1.
-  assert.deepEqual(compositeHunks("p\nq\nr", "", diff([])), [{ oldStart: 0, oldCount: 3, newStart: 0, newCount: 1, ops: "---" }]);
-  // Both empty (an empty new file): one hunk with no rows.
-  assert.deepEqual(compositeHunks("", "", diff([])), [{ oldStart: 0, oldCount: 1, newStart: 0, newCount: 1, ops: "" }]);
-  // No empty-side case asks the host for a line diff.
-  assert.equal(calls, 0);
-});
 
 test("source names: `*label:path*`, so the name Fresh looks a grammar up by is the file's (R21, INV §8 P26)", () => {
   // As `DetectedLanguage::from_virtual_name`: strip the `*`s, take the text after the last `:`.
@@ -260,29 +264,6 @@ test("source names: `*label:path*`, so the name Fresh looks a grammar up by is t
   }
 });
 
-test("targetLine: the right line on the cursor's row, else the next one, else the last (R19, INV §8 P25 c)", () => {
-  // `20 lines` with line 3 changed: a present right line, as the host gave `[2,2]`.
-  const changed: Hunk[] = [{ oldStart: 2, oldCount: 1, newStart: 2, newCount: 1 }];
-  assert.equal(targetLine([2, 2], changed, 20), 2);
-  // An added line has no left line: `[null,1]`.
-  assert.equal(targetLine([null, 1], [{ oldStart: 1, oldCount: 0, newStart: 1, newCount: 1 }], 2), 1);
-  // Paired by position: 3 old lines against 1 new, so the rows at offsets 1
-  // and 2 show only a left line, and go to the line after the hunk.
-  const positional: Hunk[] = [{ oldStart: 4, oldCount: 3, newStart: 4, newCount: 1 }];
-  assert.equal(targetLine([5, null], positional, 10), 5);
-  assert.equal(targetLine([6, null], positional, 10), 5);
-  // A pure deletion (newCount 0), as the host gave `[9,null]` for line 10 of 20.
-  const deleted: Hunk[] = [{ oldStart: 9, oldCount: 1, newStart: 9, newCount: 0 }];
-  assert.equal(targetLine([9, null], deleted, 19), 9);
-  // A trailing deletion: no right line follows, so the last line (null).
-  assert.equal(targetLine([19, null], [{ oldStart: 19, oldCount: 1, newStart: 19, newCount: 0 }], 19), null);
-  // An empty right side (a deleted file): its hunk covers the phantom line through `ops`.
-  const gone = compositeHunks("a\nb\n", "", () => assert.fail("no line diff for an empty side"));
-  assert.equal(targetLine([1, null], gone, lineCount("")), null);
-  // Neither pane on the row, or a left line no hunk holds: the last line.
-  assert.equal(targetLine([null, null], changed, 20), null);
-  assert.equal(targetLine([7, null], changed, 20), null);
-});
 
 test("openLine: clamped to the lines the tab shows; empty gives line 1; unknown passes through (R19)", () => {
   assert.equal(openLine(1, 3), 2);
@@ -297,8 +278,63 @@ test("openLine: clamped to the lines the tab shows; empty gives line 1; unknown 
   assert.equal(lineCount("a\nb"), 2);
 });
 
-test("the diff hint names Fresh's keys and Enter (R20)", () => {
-  for (const k of ["n", "]", "p", "[", "Enter", "q", "Esc"]) assert.ok(DIFF_HINT.includes(k), k);
-  // The status bar cuts a message after about 70 characters at 140 columns.
-  assert.ok(DIFF_HINT.length <= 64, `${DIFF_HINT.length}`);
+test("the diff hint names every key of the diff and Enter, most needed first (R20)", () => {
+  for (const k of ["n", "]", "p", "[", "(S-)Tab", "j/k", "Enter", "q", "Esc"]) assert.ok(DIFF_HINT.includes(k), k);
+  // At 140 columns the status bar cuts a message after about 70 characters,
+  // and after about 52 beside a TypeScript file's labels (INV §8 P43 c):
+  // closing, the moves and Enter stay within the shorter width.
+  assert.ok(DIFF_HINT.length <= 70, `${DIFF_HINT.length}`);
+  assert.ok(DIFF_HINT.startsWith("q/Esc close"), DIFF_HINT);
+  const shown = DIFF_HINT.slice(0, 50);
+  for (const k of ["n/]", "p/[", "Enter"]) assert.ok(shown.includes(k), k);
+});
+
+
+test("statusDiffTarget: today's sides, labels, title and refusal for a status row (R14)", () => {
+  const e: Entry = { path: "dir/", marker: "U", dir: true };
+  assert.deepEqual(statusDiffTarget({ path: "a.ts", marker: "M" }, "staged", false, "s:a.ts"), {
+    key: "s:a.ts",
+    path: "a.ts",
+    left: { kind: "blob", spec: "HEAD:a.ts" },
+    right: { kind: "blob", spec: ":0:a.ts" },
+    labels: ["HEAD", "Staged"],
+    title: "a.ts (HEAD ↔ staged)",
+    refusal: null,
+    refusedName: "a.ts",
+  });
+  const t = statusDiffTarget(e, "changes", false, "c:dir/");
+  assert.equal(t.path, "dir");
+  assert.equal(t.refusal, "directory");
+  assert.deepEqual(statusDiffTarget({ path: "x", marker: "R", orig: "caf\uFFFD" }, "staged", false, "s:x").refusedName, "caf\uFFFD");
+});
+
+
+test("DiffSlot with group views: a source closing, the group closing, a view taken out first (R14 no leftovers, H4, H14)", () => {
+  const slot = new DiffSlot();
+  const a = groupView(1);
+  slot.install(a);
+  assert.equal(sideOf(a, 5), "left");
+  assert.equal(sideOf(a, 6), "right");
+  assert.equal(sideOf(a, 7), null);
+  // Its group closing (the tab's ×, Close Tab): taken out; both sources still to close.
+  assert.equal(slot.onGroupClosed(2), null, "another group");
+  assert.equal(slot.onGroupClosed(1), a);
+  assert.equal(slot.current(), null);
+  assert.deepEqual([...a.open], [5, 6]);
+  assert.equal(slot.onClosed(5), null, "no view shown: the closes the plugin asked for find nothing");
+  // A source closing first: the other is left to close.
+  const b = groupView(2);
+  slot.install(b);
+  assert.equal(slot.onClosed(9), null);
+  assert.equal(slot.onClosed(6), b);
+  assert.deepEqual([...b.open], [5]);
+  assert.equal(slot.onGroupClosed(2), null, "already taken out");
+  // `q`: the plugin takes the view out before closing its sources.
+  const c = groupView(3, null, 8);
+  slot.install(c);
+  assert.equal(slot.take(b), false, "not the view shown");
+  assert.equal(slot.take(c), true);
+  assert.equal(slot.current(), null);
+  assert.equal(slot.onClosed(8), null);
+  assert.equal(sideOf(c, 8), "right");
 });

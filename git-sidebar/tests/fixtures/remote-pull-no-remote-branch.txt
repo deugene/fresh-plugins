@@ -1,0 +1,4 @@
+rc 1
+--- stdout
+--- stderr
+fatal: couldn't find remote ref refs/heads/nosuch

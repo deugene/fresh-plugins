@@ -1,0 +1,27 @@
+commit 04eec52f9ff1d9c51ea5c0546309b2c726ceeaf4
+Merge: a9b57f0 f1023c0
+Author:     fixture <fixture@example.invalid>
+AuthorDate: Thu Jan 1 00:00:12 2026 +0000
+Commit:     fixture <fixture@example.invalid>
+CommitDate: Thu Jan 1 00:00:12 2026 +0000
+
+    M
+---
+ f1.txt | 1 +
+ f2.txt | 1 +
+ 2 files changed, 2 insertions(+)
+
+diff --git a/f1.txt b/f1.txt
+new file mode 100644
+index 0000000..8e1e71d
+--- /dev/null
++++ b/f1.txt
+@@ -0,0 +1 @@
++f1
+diff --git a/f2.txt b/f2.txt
+new file mode 100644
+index 0000000..9de77c1
+--- /dev/null
++++ b/f2.txt
+@@ -0,0 +1 @@
++f2

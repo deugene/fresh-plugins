@@ -717,7 +717,169 @@ The windows held two acceptance fixtures, `/tmp/gs-mw/fix/a` (the launch folder)
 
 **P34: a parked section. Pass.** While A was active, `updateFloatingWidget(1903869748, …)` on B's section returned `true`. On switching to B it showed the new rows (`b bumped 1`). No WARN or ERROR.
 
-## 9. Follow-up: opening, diffs, staging and the title (2026-11-24)
+### P35–P38: row cap, diff navigation, graph, push and pull (2026-11-25)
+
+Fresh 0.5.9, git 2.50.1 (Apple Git-155), through the `run-git-sidebar` driver with `GS_DRIVE_DIR`/`GS_DRIVE_SESSION` set per probe (`/tmp/gs-inv-diffnav`, `/tmp/gs-inv-graph`, `/tmp/gs-inv-push`). Probe plugins were loaded with `editor.loadPlugin` from `/tmp/gs-inv-diffnav-probe/gs_nav_probe.ts` and `/tmp/gs-inv-graph-probe/gs_graph_probe.ts`, not from the repo. Background in §12.
+
+**P35: Next/Previous Change in the plugin's diff. Root cause found.**
+
+| # | Check | Result |
+|---|---|---|
+| a | Palette **Next Change** (diff_nav) in `two.txt (staged ↔ working tree)`, two hunks | Status `No changes`; the cursor stays on Ln 10 |
+| b | What diff_nav reads on the active buffer | The active buffer is the composite (id 5). `getViewState(5, "git_gutter_hunks")` and `"live_diff_hunks"` are null; `getBufferSavedDiff(5)` is `{equal:true}`; `getBufferText(5)` is `""` |
+| c | The same in Fresh's own Side-by-Side Diff (`*Diff: b.md*`, audit_mode) | Also `No changes`: no Fresh composite feeds diff_nav |
+| d | Feeding diff_nav: `setViewState(5, "git_gutter_hunks", [...])` | Returns true, and Next Change still says `No changes`: `getLineStartPosition` is null on a composite |
+| e | A palette command calling `editor.compositeNextHunk(getActiveBufferId())`, then `compositePrevHunk` | Inside the handler the active buffer is the composite. The cursor goes `[9,9]` → `[24,24]`, then `[24,24]` → `[2,2]`. `getCompositeCursorInfo()` awaited right after shows the new row. At the last hunk Next does nothing and still returns true |
+| f | `executeAction("composite_next_hunk")` from a palette command | Also moves the cursor (`[2,2]` → `[24,24]`): the action uses the active buffer. It relies on an action name, not an API |
+| g | Typing `Hunk` in the palette | Nothing: the core's "Next Hunk (Side-by-Side Diff)" actions are not palette commands |
+
+**P36: graph rows in the section tree. Pass.** A tree mounted as the plugin mounts it (`cardBorders: true`, `itemHeight: 1`, `indentCols: 1`), screen captures in `/tmp/gs-inv-graph/shots/`.
+- **a, glyphs.** `│ ─ ╮ ╯ ╭ ╰ ├ ┤ ┼ ● ○` each drew one column wide and lined up across 11 lane rows. They are East Asian "ambiguous" width; Fresh counts them as 1.
+- **b, columns.** A row's text starts at `depth × indentCols + 2`: the 2 columns are `▶ `/`▼ ` on a node with `hasChildren`, two spaces on a leaf. Depth-1 commit rows with `hasChildren: true` and a depth-1 leaf put their lanes in the same column; a `flush` leaf sits 2 columns left of them.
+- **c, nesting.** Group → commit → file (depths 0, 1, 2) drew as a tree.
+- **d, lazy children.** Every toggle fires `expand {index, key, expanded}`: a click with `toggleOnClick`, the disclosure glyph, Right/Left. (Enter, listed here at first, does not toggle a row: it sends only `activate`, P39 g.) A node with `hasChildren: true` and no child rows yet shows `▼` over nothing, so children can be pushed after the event.
+- **e, styles.** Bold, italic, underline, RGB `fg` and a theme-key `bg` badge drew. There is no dim flag. The selection band repaints `bg` across the row.
+- **f, cutting.** A row wider than the section is cut at the display column and ends with `…`; a `[ label ]` button stays pinned at the right edge, and a badge's `bg` is kept up to the `…`. In a 140-column screen the section body was 39 columns.
+- **g, colours.** `editor.bracket_rainbow_1` … `_6` resolved to six colours. In the dark theme `_5` and `_6` are both light blue.
+- **h, cost.** Plugin-side time per full update (signature JSON, then `updateFloatingWidget`): 1,020 nodes 17 + 7 ms; 3,020 nodes 23 + 18 ms; 6,020 nodes 47 + 36 ms. Down and PageDown felt the same with 3,000 rows as with 20.
+- **i, a commit as text.** A virtual buffer named `*<short>:show.diff*` holding `git show --stat --patch` output is coloured as a diff (added lines on the diff-add background, `@@` and `diff --git` lines styled), with the embedded TypeScript coloured too.
+
+**P37: push and pull from a Fresh-spawned process.**
+
+| # | Check | Result |
+|---|---|---|
+| a | `runOnTarget("git", ["push", "h401", "main"])`, an http remote answering only 401 | `Username for 'http://127.0.0.1:18401':` is drawn over Fresh's screen: the child has no tty on stdout but `/dev/tty` opens (the editor's pane) |
+| b | `kill()` after 5 s | Kills `git`, leaves `git-remote-http` orphaned and reading `/dev/tty`; the handle settles only when that orphan is killed by hand (129 s) |
+| c | `git -c core.askPass=false ls-remote …` | Still falls back to the terminal: no config key turns the prompt off |
+| d | `env GIT_TERMINAL_PROMPT=0 git push h401 main` | rc 128 in 154 ms, `fatal: could not read Username for 'http://127.0.0.1:18401': terminal prompts disabled` |
+| e | A closed port, with (d)'s env | rc 128 in 76 ms, `Failed to connect … Couldn't connect to server` |
+| f | An unreachable ssh host, `GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=5"` | rc 128 in 5.1 s, `ssh: connect … Operation timed out` / `fatal: Could not read from remote repository.` `-c core.sshCommand=…` behaves the same |
+| g | SIGKILL of `git push` while the remote's pre-receive hook sleeps | No `.lock` on either side, but the remote completes the push; the local `origin/main` stays stale |
+| h | SIGKILL of `git pull` | Its `git fetch` child is orphaned (ppid 1) and still updates `origin/main`; HEAD is not merged |
+| i | After a push, `status --porcelain=v2 --branch` | `# branch.ab +1 -0` → `+0 -0` with no fetch. A new remote commit shows as `-1` only after a fetch |
+
+ssh's own host-key and passphrase prompts read `/dev/tty` too; starting a local sshd to probe them was not allowed, so that `BatchMode=yes` turns them into failures is from ssh's documentation, UNCONFIRMED here. Confirmed later against a local sshd (P39 a).
+
+**P38: git's push and pull outcomes** (rc, then stderr unless noted).
+
+| Case | Result |
+|---|---|
+| push, no upstream (one or several remotes) | 128, `fatal: The current branch feat has no upstream branch.` and a `--set-upstream origin feat` hint |
+| push, no remote; or two remotes, none named `origin` | 128, `fatal: No configured push destination.` |
+| push, detached HEAD (also mid-rebase) | 128, `fatal: You are not currently on a branch.` |
+| push, upstream name differs (`push.default=simple`) | 128, `fatal: The upstream branch of your current branch does not match the name of your current branch.` |
+| push rejected | 1, `! [rejected] main -> main (fetch first)` or `(non-fast-forward)`, then `error: failed to push some refs` |
+| nothing to push | 0, `Everything up-to-date` |
+| push during a merge | pushes HEAD; MERGE_HEAD is ignored |
+| pull, diverged, no `pull.rebase`/`pull.ff` | 128, `fatal: Need to specify how to reconcile divergent branches.`; the fetch has already moved `origin/main` |
+| pull `--ff-only`, diverged | 128, `fatal: Not possible to fast-forward, aborting.` |
+| pull would overwrite local changes | 1, `error: Your local changes to the following files would be overwritten by merge:` with the files, then `Aborting`. With `--rebase`: 128, `error: cannot pull with rebase: You have unstaged changes.` |
+| pull `--autostash` with a conflicting stash | **0**, with `UU f` and the stash left behind (`Applying autostash resulted in conflicts.`) |
+| pull with conflicts (merge) | 1, `CONFLICT (content): Merge conflict in f` / `Automatic merge failed` on stdout; MERGE_HEAD, ORIG_HEAD and `UU` rows left |
+| pull with conflicts (rebase) | 1, `could not apply …`; `rebase-merge/`, REBASE_HEAD, detached HEAD |
+| pull, no upstream (or no remote) | **1**, `There is no tracking information for the current branch.` |
+| pull with unmerged files | 128, `error: Pulling is not possible because you have unmerged files.` |
+| pull, merge resolved but not committed | 128, `error: You have not concluded your merge (MERGE_HEAD exists).` |
+| pull up to date | 0, `Already up to date.` on stdout |
+
+### P39: implementation probes (2026-11-25)
+
+Fresh 0.5.9, git 2.50.1 (Apple Git-155), through the `run-git-sidebar` driver with `GS_DRIVE_DIR=/tmp/gs-impl-drive`, `GS_DRIVE_SESSION=gs-impl-drive`, on the acceptance fixture. The probe plugin `/tmp/gs-impl-probe-plugin/gs_impl_probe.ts` (not in the repo) was loaded with `editor.loadPlugin`: a tree section like the plugin's (`g:g`, depth-1 `h:` rows with `hasChildren`, a depth-2 file row, `more:h`), a right-click menu, a prompt with two suggestions, and a command registered with context `"git-sidebar-diff"`. Plain git ran in `/tmp/gs-impl-p2`. ssh ran against a throwaway `alpine:3` container with OpenSSH (`docker run -p 127.0.0.1:22339:22`), removed afterwards.
+
+| # | Check | Result |
+|---|---|---|
+| a | ssh prompts with the plugin's env (`GIT_TERMINAL_PROMPT=0`, `GIT_ASKPASS=`, `SSH_ASKPASS=false`, `SSH_ASKPASS_REQUIRE=force`) and `-o BatchMode=yes -o ConnectTimeout=10` appended, through `runOnTarget("env", …)` | **Confirmed.** An unknown host key (an empty `UserKnownHostsFile`): rc 128 in 155 ms, `Host key verification failed.`, and the file stays empty. A passphrase key not in an agent: rc 128 in 96 ms, `Permission denied (publickey,password,keyboard-interactive).` A wrapper script that runs ssh without BatchMode: the passphrase case fails in 444 ms (`Permission denied, please try again.` three times: the askpass `false` answers each prompt), the host-key case in 341 ms (`Host key verification failed.`). Nothing was drawn over Fresh, and no ssh process was left. stderr lines end in `\r` |
+| b | The full argv against (a)'s sshd | **Confirmed.** A `core.sshCommand`-style `ssh -i <key> -o IdentitiesOnly=yes -o UserKnownHostsFile=<kh>` with the two options appended pushes (rc 0, `* [new branch] main -> main`). An unreachable host (`ssh://git@10.255.255.1/r.git`): rc 128 after 10.1 s, `ssh: connect to host 10.255.255.1 port 22: Operation timed out` |
+| c | `editor.getEnv` against a spawned child's environment | **Confirmed.** In a Fresh started with `GIT_SSH_COMMAND='ssh -o P39=yes'` and `GIT_SSH=/opt/p39/ssh`, `getEnv` returns both, and `env` run through `runOnTarget` and through `spawnHostProcess` prints the same two. `HOME` and `PATH` match too. **An unset variable gives `undefined`, not the declared `null`** |
+| d | `GIT_ASKPASS=` with `SSH_ASKPASS` set to a script that records its runs, against an http remote that answers only 401 | **Confirmed.** rc 128 in 179 ms, `could not read Username for 'http://127.0.0.1:18439': terminal prompts disabled`, and the script never ran. Control, without `GIT_ASKPASS=`: git ran the script for the username and the password, then `Authentication failed` |
+| e | `%D` of `log --decorate=full --decorate-refs-exclude=refs/remotes/*/HEAD` | **Confirmed.** Attached: `HEAD -> refs/heads/main`; detached: `HEAD, refs/remotes/origin/main`; tags: `tag: refs/tags/v1a, tag: refs/tags/v1` (annotated and lightweight alike); the upstream: `refs/remotes/origin/main`. The exclusion drops `refs/remotes/origin/HEAD`, which plain `--decorate=full` adds. **A shallow clone's boundary commit decorates as `grafted`** (and its `%P` is empty), which is not a ref and must not become a badge |
+| f | `show --no-color --format=fuller --stat --patch --diff-merges=first-parent` | **Confirmed.** On a merge: `Merge: <p1> <p2>`, both dates, the message, then the stat and patch of its first-parent diff (the files the merged branch brought). On a root commit: every line added (`--- /dev/null`). `diff-tree -r -z --raw -M <m>^1 <m>` lists the merged files as `A`; `diff-tree --root --no-commit-id -r -z --raw -M <root>` lists the root's |
+| g | Enter on a depth-1 `hasChildren` row; `setExpandedKeys` | **Contradicts P36 d's "Enter".** Enter on a commit row sends only `activate {index, key}`: no `expand`, and the host does not toggle the row; on the depth-0 group row the same. Right and Left send `expand` and toggle; Space sends `activate {via:"space"}`. A click on a `hasChildren` row sends only `expand {index, key, expanded}`, no `select`, also on a row not selected before; a click on a leaf (`hf:`, `more:h`) sends `select {via:"click"}`. `setExpandedKeys` sends no `expand` back. So the plugin toggles a commit on Enter itself, as it does a group |
+| h | `startPrompt(label, type)` with `setPromptSuggestions` (two suggestions), from the palette and from a right-click menu's button | **Confirmed**, the same from both. On open: `prompt_changed {input:""}`. The first suggestion is highlighted: Enter at once gives `prompt_confirmed {prompt_type, input:"origin", selected_index:0}`; Down then Enter gives `"backup"`, 1. Typed text that matches no suggestion hides the list, and Enter gives `{input:"zzz", selected_index:null}`. Esc gives `prompt_cancelled {input:""}`, and the host shows `Search cancelled.`. Every prompt hook fires for every prompt type: the plugin filters by `prompt_type` |
+| i | `compositeNextHunk` on a 200-line diff with changes at lines 20 and 150 | **Confirmed.** From line 30 the cursor goes to 150 (`getCompositeCursorInfo().lines` `[29,29]` → `[149,149]`), and the view scrolls so that `line 150 CHANGED` is on screen. A second call at the last change leaves it there |
+| j | `spawnHostProcess("env", ["GIT_TERMINAL_PROMPT=0", "GIT_ASKPASS=", "git", …])` | **Confirmed.** `{exit_code: 0, stdout: "main\n"}`; a child sees the assignments |
+| k | Palette listing of a command registered with context `"git-sidebar-diff"` | **Confirmed.** Listed while a section diff is the active tab, with the keyboard in the section or in the diff; not listed with `b.md`'s tab active; not listed in a second window (its own active buffer); listed again back in the first |
+| l | `editor.setClipboard("p39-clip-…")`, then Ctrl+V in `[No Name]` | **Confirmed.** The buffer holds the text, and the system clipboard (`pbpaste`) has it too |
+
+### Found during the live checks of R29–R36 (2026-11-25)
+
+Same driver setup, on `tests/live/fixture.sh graph` and `graph-long`.
+- **Fresh's bundler cannot load an import cycle.** The first build failed to load with `ReferenceError: __mod_actions_ab62 is not initialized`, while `npm run check` passed. The bundle wraps each module in a function run once, in dependency order, that destructures its imports when it runs (`const {badName} = __mod_actions_…;`), and it counts `import type` as a dependency: `actions → graph → (type) diff → actions` was a cycle. Node runs a cycle and `fresh --check-plugin` only bundles, so `tests/imports.test.ts` now fails on one.
+- **A key binding added to `config.json` while Fresh runs takes effect only after `editor.reloadConfig()`** (or a restart). With it, F7 and Shift+F7 bound to `gitSidebar_nextChange` / `gitSidebar_prevChange` moved the diff's cursor as the palette commands do.
+- **A section scrolled far down stays scrolled when its list shrinks.** After 1,200 untracked files were deleted with the section scrolled near row 1,000, it showed blank rows until the next key moved the selection. The same happens without the Graph; the plugin pushes the reconciled index, and the host draws it only on the next move.
+- **The right-click menu opens above the row when the row is near the screen's bottom**, so the driver's `click … --below <row>` finds no item there.
+- The `driver.mjs` `cmd` and `eval` act on the window of the fixture's folder (as SKILL.md warns): a Commit… and Push sent with `cmd` while window B was active ran in window A.
+
+### P40: review-fix probes (2026-11-25)
+
+git 2.50.1 (Apple Git-155) in fresh `/tmp` repositories with `GIT_CONFIG_GLOBAL=/dev/null`, except (c), which needed a gettext build: git 2.56.1 in the `mcr.microsoft.com/devcontainers/base:debian` image (`docker run --rm --network none`, `de_DE.UTF-8` made with `localedef`).
+
+| # | Check | Result |
+|---|---|---|
+| a | `pull` with the user's autostash config (`pull.rebase=true` + `rebase.autoStash=true`; `merge.autoStash=true`, with and without `pull.ff=only`), a dirty `f.txt` the upstream also changed | Without `--no-autostash`: rc 0, `Created autostash: …` … `Applying autostash resulted in conflicts.`, a `stash@{0}: autostash` left behind and `UU f.txt`. With it, rebase: rc 128, `error: cannot pull with rebase: You have unstaged changes.`; merge: rc 1, `error: Your local changes to the following files would be overwritten by merge:` … `Aborting`. No stash, HEAD unchanged. `--no-autostash` without `--rebase` needs git 2.27: v2.26.0's `builtin/pull.c` dies with `--[no-]autostash option is only valid with --rebase.` |
+| b | Revisions without `--` beside a same-named path | `git log … HEAD @{upstream}` with a committed `HEAD` file, an untracked one, an untracked `head` (the filesystem is case-insensitive) or a `HEAD/` directory: rc 128, `fatal: ambiguous argument 'HEAD': both revision and filename`. A top-level file named as a full commit id does the same to `diff-tree`, `show` and `log -1`. With `--` after the revisions, all rc 0 |
+| c | A conflicting pull under `LANG=de_DE.UTF-8` | rc 1, `KONFLIKT (Inhalt): Merge-Konflikt in f.txt`, stderr `Von ../o`. With `LC_ALL=C` as well: `CONFLICT (content): Merge conflict in f.txt`, `From ../o`. A hook run by `env LC_ALL=C git commit` sees `LC_ALL=C`. Apple's git ignores `LANG` (no gettext) |
+| d | `pull` on a branch only ahead of its upstream | `pull.rebase=true` or `merges`: rc 0, stdout `Current branch main is up to date.`; `pull.rebase=false` or `pull.ff=only`: `Already up to date.` |
+| e | `show` of a root commit with `-c log.showRoot=false` | Without `--root`: the header and message only. With `--root`: `a.txt \| 1 +`, `new file mode 100644`, `--- /dev/null`. With `--root --`, a non-root commit, a merge, and a root commit under the default config print the same as without |
+
+Not probed, from the review: in a partial clone, `diff-tree -M` (inexact rename detection reads blobs), `cat-file` of a historical blob and `show --patch` make git fetch the missing objects from the promisor remote. These are plain reads, killed at 10 s and without `remoteEnv`, so a remote that needs credentials can prompt as P37 a describes. git 2.44's `--no-lazy-fetch` / `GIT_NO_LAZY_FETCH=1` would stop the fetch, and the read would fail instead. Left as a documented limit (spec Decisions, README Limits).
+
+### P41: diff placement and change markers (2026-11-25)
+
+Fresh 0.5.9, through the `run-git-sidebar` driver, each probe with its own `GS_DRIVE_DIR`/`GS_DRIVE_SESSION` (`gs-place`, `gs-scroll`, `gs-group`, `gs-gplace`), editor calls through `eval`. The dock was opened with Alt+`` ` `` (a terminal in a new dock leaf). Scrollbar cells were read with `tmux capture-pane -p -e -N`: the driver's `screen --color` drops the last column, because tmux trims trailing cells. Scratch files: `/tmp/gs-place-scratch/`, `/tmp/gs-scroll-scratch/`, `/tmp/gs-group-scratch/`, `/tmp/gs-gplace-scratch/`. §13 draws the conclusions.
+
+| # | Check | Result |
+|---|---|---|
+| a | A section row click while the dock (split 6) is the active split | **The diff opens in the dock.** Its tabs read `*Terminal 1* ×   b.md (staged ↔ working tree) ×`, and `describeWorkspace` gives `active:6` with pane 6 showing the diff |
+| b | A File Explorer click on `a.ts` in the same state | Opens `a.ts (preview)` in the top pane; afterwards `active:0`, and the keyboard stays in the explorer |
+| c | `listSplits()` / `describeWorkspace()` with the dock open | **No role field.** Both panes report `kind:"virtual"`, `label:null`, `x:42`, `w:98`; only `y`/`height` differ (1/26 against 28/11) |
+| d | With the keyboard in the section and the dock active: a composite made by hand, then `setSplitBuffer(0, comp)`; for View Commit, `createVirtualBuffer({…, background: true})` then `moveBufferToSplit(buf, 0)` | **Both land in pane 0** (side by side for the composite), the active split stays 6, the dock's tabs are untouched, and `keys Down Enter` still act in the section (`focus=Some(#widget_focus:git)` in the log) |
+| e | `focusSplit(0)`, `showBuffer`, `focusSplit(6)` | Keeps the section's focus, but promotes the explorer's `a.ts (preview)` tab in pane 0 to a permanent one |
+| f | A composite diff of a 300-line file with 5 changes, 140×30: the scrollbar | **Drawn, never marked.** Column 140, rows 2–28: thumb bg `255,255,0`, track bg `80,80,80`; after End the thumb is at rows 26–28. `setScrollbarMarkers` with `[255,0,255]` on the composite (id 5), the left source (3) and the right source (4) each returns `true`, and column 140 stays plain. Control: the same call on the file opened as a tab paints `▌` fg `255,0,255` on the track at rows 15–16, and git_gutter's own marks show there too |
+| g | `setLineIndicator`, `addOverlay` (bg) and `addVirtualLine` on a composite's source | Each returns `true`; none is drawn in the composite |
+| h | `createBufferGroup` with two scrollable leaves carrying the `bufferId` of hidden, read-only, `editingDisabled` virtual buffers `*Staged:big.ts*` and `*Working tree:big.ts*` | **One tab**, named as given; the sources get no tabs (with `hiddenFromTabs: false` each also gets its own). Both panels show line numbers and TypeScript colours picked from the buffer name. A borrowed buffer keeps its own `mode`; the group's `mode` applies only to panels the group owns (`buffer_groups.rs:150-232`) |
+| i | `setScrollbarMarkers` on each panel's buffer, RGB colours, `line`/`endLine` | **Painted** on each panel's own track (left at column 103, right at 159): `220,160,90` at row 3, `80,200,120` at row 9, `220,90,90` at row 31, and an 11-line deletion as a streak over rows 29–31 |
+| j | `compareBuffers` on the two virtual buffers; filler `addVirtualLine`s, line and intra-line overlays, `setLineIndicators`, `createScrollSyncGroup` + `setScrollSyncAnchors` | `compareBuffers` resolves with 5 hunks and their spans. A modified line's bg is `60,55,0`, its intra-line span `140,0,0` (left) / `0,110,0` (right); the gutter shows `~`, `+`, `-`; three filler rows face three added lines, and 11 blank rows face the deletion. PageDown and the wheel in either panel keep the sides aligned (51↔54, 211↔203, 269↔261, 175↔178) |
+| k | Keys in a panel | With a mode from `defineMode(…, true)` set on the sources, `n`, `p`, `]`, `[`, Enter, `q`, Esc and Tab each reach the plugin's handler. Unbound, `n`, `p`, `q` and Enter only say `Editing disabled in this buffer`, and Esc does nothing: Fresh's `q`/Esc close is bound in the `compositeBuffer` context only. Tab does not switch panels; a click does, and so does `focusBufferGroupPanel`. `setBufferCursor` on both sources plus `scrollToLineCenter(leftSplit, buf, 279)` centres a change. A palette command whose context is the mode name is listed while a panel has the keyboard |
+| l | `createBufferGroup` with the keyboard in the section | **No focus steal:** Down still moves the section's selection; `getActiveBufferId()` then gives the left source. The group's tab goes in the active split: with the dock active (split 26), into the dock beside `*Terminal 2*` |
+| m | Closing a group: `closeBufferGroup`, the tab's `×`, Alt+W | Each fires only `buffer_group_closed {group_id, window_id}`; both sources stay in `listBuffers()`. `closeBuffer(id, true)` on each then fires `buffer_closed` for each, with no WARN or ERROR. Closing the sources while the group is open closes the group: `buffer_group_closed`, then two `buffer_closed` |
+| n | Cursor reads in a group | `getPrimaryCursor()`, `getCursorLine()` and `getCursorPosition()` read the panel with the keyboard (line 202 in buffer 7; line 209 in buffer 6 after a click on the left). `getActiveSplitId()` gives the host split (0), not the panel's |
+| o | A second group, then the first closed through its sources | The second stays active, no empty tab is left; its tab is appended at the end of the tab bar, not in the first's place |
+| p | A buffer group into a split that is not active (the dock active, the keyboard in the section) | **No call does it.** `create_buffer_group` shows the group in the active split (`app/buffer_groups.rs:186-205`; no dock redirect in `plugin_dispatch.rs:7038-7060`), `inTabOf` acts only on the active split's own tab, and the group's tab is a `TabTarget::Group` with no buffer id: its split drops out of `listSplits()`/`describeWorkspace()`, its panel buffers list `splits: []`, and `moveBufferToSplit` on a panel buffer moved the bare panel and broke the layout. **`focusSplit(target)`, then `createBufferGroup`, not focusing back:** the group opens in the target, beside its `a.ts (preview)` tab, which stays a preview; the dock is untouched; the target stays active, `getActiveBufferId()` is the left panel's buffer, and `active_buffer_changed {reason:"buffer"}` fires once; the keyboard stays in the section. Focusing back to the dock afterwards fires nothing but promotes the target's preview (`focus_split` → `promote_preview_if_not_in_split`, `app/active_focus.rs:240-243`). Closing the group (`closeBufferGroup` or its `×`) gives the split back its previous tab, a preview still a preview, and leaves the dock alone; the borrowed sources stay open (`buffer_groups.rs:648-656`) |
+| q | Revealing the row's file in the File Explorer when its diff opens, the keyboard in the section (`src/deep/x.ts` in a collapsed `src/`, and `new/c.txt`) | A plain row click reveals nothing, even with `file_explorer.follow_active_buffer` on: the composite has no path. **In one script: `previewFileInSplit(split, abs)`, `showBuffer(composite)`, `dismissPreview()`, with `follow_active_buffer` on** (set for the call with `setSetting` and set back): `src` expands (drawn compacted as `src/deep`), `x.ts` is selected with the unfocused band, the composite stays the active tab, no preview tab is left, and Up still moves the section's selection. Without `dismissPreview` an `x.ts (preview)` tab stays. The status bar then says `Opened <path>`. A deleted file reveals nothing, keeps the explorer's old selection and logs `WARN … Component 'gone.ts' not found in tree`. With the explorer section collapsed the selection moves and shows once it is expanded |
+| r | The same with `executeAction("focus_file_explorer")` instead of the setting | Reveals with the setting off, but the explorer takes the keyboard (`File explorer focused`); `focus_next_sidebar_section` gives it back to the section |
+
+Not probed: a theme key as a marker colour (the code resolves one, `split_rendering/scrollbar.rs:371-386`); a group in several windows (R28); `compareBuffers` with an empty side (P42 b).
+
+### P42: the two-pane diff's build, placement and close (2026-11-25)
+
+Fresh 0.5.9, through the `run-git-sidebar` driver with `GS_DRIVE_DIR=/tmp/gs-p42`, `GS_DRIVE_SESSION=gs-p42`, on the acceptance fixture at 140×40. The probes ran in a helper plugin loaded with `editor.loadPlugin` (`/tmp/gs-p42-scratch/gs_p42_probe.ts`), which runs a script file in its own realm, so handlers and state persist, and logs `active_buffer_changed`, `buffer_closed`, `buffer_group_closed` and `chrome_focus_changed`; the scripts are in `/tmp/gs-p42-scratch/`. Sources: hidden, read-only virtual buffers with one mode, filled with the exact texts. Layout: `{split h .5: {split v: fixed "leftHeader" h1 / scrollable "left"}, {split v: fixed "rightHeader" h1 / scrollable "right"}}`. Decorations as the plan's `paint`: line and span overlays, empty `addVirtualLine` fillers, `setLineIndicators` `-`/`+`, `setScrollbarMarkers` (a range `[from, max(to-1, from)]`, or a point at the seam), `createScrollSyncGroup` on `panelSplits.left/right` with an anchor at each hunk's end.
+
+| # | Check | Result |
+|---|---|---|
+| a | The layout above, A38's 300-line `long.ts` | **Works.** Both headers are drawn by `setPanelContent` (each followed by a separator row); line numbers, TypeScript colours, `-`/`+` gutters and marks on both tracks; PageDown and the wheel keep the sides paired (211↔203 with eleven blank rows facing the deletion) |
+| b | An empty side | `compareBuffers` resolves: empty left → one hunk `left {start 0, count 0, from 0, to 0, jump 0}`, `leftLines 0`; empty right likewise; equal texts → `hunks: []`. A marker at position 0 of an empty buffer draws one cell at the top of its track. **Fillers never render in an empty (zero-byte) buffer**, `above` or not: its pane shows a single empty line `1` and nothing below, no tint. In a non-empty buffer, fillers `above` at byte 0 do render (an add at the top). **With an empty left and the anchor `[0, N]`, the right pane opens scrolled past its last line, blank**, also after `setBufferCursor` on both and `scrollToLineCenter(leftSplit, L, 0)`; a click and Ctrl+Home bring it back. The same group with no anchors (sync group made, `setScrollSyncAnchors` not called), or with no sync group, shows the right side from line 1. An empty right (`[N, 0]`) draws as expected |
+| c | `compareBuffers` on the two hidden sources before `createBufferGroup` | Resolves, with the same hunks |
+| d | Replacing: the old group in split 0, the dock (terminal, split 62) active, the keyboard in the section (Focus). (i) `focusSplit(0)`, create, close the old sources; (ii) `focusBufferGroupPanel(old, "left")`, create, close the old sources | **Both** put the new group in split 0, leave the dock's terminal tab alone, leave no stray tab, and keep the keyboard in the section (no `chrome_focus_changed`; Down moves the section's selection band). (i) fires `active_buffer_changed` for the **old** group's left source first, then for the new one; (ii) fires it once, for the new left source |
+| e | `focusSplit(9999)` + `flush()` | Returns true; `getActiveSplitId()` unchanged; **logs `WARN … Split SplitId(9999) not found`**, which shows a warning count. `listSplits()` is `[]` while the only editor split shows a group (H3) |
+| f | `defineMode(mode, [j→scroll_down, k→scroll_up, Escape, BackTab, Tab, q, n, ], p, [, Enter → handlers], true)` on the sources | `j`/`k` scroll both panes one line, the cursor stays (`Ln 20`). Every other key reaches its handler; `getPrimaryCursor()`/`getCursorLine()` read the focused pane. `focusBufferGroupPanel(g, "right")` from the Tab handler moves the keyboard (the next key's active buffer is the right source), and from BackTab back |
+| g | A command registered with the mode as its context, the group the active tab, the keyboard in the section | Listed in the palette |
+| h | Sources, `compareBuffers`, group, headers, wrap, every decoration, sync and cursors, in one script | 10,000 lines with 500 one-line changes: 353 ms (sources 83, compare 121, group and decorations 64, flush 85). A 5 MiB full rewrite (52,428 changed lines, one hunk): 1.78 s |
+| i | Exact texts | `"a\n"→"a\n\n"`: one hunk, right line 2 (`[1,1]`), a blank row faces it on the left. `"a\nb\n"→"a\nb\nc\n"`: only line 3. `"a"→"a\n"`: one `eolOnly` hunk on line 1, `spans: [null]`. Each pane draws its empty last line (`2 │`, `4 │`); no WARN or ERROR |
+| j | `closeBuffer(left, true)` alone, the group open | `buffer_closed` (both headers), **`buffer_group_closed`, with `getBufferInfo(left)` already null and `getBufferInfo(right)` not null**, then `buffer_closed` (left). The right source stays open until closed |
+| k | `focusSplit(0)` (showing `a.ts`) then `createBufferGroup` with no `flush` between, the dock active, the keyboard in the section | One `active_buffer_changed`, for the new left source; none for `a.ts` |
+| l | A one-panel group (after GATE C): `{split v: fixed "header" h1 / scrollable "<side>" bufferId S}`, S a hidden read-only source with the mode, no decorations, no sync group | **Works.** The header is drawn; with `setLineWrap(S, panelSplits.<side>, false)` a 300-column line is not wrapped. `j`/`k` scroll the pane, the cursor stays; Tab, BackTab and `n` reach their handlers. `closeBuffer(S)` from the `q` handler: `buffer_closed` (header), `buffer_group_closed` (`getBufferInfo(S)` already null), `buffer_closed` (S), and `listBuffers()` is as before. The tab's `×`: `buffer_closed` (header) and `buffer_group_closed` only, S still open until closed. Replacing from the dock with the keyboard in the section, by `focusBufferGroupPanel(old, <its side>)`, create, close the old sources: one-pane → two-pane and two-pane → one-pane each land in split 0, fire one `active_buffer_changed` (the new view's first source), leave the dock alone and the keyboard in the section (Down moves the selection band). No WARN or ERROR |
+
+### P43: review-fix probes, the Graph's reads (2026-11-26)
+
+git 2.50.1 (Apple Git-155) in a fresh `/tmp` repository with `GIT_CONFIG_GLOBAL=/dev/null`; git 2.30.2 in the `buildpack-deps:bullseye-scm` image (`docker run --rm`), and older git from its source at the release tags. (c) is Fresh 0.5.9 through the `run-git-sidebar` driver on the `graph` fixture at 140×40, the explorer shown.
+
+| # | Check | Result |
+|---|---|---|
+| a | `log --topo-order -z --decorate=full --format=%H%x00%P%x00%D%x00%an%x00%s HEAD --`, one subject `fix<US>thing<RS>x` (bytes 0x1F, 0x1E) | Each commit is five fields, each ended by a NUL, the last too; the subject comes out with both bytes as they are, so the old `%x1f`/`%x1e` format split it into six fields and lost the commit. `tests/fixtures/record.sh` re-recorded with this argv gives the old log fixtures byte for byte, with only the separators changed |
+| b | `show --format=fuller --stat --patch --first-parent --root <id> --` against the same with `--diff-merges=first-parent`, on a merge and a root commit, and with `-c log.diffMerges=combined` | Byte-identical; re-recorded `show-*.txt` unchanged. git 2.30.2 has `--diff-merges` but not its `first-parent` value: rc 128, `fatal: unknown value for --diff-merges: first-parent`; with `--first-parent` it prints the merge's first-parent diff, and (a)'s log and `log -1 … HEAD --` beside a `HEAD` file work too. In v2.27.0 and v2.30.0, `builtin/log.c` `show_setup_revisions_tweak` leaves `combine_merges` off when `--first-parent` is given, and `log-tree.c` `log_tree_diff` then diffs a merge against its first parent only; v2.50.1's `show_setup_revisions_tweak` calls `diff_merges_default_to_first_parent` for it |
+| c | The diff hint (R20), 69 characters, the keyboard in a diff | A `.txt` diff: the whole hint shows, 3 columns to spare. A `.ts` diff, whose status bar also shows `TypeScript` and `LSP (off)`: cut after about 52 characters (`… j/k scroll, Enter …`), so a hint ending with `q/Esc close` lost it. With the close keys first: `q/Esc close, n/] next, p/[ prev, Enter file, (S-)Tab…`, only the pane and scroll keys cut |
+
 
 **Ticket.** "Click on file does not open it in tab. Diff numbers near the branch do not show actual changes count (I changed one line in README, it's shown in Changes but the numbers show 0 0)." Added: stage and unstage per file and per group; view file and view diff per file row, the diff side by side (Changes: index vs working tree; Staged: HEAD vs index).
 
@@ -1049,3 +1211,185 @@ Sources: `SRC` paths as above (`app/` is `SRC/fresh-editor/src/app/`), `DTS`, `E
 - Closing an inactive window's diff buffers waits until that window is active again: `closeCompositeBuffer` acts on the active window.
 - Windows on one repository share its write queue, so their writes never hold `.git/index.lock` at once.
 - `authority_changed` restarts a section only when its own window's label changed: the hook also comes on a plain switch between windows with different authorities.
+
+## 12. Follow-up: row cap, diff navigation, graph, push and pull (2026-11-25)
+
+**Ticket.** "Update git-sidebar: increase the Staged and Changes limits to 1000 items each; when I open a file diff, the next and previous change commands do not work there, fix if possible; add a third dropdown, a git graph, working like VS Code's git graph, functional but not overcomplicated; next to the Commit palette command, add Push and Pull." Later: "if push and pull are already implemented natively or in native plugins, skip it", and "for pull and push you could copy the VS Code implementation too".
+
+Sources: `DTS`, `EP`, `SRC` as above; the user's log `~/.local/state/fresh/logs/fresh-server-216.log`; VS Code at `microsoft/vscode` main `45fca7d` (`VS`), and `mhutchie/vscode-git-graph` (`GG`), read with `gh api` (copies in `/tmp/gg_research/`). Live results are §8 P35–P38.
+
+### 12.1 The row cap (high)
+
+- The cap is one constant, `ROW_CAP = 500` (`git-sidebar/lib/view.ts:12`). Stage all already covers paths past it (R16).
+- 1,000 rows per group costs little: a full update of 3,020 nodes takes 23 + 18 ms in the plugin (P36 h).
+- Spec text that names 500 or its consequences: R11, R16, A11, A16, A23 (the 1,200-file repository, `… 700 more`).
+
+### 12.2 Next/Previous Change in the diff (root cause, high)
+
+- **What the user ran.** The palette's **Next Change** and **Previous Change** are the bundled diff_nav plugin's (`diff_nav_next`, `diff_nav_prev`; `EP/diff_nav.ts:200-212`). They have no default key, and the user's `config.json` has no `keybindings`. The user's log shows four `handle_action: PluginAction('diff_nav_next')` while the plugin's diffs (mode `git-sidebar-diff`) were open, at lines 412711, 413042, 413699 and 414375, each followed by `status: No changes`. No WARN or ERROR.
+- **Why they fail.** diff_nav collects its targets from the active buffer only: view state `git_gutter_hunks` (git_gutter's), view state `live_diff_hunks` (live_diff's) and `getBufferSavedDiff` (`EP/diff_nav.ts:43-77`). In a diff tab the active buffer is the composite, which has none of them and no text; its cursor is a separate row (`SRC/fresh-editor/src/app/composite_buffer_actions.rs:340-362`). The two sources are hidden virtual buffers that are never active (P35 b).
+- **Not the plugin's fault alone.** Fresh's own Side-by-Side Diff fails the same way (P35 c). audit_mode's Review Diff moves with its own `n`/`p` handler calling `editor.compositeNextHunk` (`EP/audit_mode.ts:6818-6830`).
+- **What works.** `n`/`]` and `p`/`[` (P25), which are the core's `composite_next_hunk`/`composite_prev_hunk` in the `compositeBuffer` keymap context. Those actions are not in the palette (P35 g).
+- **Fix options.**
+  - a. Palette commands of the plugin's own that call `compositeNextHunk(id)` / `compositePrevHunk(id)` (`DTS:6725,6729`) on the active composite. Works (P35 e). A call at the last hunk does nothing and still returns true, so "no more changes" can only be told by comparing `getCompositeCursorInfo()` before and after, or from the hunks the plugin built.
+  - b. The same through `executeAction("composite_next_hunk")` (P35 f). It works, but depends on an action name.
+  - c. Feeding diff_nav fails (P35 d), and diff_nav could not move a composite cursor anyway.
+  - The plugin cannot rename, hide or override diff_nav's commands, so the palette keeps listing them beside the plugin's.
+- **Contexts.** Listing the new commands only while a plugin diff is active needs a third context; git-sidebar's CLAUDE.md allows only `git-sidebar-rows` and `git-sidebar-shown` today.
+
+### 12.3 A git graph group (high unless noted)
+
+**What VS Code does.**
+- **The built-in Source Control Graph** (`VS/src/vs/workbench/contrib/scm/browser/scmHistory.ts`, `scmHistoryViewPane.ts`; `VS/extensions/git/src/historyProvider.ts`, `git.ts`) is a third collapsible section of the Source Control view, the closest analogue.
+  - A row is graph lanes, the subject, the author (dimmed), then ref badges. Hash, date and stats are in the hover only.
+  - Badges, by default, only for refs with a colour: the current branch, its upstream and the base ref (`scm.graph.badges`: `filter` | `all`).
+  - Nodes: a circle; a double circle for a merge; a ring with a filled centre for HEAD.
+  - Which commits: "Auto" (default) is the current branch, its upstream and its base; also "All" and an explicit list. `git log --topo-order --decorate=full` over those refs, `-n<pageSize>` with `--skip`, page size 50, a "Load More…" row (`git.ts:1514-1570`, `pane.ts:1300-1353`).
+  - Two synthetic rows, "Outgoing Changes" and "Incoming Changes", when HEAD and the upstream differ. No uncommitted-changes row.
+  - Expanding a commit lists its files; a file opens a diff of `parentIds[0]` against the commit, with an empty left side for a root commit (`pane.ts:1004-1021,1110`).
+  - Commit menu: Checkout (detached), Create Branch, Create Tag, Cherry Pick, Compare with…, Copy Commit ID, Copy Commit Message. Title bar: Fetch, Pull, Push, Refresh, Go to Current.
+- **The Git Graph extension** (`GG/src/dataSource.ts`, `GG/web/graph.ts`) is a full-tab table: graph, ref badges and subject, date, author, short hash. It shows every branch (`--branches --tags --remotes HEAD`), date order, 300 commits then 100 at a time, an "Uncommitted Changes (N)" row, a commit-details panel with `git diff --name-status --find-renames <c>^ <c>` (root: `diff-tree --root`), and a large menu (checkout, merge, rebase, reset, revert, branch and tag actions, push, pull).
+
+**The data.**
+- Log: `git log --topo-order -n <N+1> --format=%H%x1f%P%x1f%D%x1f%an%x1f%at%x1f%s%x1e <refs>`. Asking for one more than shown tells whether more exist. "Auto" refs are `HEAD` plus `@{upstream}` when there is one. `--all` would include `refs/stash`.
+- One commit's files: `git diff-tree -r -z --raw -M <c>^1 <c>`; a root commit `git diff-tree --root -r -z --raw -M <c>`. A merge compares with its first parent; plain `diff-tree <merge>` prints nothing. `--raw` gives modes, so a gitlink (160000) can be refused like a directory row.
+- One file's sides: `<c>^1:<orig or path>` and `<c>:<path>`, empty for an added file, a root commit, or a deletion. The plugin's `readSide` already reads any `<rev>:<path>` blob (`lib/git.ts:39-41`, `git_sidebar.ts:747-788`).
+
+**Lanes** (`scmHistory.ts:293-404`). An ordered list of lanes, each waiting for a commit id. For commit `c` in topo order:
+- its node is in the first lane waiting for `c`, or a new lane at the end when none is (a branch tip);
+- that lane now waits for `c`'s first parent; other lanes waiting for `c` end here (they converge into the node);
+- each further parent gets a new lane;
+- a root commit ends its lane. VS Code drops every other lane there too, which breaks with several roots; a re-implementation should keep them.
+VS Code shifts lanes left as soon as one frees, drawing the shift inside the row. In text that needs two glyphs in one cell, so a text port keeps lanes in fixed slots and reuses the first free slot for a new lane (as GG's next free point does). Then a row needs only `●`/`○`, `│`, `─`, `╮`/`╭` for a lane leaving the node, `╯`/`╰` for a lane converging into it, and `┼` where a horizontal crosses a lane. That port is the research agent's proposal, untested.
+
+**What Fresh allows** (P36).
+- One commit per row, lanes aligned when every commit row is at the same depth with `hasChildren: true`; up to six lane colours (`editor.bracket_rainbow_1…6`).
+- Nesting group → commit → file, and `expand` events to load a commit's files when it is expanded.
+- Rows wider than the section end with `…`; badges and lanes keep their colours up to the cut. No width API.
+- Only a full tree update or a tail append (`appendTreeNodes`, `DTS:2942-3005`, rejects duplicate keys and cannot move a "Load more" row). The plugin already does full updates, skipped when the signature is unchanged (`git_sidebar.ts:448-482`).
+- The bundled git_log plugin cannot show a given commit: its handlers take no arguments and it exports no API (`EP/git_log.ts:683-704`). A read-only virtual buffer of `git show` output, named `*<id>:show.diff*`, is coloured as a diff (P36 i).
+- `editor.setClipboard(text)` (`DTS:5440`; the bundled `EP/asm-lsp.ts:109` uses it) copies to the internal and the system clipboards, so Copy Commit ID and Copy Commit Message are possible (corrected at plan time; live in §8 P39 l).
+
+**What a third group touches** (`git-sidebar/`).
+- `lib/view.ts`: `buildTree`, `rowKind`, `groupOf`, `placeOf`, `reconcile` (R10's place: a commit or commit-file row has no group today), the row-cap row, `revealKey`, `signature`, and the `Segment`/`Node` types (no `bg` or `bold` yet).
+- `lib/actions.ts`: `rowAction`, `buttonLabel`, `menuItems`/`MenuChoice`, `paletteTarget` (it tests `entries.has(key)`).
+- `lib/diff.ts`: `sides`, `rowRefusal`, `COMPARISON`/`paneLabels`/`tabTitle` know only staged, changes and conflicted. `sourceName` labels must not hold a `:` (P26). `diffEnter` (R19) maps to the working file's line, which for a commit is only near.
+- `git_sidebar.ts`: the initial `expanded` set, the `expand` handler (lazy loading, with an epoch check after every await), `activate`, `openDiff`, `menuChoose`, and the refresh: a `git log` when HEAD, the upstream or the refs move, inside R11's 25% budget and R28's active-window rule.
+- `lib/git.ts`: argv builders and parsers for `log` and `diff-tree`.
+
+### 12.4 Push and pull (high unless noted)
+
+- **Nothing native.** No push or pull action in 0.5.9's core (`SRC/fresh-core/src/action.rs`; the only git action is `FileExplorerToggleGitignored`), and none among the bundled plugins' commands. `EP/pkg.ts:574` runs `pull --ff-only` on the package index only.
+- **What VS Code runs** (`VS/extensions/git/src/git.ts` ~2601, `repository.ts:2397-2446,2491`, `commands.ts:4059-4175,4386`):
+  - Pull: `git pull --tags <upstream remote> <upstream branch>`, with `--autostash` and `-r` only when their settings are on (both off by default). No `--ff`/`--no-rebase`, so the user's `pull.rebase`/`pull.ff` decide; a diverged branch with neither set gets git's error.
+  - Push: `git push <upstream remote> <head>:<upstream branch>`; no `--follow-tags` outside Sync.
+  - No upstream: push asks to publish, then runs `push -u <remote> <branch>`. One remote is used directly; several give a pick list. No remote: a warning. Detached HEAD: "Please check out a branch to push to a remote."
+  - Credentials: VS Code sets `GIT_ASKPASS` to its own askpass (`askpass.ts:38`); it never relies on a terminal.
+- **No env, no stdin.** `runOnTarget`, `spawnHostProcess` and `spawnProcess` take program, args, cwd and an output target only (`DTS:8221,8232,8846`); the child's stdin is null (`SRC/fresh-editor/src/app/plugin_dispatch.rs:3886`, `services/remote/spawner.rs:285`), but it can open `/dev/tty`, the editor's pane.
+- **So a credential prompt hangs and draws over the editor** (P37 a), and killing the run leaves a helper behind that keeps the handle from settling (P37 b). `env GIT_TERMINAL_PROMPT=0` as argv[0] turns it into a fast failure with git's reason (P37 d); `-c` config cannot (P37 c). ssh needs `BatchMode=yes` and a `ConnectTimeout` (P37 f), through `GIT_SSH_COMMAND` or `-c core.sshCommand=`, either of which replaces a `core.sshCommand` the user has set.
+- **Neither may be killed.** A killed push still lands on the remote, with the local tracking ref left stale (P37 g); a killed pull leaves its fetch running and the merge undone (P37 h), and a kill during the merge risks `index.lock` (P16). Both are writes in R11's sense, and fit `runWrite`/`OpQueue`: never killed, "still running" after 60 s, one at a time with stages and commits. R11 lists only stage, unstage and commit as writes today.
+- **The title follows.** `↑A ↓B` comes from `# branch.ab` (`lib/status.ts:94-96`), and every queued write asks for a refresh when it ends (`lib/stage.ts:337`). After a push `↑` drops without a fetch; `↓` moves only after a fetch, which pull does (P37 i).
+- **Outcomes that need their own message** (P38): no upstream (offer publish), no remote, detached HEAD or a rebase in progress, upstream name mismatch, push rejected (pull first), credentials or connection failures, diverged branches with no pull config, local changes in the way, unmerged files or an unconcluded merge, conflicts after a pull (rc 1 with `CONFLICT` on stdout, then `UU` rows in Changes), and up to date (`Everything up-to-date` on stderr, `Already up to date.` on stdout). Pull with no upstream exits 1, not 128. `--autostash` can exit 0 with conflicts left, so it is not used.
+
+### 12.5 Open
+
+- ~~Whether the graph shows the current branch and its upstream (VS Code's "Auto"), or every branch.~~ The branch and its upstream (spec, decisions).
+- ~~Which commit actions the graph offers.~~ Read-only ones: its files, View Commit, Copy Commit ID and Copy Commit Message (spec R32, R33).
+- ~~ssh host-key and passphrase prompts under `BatchMode=yes` (UNCONFIRMED live, P37).~~ Confirmed against a local sshd: both fail fast, and `SSH_ASKPASS_REQUIRE=force` with `SSH_ASKPASS=false` stops them in a wrapper that drops BatchMode too (P39 a, b).
+- ~~Whether the user's `core.sshCommand` must survive the plugin's ssh options.~~ It does: the plugin resolves git's ssh command itself (`GIT_SSH_COMMAND`, `core.sshCommand`, `GIT_SSH`, `ssh`) and appends the options to it (P39 b, c). A program that is not OpenSSH is left as it is, a documented limit (spec R36).
+- Still open: the plugin cannot learn the section's width, so a long row is cut by the host (P36 f).
+
+## 13. Follow-up: where the diff opens, and change markers (2026-11-25)
+
+**Ticket.** "Update git-sidebar: always open diff in top bar, not in utility dock (e.g. like click on a file in file explorer works); if possible mark changes in the diff view's scroll bar or its area, similar to how VS Code does it, so we do not have to scroll the whole file to see how many changes there are (the whole scroll bar height represents the file; mark the corresponding areas red/green for additions and deletions). Explore Fresh, its official plugins' source and its docs to find the best solution."
+
+Sources: `SRC`, `EP`, `DTS` as above; the docs at `sinelaw/fresh` master (`docs/index.md` and the pages it links, copies in `/tmp/fresh-docs-fetch/`), v0.5.9's `docs/`; the user's log `~/.local/state/fresh/logs/fresh-server-80349.log`. Live results are §8 P41.
+
+### 13.1 The diff opens in the active split, which can be the dock (root cause, high)
+
+- **The utility dock** is an ordinary split leaf tagged `SplitRole::UtilityDock`, at most one per window (`SRC/fresh-editor/src/view/split.rs:68,80`; v0.5.9 `docs/internal/buffers-splits-undo.md:79-84`). Alt+`` ` `` opens a terminal there, splitting the root horizontally at 0.7 and making the new leaf active (`app/action_dispatch.rs:2029-2097`); Alt+J moves the keyboard to and from it (`:579`). Diagnostics, find_references, live_grep, search_replace and code-tour put their panels there through `createVirtualBufferInSplit({role: "utility_dock"})` (`app/plugin_dispatch.rs:4307-4320`). The user's log shows them using it (`Opened terminal TerminalId(1) into new dock leaf LeafId(SplitId(9))`).
+- **`showBuffer` uses the active split, whatever it is** (`app/plugin_commands.rs:1761-1802` → `set_active_buffer`, `app/active_focus.rs:111-160`). So when the dock was the split last used, the section's diff opens there as a tab beside the terminal (P41 a). A non-hidden `createVirtualBuffer` adds its tab to the active split itself (`plugin_dispatch.rs:4118-4207`), so View Commit's tab lands there before `showBuffer` runs. Upstream master is the same.
+- **A file open steers away from the dock.** `open_file_with_kind` calls `redirect_active_split_away_from_dock_if_needed` (`app/file_open_orchestrators.rs:301-325`), which makes the last-focused leaf that is not the dock active, or else the first such leaf in tree order (`app/window/mod.rs:4116-4143`). The File Explorer's click (preview), Enter and double-click all take that path (`app/chrome/file_explorer.rs:83-150,580`; P41 b), and so do the plugin API's `openFile` and `openFileInSplit` (`file_open_orchestrators.rs:265`, `plugin_commands.rs:1660-1687`). So the plugin's View File and Enter in the diff (R7, R19) already avoid the dock.
+- **A plugin cannot ask which leaf is the dock.** `SplitSnapshot` and `PaneDescription` carry no role (`fresh-core/src/api.rs:814-874`; P41 c); the role is write-only, at creation. `PaneDescription.kind` is `"terminal"`, `"file"` or `"virtual"`, and `BufferInfo` has `is_terminal` and `splits` (`DTS:911,964`). While a dock exists the editor leaf survives its last tab being closed (`buffer_close.rs:844-859`), and a sole leaf loses the role (`split.rs:1921-1932`), so some non-dock leaf always exists. The dock is created below the rest, at full width.
+- **Placing a buffer in a split that is not active** (P41 d): `moveBufferToSplit(bufferId, splitId)` (`DTS:6572`; `split_actions.rs:679-733`) and `setSplitBuffer(splitId, bufferId)` (`DTS:7316`; `plugin_commands.rs:1146-1176`) show it there, leave the active split and the keyboard where they were, and call `set_active_buffer` only when the target is the active split. `moveBufferToSplit` also removes the buffer's tab from other panes. Both are queued: `await editor.flush()` before reading the layout back. `focusSplit` + `showBuffer` + `focusSplit` back promotes the target's preview tab (P41 e), and `createVirtualBufferInExistingSplit` first adds a tab to the active split (`plugin_dispatch.rs:4546-4580`).
+- **No bundled plugin has a helper.** audit_mode, live_grep and merge_conflict call `showBuffer` and share the problem. code-tour alone picks a target: the first `describeWorkspace()` pane of `kind === "file"` that is not its own dock leaf, remembered, with `openFile` as the fallback (`EP/code-tour.ts:953-964`).
+- **Windows.** Each window has its own split tree, ids from a per-window counter (`split.rs:1273`), and these calls act on the active window. A remembered split id belongs to its section.
+
+### 13.2 No marks on a composite's scrollbar (high)
+
+- `setScrollbarMarkers`, `setScrollbarMarkersInRange` and `clearScrollbarMarkers` are in 0.5.9 (`DTS:7594-7644`, `ScrollbarMarker` at `DTS:3656`; v0.5.9 `docs/plugins/api/overlays.md:562+`), painted as a coloured `▌` on the track of the split that shows the buffer. git_gutter, live_diff and compare_files use them on file buffers.
+- **A composite's bar is built without marks.** For a composite buffer, `scrollbar_facts.rs:63-78` builds the vertical bar with `BarFacts::plain(scroll_row, composite.row_count(), …)`, and `plain` sets `marks: []` (`view/shell/buffer_host.rs:610-620`); only other buffers go through `resolve_scrollbar_marks`. Markers on the composite collapse to byte 0 (it holds no text), and the hidden sources keep theirs, but no split draws them (`plugin_commands.rs:2165-2218`). Live: P41 f. Upstream master is the same (`scrollbar_facts.rs:63-77` at `36f2588`), and no issue or PR asks for it.
+- **Nothing else drawn from the sources shows in a composite either.** It renders each side from syntax highlighting and its own inline diff; its gutter is a right-aligned line number (`render_composite.rs:147-236,443-455`). Line indicators, overlays and virtual lines on a source are not drawn (P41 g).
+- **What a composite can show.** Each pane's header prints its source's `label` as given (`render_composite.rs` ~130), and the tab its `name`. Counts of added and removed lines, and of changes, could go there, from the hunks the plugin already computes. That tells "how many", not "where".
+
+### 13.3 A diff built as a buffer group (high unless noted)
+
+Fresh's own Compare Files (`EP/compare_files.ts`, v0.5.9, 734 lines; `docs/features/compare-files.md`: "Each difference also gets a mark on the scrollbar") is a VS Code-style two-pane diff with scrollbar marks, built without a composite:
+- `createBufferGroup(name, mode, layout)` (`DTS:9473`): one tab, two scrollable panels side by side (`compare_files.ts:413-423`). Each panel is a real split, so it gets its own scrollbar, gutter and decorations. A leaf may carry the `bufferId` of an existing buffer, so the plugin's hidden read-only sources can be the panels (P41 h). R21's syntax colours still come from the buffer names.
+- `compareBuffers(left, right)` (`DTS:8374`): hunks with each side's byte ranges, each line's range and the intra-line part that differs. It works on read-only virtual buffers (P41 j).
+- Per side: `addOverlay` with `diff_add_bg`/`diff_remove_bg`/`diff_modify_bg` over changed lines and `diff_*_highlight_bg` over the intra-line spans (`compare_files.ts:241-250`); `setLineIndicators` `+`/`-`/`~` (`:302-313`); one `setScrollbarMarkers` mark per hunk, a range over its lines, or a point at the seam on the side that has none (`:291-314`), in `[80,200,120]` added, `[220,160,90]` modified, `[220,90,90]` removed (the same as live_diff's; git_gutter's are `[80,250,123]`, `[255,184,108]`, `[255,85,85]`).
+- Alignment: empty `addVirtualLine` fillers on the shorter side of each hunk (`:267-289`), and `createScrollSyncGroup` + `setScrollSyncAnchors` with an anchor at each hunk's end (`:326-343,469`). Line wrap off in both panels (`:467-468`).
+- Navigation: its own next/previous difference commands (palette, context `compare-active`; Alt+F5 / Shift+Alt+F5 in the global keymap), which set both cursors (`setBufferCursor`) and centre the change (`scrollToLineCenter`) (`:497-565`). Cleanup: on `buffer_group_closed` and `buffer_closed` (`:487-491,692-729`).
+
+All of it works live with the plugin's own sources (P41 h–o): marks on both tracks, fillers, synced scrolling, intra-line highlights, gutter marks, keys bound through the sources' mode, no focus steal. What the composite gives today and a group would need the plugin to do itself:
+- **Alignment** (fillers and anchors) and turning line wrap off (R14 "scroll together").
+- **The keys** (R20): `n`, `p`, `]`, `[`, `q` and Esc are Fresh's only in a composite (`compositeBuffer` context). In a group they do nothing until the plugin binds them in its mode (P41 k), which the plugin's CLAUDE.md now forbids, for the composite's sake.
+- **Next and Previous Change** (R29) on the plugin's own hunk list instead of `compositeNextHunk`.
+- **Enter** (R19) reads the cursor of the panel that has the keyboard (P41 n); a cursor on the left panel must be mapped to the right side through the hunks.
+- **No leftovers** (R14): a group's close fires only `buffer_group_closed` and leaves the borrowed sources open (P41 m), so the plugin closes them on that event.
+- **Two cursors.** Each panel scrolls and has a cursor of its own; a click moves the keyboard between them, and Tab does nothing unless bound.
+- **Placement.** A group's tab goes in the active split too, the dock included (P41 l).
+
+### 13.4 Revealing the file in the File Explorer (high unless noted)
+
+Added to the ticket: "when we press on a changed file and open its diff, focus on it in file explorer".
+
+- **No API reveals or selects a path in the explorer**, in 0.5.9 or on master (`36f2588` adds only `addFileExplorerMenuItem`). `setFileExplorerDecorations` and the slot APIs only decorate. No bundled plugin reveals a file.
+- **What reveals.** The explorer follows the active file only when a *file-backed* buffer lands in the focused pane (`Window::set_pane_buffer`, `app/window/mod.rs:5568-5577` → `follow_file_explorer_to_active_file`, `app/file_explorer.rs:2827-2836`), and only while `file_explorer.follow_active_buffer` is on (default off, `DTS:4670`), the explorer column is shown, the explorer tree does not have the keyboard, and the file is under the window's root (`follow_path_in_explorer`, `:2801-2815`). A section with the keyboard does not count as the explorer (`app/sidebar.rs:558-561`). A virtual or composite buffer has no path (`app/types/buffer_meta.rs:89-93`), so the diff never reveals anything by itself (P41 q). Switching splits does not follow (`app/active_focus.rs:326-327`).
+- **`focus_file_explorer`** (`app/file_explorer.rs:333-348`) reveals the active file without the setting, but it takes the keyboard, shows a hidden explorer, and is an action name, not an API (P41 r).
+- **What works from a plugin** (P41 q): preview the file in the diff's split (`previewFileInSplit`), show the diff, and drop the preview (`dismissPreview`), in one synchronous script, with `follow_active_buffer` on. The keyboard stays in the section and no tab is left. Its costs:
+  - the file is loaded for the preview, as an explorer click loads it (whether that starts a language server is UNCONFIRMED); a file already open is switched to and back;
+  - the status bar says `Opened <path>`, over the plugin's own message;
+  - nothing for a deleted file (and a `WARN` in the log, so skip it), a file outside the window's root, or a hidden explorer column (from code).
+- **Turning the setting on for the call** (`setSetting`) works, but in 0.5.9 `setSetting` is no scoped layer (despite `DTS`): it patches the whole running config (`app/editor_init.rs:2065-2101`), reloads key bindings, and re-applies the active window's menu, tab and status bar visibility from config, undoing a runtime toggle of those bars, twice per click. It is not written to disk.
+
+### 13.5 Options
+
+| | Where the diff opens | Change overview | Cost |
+|---|---|---|---|
+| A | The composite moved off the dock with `moveBufferToSplit` (§13.1) | Counts in the pane labels or the tab title; no marks | Small: a target-split rule, and labels from the hunks already computed |
+| B | The same rule; a group goes there through `focusSplit` (P41 p) | VS Code-like marks on both scrollbars, plus gutter `+`/`-`/`~` | Large: §13.3's list, and R14, R19, R20, R29 and the CLAUDE.md diff-view invariants rewritten |
+
+Either way the plugin has to choose the target split itself (§13.1), and put the view there: a composite with `moveBufferToSplit` (the active split stays as it was) or, like a group, by `focusSplit(target)` first (the target becomes active, as after a file open from the dock; P41 p). The target: the split already showing its diff; else the last split it saw active while that split showed a file (files never open in the dock, so that is close to the host's last-focused non-dock leaf); else the first `describeWorkspace()` pane of kind `"file"`; else the active split.
+
+### 13.6 Open
+
+- ~~**Placing a buffer group in a split that is not active.**~~ Not possible; `focusSplit(target)` before `createBufferGroup` puts it there and leaves the target active, as a file open from the dock does, with the keyboard still in the section and no preview promoted (P41 p). ~~Not probed: replacing a group already in the target~~: `focusBufferGroupPanel(old, "left")` or `focusSplit(<its split>)`, then the new group, then the old sources closed, both work; the first fires one `active_buffer_changed`, the second also one for the old group (P42 d). With no `flush` between `focusSplit` and the creation, the target's own tab is not announced (P42 k). Not probed: a preview tab in a third split (by the code, `focusSplit` promotes a preview in any split it leaves).
+- ~~**An empty side (P42 b).**~~ Fillers do not render in a zero-byte buffer, and an anchor `[0, N]` for an empty left side opens the right pane scrolled past its end, blank, even after the cursors are set and centred. Decided at GATE C: a diff with an empty side is one plain pane of the other side (spec R38 "One side"), a one-panel group with no sync group, which works (P42 l).
+- **Which sources a group's close left open** (P42 j): when `buffer_group_closed` comes from a source's close, `getBufferInfo` is already null for that source and not for the other.
+- **Events after a placement that is not active (UNCONFIRMED).** `moveBufferToSplit` into a split that is not active fires no `active_buffer_changed` (only `set_active_buffer` announces one, by code). The diff's key hint (`hintFor`), auto-reveal (R23) and the `DIFF_MODE` commands' listing (R29) rely on the active buffer; they may act only once the user clicks into the diff.
+- **The target rule is a guess at the host's** (UNCONFIRMED in odd layouts): with no file shown anywhere, or a user's own horizontal split under a single pane, it cannot tell such a split from the dock.
+
+### 13.7 Host behaviour the two-pane diff relies on
+
+Gathered while planning the diff follow-up, from Fresh v0.5.9's source (`SRC`; a bare file name is under `fresh-editor/src/`), the type file (`DTS`) and §8's probes. The plugin's code and tests cite them as H1–H17.
+
+| # | Behaviour | Evidence |
+|---|---|---|
+| H1 | `createBufferGroup(name, mode, layoutJson)` shows one tab in the **active** split; scrollable leaves with `bufferId` borrow hidden read-only virtual buffers, which keep their own mode; returns `{groupId, panels, panelSplits}` (nested leaves included) | P41 h, l, p; `buffer_groups.rs:186-205,265-281` |
+| H2 | `focusSplit(target)` then create (no focus back) puts the group in `target`, keeps the keyboard in the section, promotes no preview in `target`, fires one `active_buffer_changed` | P41 p |
+| H3 | `getActiveSplitId()` gives the host split while a panel is focused; `listSplits`/`describeWorkspace` omit a split showing a group tab | P41 n, p; `plugin_dispatch.rs:7293,7546` |
+| H4 | Closing a borrowed source closes its group: `buffer_closed` (owned headers) → `buffer_group_closed` → `buffer_closed` (source). User close (× / Close Tab) or `closeBufferGroup` fires only `buffer_group_closed` and leaves sources open. A window close fires only `buffer_closed`s. `closeBufferGroup` acts on the active window's per-window ids | P41 m; `buffer_close.rs:202,340`; `buffer_groups.rs:598,716`; `window_actions.rs:1494-1503` |
+| H5 | `compareBuffers(l, r)` → `CompareResult` (`hunks[{left,right,eolOnly}]`, side `{start,count,from,to,jump,lines,spans}`), byte offsets; empty side = `count:0`; equal → `hunks:[]`; rejects if a buffer is binary, too large, or not in the active window | P41 j; `plugin_commands.rs:3072-3150`; `fresh-core/src/diff.rs:229,443,622` |
+| H6 | Overlays, `addVirtualLine` fillers, `setLineIndicators`, `setScrollbarMarkers` (RGB; `position`/`end`) draw in panels; `createScrollSyncGroup(id, leftSplit, rightSplit)` + `setScrollSyncAnchors(id, [[lEnd, rEnd]…])` keep them aligned (anchors in 0-based buffer lines, one per hunk end) | P41 i, j; INV §13.3 |
+| H7 | Borrowed panels inherit `editor.line_wrap` (on by default) → `setLineWrap(buf, panelSplit, false)` each | `buffer_groups.rs:535-546` |
+| H8 | A panel's scrollbar track counts buffer lines only (fillers not counted), so each pane scales marks to its own length | `split_rendering/scrollbar.rs:85-97,202-220` |
+| H9 | `defineMode` bindings beat Fresh defaults; key names `Escape`, `BackTab`; a binding may name a built-in action (`scroll_down`/`scroll_up` scroll the focused pane and its sync partner without moving the cursor) | P41 k; `input/keybindings.rs:2368-2379`; `plugin_commands.rs:2552`; `window/mod.rs:5419-5478` |
+| H10 | Fixed leaf `{type:"fixed", id, height:1}` inside a vertical split gets an owned, unfocusable, non-scrolling buffer, written with `setPanelContent(groupId, id, entries)` | `buffer_groups.rs:404-431,565-585`; `audit_mode.ts:7436-7441`, `git_log.ts:175-189` |
+| H11 | `getPrimaryCursor()`/`getCursorLine()` read the focused panel; `setBufferCursor(buf, byte)` and `scrollToLineCenter(split, buf, line)` move/centre | P41 k, n |
+| H12 | A terminal buffer has a path (its scrollback file), so `getBufferPath` ≠ `""` does not mean a file. `getBufferInfo(id).is_virtual` is true for terminals and plugin buffers, false for files | `app/terminal.rs:563-567`; `DTS:900-912` |
+| H13 | A scroll sync group is removed automatically when either pane closes; its id must be unique **per plugin** (split ids repeat across windows) | `DTS:7795-7801`; `view/scroll_sync.rs:310-323` |
+| H14 | `closeBuffer` on an id already closed logs `ERROR Failed to close buffer` (bumps the warning count, §8 P29) | `app/plugin_commands.rs:1815-1821` |
+| H15 | `BufferInfo.splits` lists only splits where the buffer is the visible tab | `view/split.rs:1749-1756` |
+| H16 | Hooks such as `active_buffer_changed` come from a once-per-frame focus announcement, only when the (window, buffer) changes; `focusSplit` fires none itself. A frame between `focusSplit` and the group's creation announces the target's own tab | `app/active_focus.rs:288-322`; `focus_announcer.rs:107-185` |
+| H17 | `compareBuffers` splits lines keeping their `\n` (`split_inclusive`), so the texts compared must be the exact file texts, not ones with the final newline dropped | `fresh-core/src/diff.rs:443-445` |

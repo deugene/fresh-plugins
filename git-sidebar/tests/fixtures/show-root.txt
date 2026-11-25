@@ -1,0 +1,18 @@
+commit 8b09465714b8cd7889fbc521538c99c342bc6457
+Author:     fixture <fixture@example.invalid>
+AuthorDate: Thu Jan 1 00:00:06 2026 +0000
+Commit:     fixture <fixture@example.invalid>
+CommitDate: Thu Jan 1 00:00:06 2026 +0000
+
+    c1
+---
+ c1.txt | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/c1.txt b/c1.txt
+new file mode 100644
+index 0000000..ae93045
+--- /dev/null
++++ b/c1.txt
+@@ -0,0 +1 @@
++c1

@@ -5,8 +5,10 @@ import { deferred, FakeEditor, panelOf, type ProcCall, type ProcOutcome, type Pr
 import { rowKind, UNKNOWN_NOTICE, VOLUME_NOTICE, type TreeSpec } from "../lib/view.ts";
 import { NOT_SHOWN, NOTHING_SELECTED } from "../lib/actions.ts";
 import { DIFF_HINT } from "../lib/diff.ts";
+import { diffLayout } from "../lib/diff_view.ts";
 import { COMMIT_BUSY } from "../lib/stage.ts";
-import { fixture, GS_VOLUME, H, inspectResult, manyUntracked, mod, pathsOf, pwdResult, raw, texts, untracked } from "./helpers.ts";
+import { fixture, GS_VOLUME, H, inspectResult, manyUntracked, mod, pathsOf, pwdResult, raw, recorded, texts, untracked } from "./helpers.ts";
+import { parseLog } from "../lib/history.ts";
 
 const ACCEPTANCE = fixture("acceptance");
 const BIND_PWD = pwdResult("/workspaces/repo");
@@ -40,6 +42,30 @@ interface Repo {
   /** What the summary read after a commit (`log -1 … HEAD`) gives: by
    *  default `abc1234` and the last commit's message, with rc 0. */
   headLog?: ProcOutcome;
+  /** The Graph's log (`log --topo-order …`): by default no commits
+   *  (`NO_COMMITS_LOG`). */
+  log?: ProcOutcome;
+  /** The upstream's id (`rev-parse --verify -q @{upstream}`): by default a
+   *  fixed id. */
+  upstreamId?: ProcOutcome;
+  /** A commit's files (`diff-tree`), `show` and message (`log -1
+   *  --format=%B`), by the commit's id; others fail (rc 128). */
+  trees?: Record<string, ProcOutcome>;
+  shows?: Record<string, ProcOutcome>;
+  messages?: Record<string, ProcOutcome>;
+  /** The branch's upstream (`for-each-ref … %(upstream:remotename)…`): by
+   *  default `origin` and `refs/heads/main`. */
+  upstreamRef?: ProcOutcome;
+  /** `git remote`: by default `origin`. */
+  remotes?: ProcOutcome;
+  /** The branch checked out when a pull runs (`symbolic-ref -q HEAD`): by
+   *  default the status's `branch.head`, rc 1 when it is detached. */
+  headRef?: () => ProcOutcome;
+  /** `config --get core.sshCommand`: by default not set (rc 1). */
+  sshConfig?: ProcOutcome;
+  /** A pull or push (`env … git pull|push …`): by default rc 0, nothing
+   *  printed. */
+  onRemote?: (c: ProcCall) => ProcOutcome | void;
 }
 
 /** The acceptance fixture's objects the diffs read. */
@@ -58,15 +84,40 @@ const oidOf = (spec: string): string => createHash("sha1").update(spec).digest("
 /** The spec an object id stands for in `repo` (the argument itself if none). */
 const specOf = (repo: Repo, arg: string): string => Object.keys(repo.blobs ?? {}).find((s) => oidOf(s) === arg) ?? arg;
 
+/** The Graph's log by default: one the parser finds no commit in, so the
+ *  Graph draws no rows and a test sees only the status's. A stand-in, not
+ *  what git prints: never "", which with rc 0 is output that was not UTF-8,
+ *  a failed log (INV §8 P17). */
+const NO_COMMITS_LOG: ProcOutcome = { code: 0, stdout: "\n", stderr: "" };
+
 function repoScript(repo: Repo): (c: ProcCall) => ProcOutcome {
   let lastMessage = "";
   return (c) => {
     if (c.program === "docker") return repo.inspect ?? { code: 1, stdout: "", stderr: "no such container" };
     if (c.program === "pwd") return repo.pwd ?? BIND_PWD;
+    if (c.program === "env") return repo.onRemote?.(c) ?? { code: 0, stdout: "", stderr: "" };
     if (c.program !== "git") return { code: 127, stdout: "", stderr: "unknown program" };
+    // Pull and Push's reads (R34, R35).
+    if (c.args[1] === "for-each-ref") return repo.upstreamRef ?? { code: 0, stdout: "origin\0refs/heads/main\n", stderr: "" };
+    if (c.args[1] === "remote") return repo.remotes ?? { code: 0, stdout: "origin\n", stderr: "" };
+    if (c.args[1] === "config") return repo.sshConfig ?? { code: 1, stdout: "", stderr: "" };
+    if (c.args[1] === "symbolic-ref") {
+      if (repo.headRef !== undefined) return repo.headRef();
+      const head = /# branch\.head ([^\0]*)\0/.exec(repo.status)?.[1];
+      return head === undefined || head === "(detached)" ? { code: 1, stdout: "", stderr: "" } : { code: 0, stdout: `refs/heads/${head}\n`, stderr: "" };
+    }
     // A commit is a write too, without the flag (INV §8 P30).
     if (c.args[0] === "commit") lastMessage = c.args[3] ?? "";
     if (c.args[0] === "--literal-pathspecs" || c.args[0] === "commit") return repo.onWrite?.(c) ?? { code: 0, stdout: "", stderr: "" };
+    // The Graph's reads (R30–R33).
+    // The id is the last revision, before the `--` that ends them.
+    const lastRev = c.args.at(-1) === "--" ? c.args.at(-2)! : c.args.at(-1)!;
+    const byId = (m: Record<string, ProcOutcome> | undefined): ProcOutcome => m?.[lastRev] ?? { code: 128, stdout: "", stderr: "fatal: bad object" };
+    if (c.args[1] === "log" && c.args.includes("--topo-order")) return repo.log ?? NO_COMMITS_LOG;
+    if (c.args[1] === "log" && c.args.includes("--format=%B")) return byId(repo.messages);
+    if (c.args[1] === "rev-parse" && c.args.includes("--verify")) return repo.upstreamId ?? { code: 0, stdout: `${"9".repeat(40)}\n`, stderr: "" };
+    if (c.args[1] === "diff-tree") return byId(repo.trees);
+    if (c.args[1] === "show") return byId(repo.shows);
     if (c.args[1] === "log") return repo.headLog ?? { code: 0, stdout: `abc1234\n${lastMessage}\n`, stderr: "" };
     if (c.args[0] === "rev-parse" && c.args[1] !== "--show-toplevel") {
       const spec = c.args[1];
@@ -131,6 +182,9 @@ const listedNow = () => [...fake.palette()].filter(([, listed]) => listed).map((
 /** A click on a row body, as the host reports it for a file row. */
 const click = (index: number, key: string) => fake.widget("select", { index, key, via: "click" });
 const statuses = () => fake.named("setStatus").map((c) => c.args[0] as string);
+/** Every `git status` run so far. Each refresh also reads the upstream's
+ *  id for the Graph, and its log when HEAD or the upstream moved (R30). */
+const statusRuns = () => fake.gitCalls().filter((p) => p.args.includes("status"));
 /** The argv of every git write (`--literal-pathspecs …`, or `commit …`) so far. */
 const writeCalls = () => fake.gitCalls().filter((p) => p.args[0] === "--literal-pathspecs" || p.args[0] === "commit");
 const writes = () => writeCalls().map((p) => p.args);
@@ -148,21 +202,42 @@ const resolved = () =>
     .filter((p) => p.args[0] === "rev-parse" && p.args[1] !== "--show-toplevel")
     .map((p) => p.args[1]);
 const vbufOpts = () => fake.named("createVirtualBuffer").map((c) => c.args[0] as { name: string; entries: { text: string }[]; [k: string]: unknown });
-const compositeOpts = () =>
-  fake.named("createCompositeBuffer").map((c) => c.args[0] as { name: string; mode: string; sources: { bufferId: number; label: string; editable: boolean }[]; layout: { type: string } });
+/** Every diff group made: its tab title, its mode and its layout (R38). */
+const groupOpts = () => fake.named("createBufferGroup").map((c) => ({ name: c.args[0] as string, mode: c.args[1] as string, layout: JSON.parse(c.args[2] as string) as unknown }));
+/** The last diff group made, as the fake keeps it. */
+const lastGroup = () => fake.groupsMade.at(-1)!;
+/** The last diff's panes: each side's text, null where it has no pane (R38
+ *  "One side"). */
+function lastPanes(): { left: string | null; right: string | null } {
+  const g = lastGroup();
+  const text = (side: string) => (g.panels[side] === undefined ? null : (fake.textOf(g.panels[side]) ?? null));
+  return { left: text("left"), right: text("right") };
+}
+/** Calls of `name` on buffer `id` (the first argument), their other arguments. */
+const callsOn = (name: string, id: number) => fake.named(name).filter((c) => c.args[0] === id).map((c) => c.args.slice(1));
+/** Every decoration call a two-pane diff makes (R38, R39). */
+const DECORATIONS = ["compareBuffers", "addOverlay", "addVirtualLine", "setLineIndicators", "setScrollbarMarkers", "createScrollSyncGroup", "setScrollSyncAnchors"];
+const decorationCalls = () => fake.calls.filter((c) => DECORATIONS.includes(c.name));
 const shownBuffers = () => fake.named("showBuffer").map((c) => c.args[0] as number);
 /** Each source's text, left then right, of every view built. */
 const sourceTexts = () => vbufOpts().map((o) => o.entries.map((e) => e.text).join(""));
 
 /** Every git run is a lock-free read, a write with literal paths (R11,
- *  R15), or a commit, which names no paths and must not export the flag to
- *  hooks (R26, INV §8 P30). With windows, no git or docker starts outside
+ *  R15), a commit, which names no paths and must not export the flag to
+ *  hooks (R26, INV §8 P30), or a pull or push run through `env` (R36). With windows, no git or docker starts outside
  *  the active window's folder (R28); `pwd` runs in the container, with no
  *  cwd. */
 function assertProcsAllowed(): void {
   for (const p of fake.allProcs.filter((x) => x.program === "git")) {
     assert.ok(["--no-optional-locks", "rev-parse", "--literal-pathspecs", "commit"].includes(p.args[0]), p.args.join(" "));
     if (p.args[0] === "commit") assert.ok(!p.args.includes("--literal-pathspecs"), p.args.join(" "));
+  }
+  // `env` runs only a pull or push: assignments, then git, then the write
+  // (R34–R36).
+  for (const p of fake.allProcs.filter((x) => x.program === "env")) {
+    const g = p.args.indexOf("git");
+    assert.ok(g > 0 && p.args.slice(0, g).every((a) => /^[A-Z_]+=/.test(a)), p.args.join(" "));
+    assert.ok(["pull", "push"].includes(p.args[g + 1]), p.args.join(" "));
   }
   if (fake.windows !== null) {
     for (const p of fake.allProcs.filter((x) => x.program !== "pwd")) {
@@ -172,11 +247,20 @@ function assertProcsAllowed(): void {
   }
 }
 
+/** Nothing the host would log above debug: no buffer closed twice (H14,
+ *  `Failed to close buffer`), no `focusSplit` on a split that is gone (P42
+ *  e). */
+function assertHostQuiet(): void {
+  assert.deepEqual(fake.errors, [], "host errors");
+  assert.deepEqual(fake.warnings, [], "host warnings");
+}
+
 /** A fresh editor for a second scenario within one test. The first
  *  scenario's runs are checked as `afterEach` checks the last one's. */
 function restartFake(): void {
   fake.uninstall();
   assertProcsAllowed();
+  assertHostQuiet();
   fake = new FakeEditor();
   fake.install();
 }
@@ -193,6 +277,7 @@ afterEach(() => {
   fake.uninstall();
   assert.deepEqual(rejections, [], "unhandled rejections");
   assertProcsAllowed();
+  assertHostQuiet();
 });
 
 test("load: placeholder mounted at once, then the real title; both options on every mount", async () => {
@@ -200,8 +285,8 @@ test("load: placeholder mounted at once, then the real title; both options on ev
   // Synchronous mount at load (INV §8 P2): before any git call.
   assert.equal(mounts().length, 1);
   assert.equal(lastMount().title, "Git");
-  assert.deepEqual(texts(lastMount().spec), ["Staged Changes", "Changes"]);
-  assert.deepEqual(lastMount().spec.expandedKeys, ["g:s", "g:c"], "both groups expanded");
+  assert.deepEqual(texts(lastMount().spec), ["Staged Changes", "Changes", "Graph"]);
+  assert.deepEqual(lastMount().spec.expandedKeys, ["g:s", "g:c", "g:g"], "all three groups expanded (R3)");
   assert.equal(fake.gitCalls().length, 0);
   await fake.advance(200);
   assert.equal(mounts().length, 2);
@@ -249,7 +334,9 @@ test("a save refreshes; an identical result makes zero widget calls", async () =
   fake.clear();
   await fake.emit("after_file_save", { buffer_id: 1, path: "/repo/b.md" });
   await fake.advance(1000);
-  assert.equal(fake.gitCalls().length, 1);
+  assert.equal(statusRuns().length, 1);
+  // The Graph reads its upstream's id, and no log: nothing moved (R30).
+  assert.deepEqual(fake.gitCalls().filter((p) => !p.args.includes("status")).map((p) => p.args[1]), ["rev-parse"]);
   assert.deepEqual(fake.widgetCalls(), []);
   // 30 s of polling with nothing changing: still no widget calls (R10).
   await fake.advance(30_000);
@@ -325,7 +412,7 @@ test("branch change: remount with all options, then push expansion and selection
   assert.equal(m.length, 1);
   assert.equal(m[0].title, "Git · other");
   assert.equal(m[0].spec.selectedIndex, 1);
-  assert.deepEqual(m[0].spec.expandedKeys, ["g:s"]);
+  assert.deepEqual(m[0].spec.expandedKeys, ["g:s", "g:g"]);
   assertEveryMountHasOptions();
   const names = fake.widgetCalls().map((c) => c.name);
   // No "focus": the host's focus shows a hidden explorer column and expands
@@ -333,7 +420,7 @@ test("branch change: remount with all options, then push expansion and selection
   // keyboard by itself (R1, R22).
   assert.deepEqual(names, ["mountSidebarSection", "widgetMutate", "widgetMutate"]);
   assert.deepEqual(mutations(), [
-    { kind: "setExpandedKeys", widgetKey: "git", keys: ["g:s"] },
+    { kind: "setExpandedKeys", widgetKey: "git", keys: ["g:s", "g:g"] },
     { kind: "setSelectedIndex", widgetKey: "git", index: 1 },
   ]);
   assert.equal(fake.named("floatingPanelControl").length, 0);
@@ -371,13 +458,14 @@ test("Enter on a file row opens its diff, never the file; Space stages it; Enter
   fake.files.add("/repo/b.md");
   fake.contents.set("/repo/b.md", "# b\nchanged\n");
   fake.clear();
-  // gone.ts is deleted: its diff has an empty right side, and no buffer opens the file.
+  // gone.ts is deleted: its right side is empty, so its diff is one pane,
+  // the staged version (R38 "One side"), and no buffer opens the file.
   await fake.widget("activate", { index: 6, key: "c:gone.ts" });
   await fake.advance(50);
-  assert.deepEqual(sourceTexts(), ["export const gone = 1;", ""]);
+  assert.deepEqual(lastPanes(), { left: "export const gone = 1;\n", right: null });
   await fake.widget("activate", { index: 5, key: "c:b.md" });
   await fake.advance(50);
-  assert.deepEqual(sourceTexts().slice(2), ["# b", "# b\nchanged"]);
+  assert.deepEqual(lastPanes(), { left: "# b\n", right: "# b\nchanged\n" });
   assert.equal(fake.named("openFile").length, 0);
   // Each diff names its keys (R20), and nothing else is said.
   assert.deepEqual(statuses(), [DIFF_HINT, DIFF_HINT]);
@@ -391,8 +479,8 @@ test("Enter on a file row opens its diff, never the file; Space stages it; Enter
   await fake.widget("activate", { index: 3, key: "g:c" });
   await fake.widget("activate", { index: 3, key: "g:c" });
   assert.deepEqual(mutations(), [
-    { kind: "setExpandedKeys", widgetKey: "git", keys: ["g:s"] },
-    { kind: "setExpandedKeys", widgetKey: "git", keys: ["g:s", "g:c"] },
+    { kind: "setExpandedKeys", widgetKey: "git", keys: ["g:s", "g:g"] },
+    { kind: "setExpandedKeys", widgetKey: "git", keys: ["g:s", "g:g", "g:c"] },
   ]);
   fake.clear();
   await fake.widget("activate", { index: 0, key: "more:c" });
@@ -558,7 +646,7 @@ test("cancel (the window closed): no git and no mounts ever again", async () => 
   repo.statusOutcome = () => pending.outcome;
   await fake.emit("after_file_save", {});
   await fake.advance(500);
-  assert.equal(fake.gitCalls().length, 3);
+  assert.equal(statusRuns().length, 2);
   await fake.widget("cancel");
   fake.clear();
   pending.resolve({ code: 0, stdout: raw({ records: [untracked("late.txt")] }), stderr: "" });
@@ -591,7 +679,7 @@ test("seeds: every spec carries the current selection and expansion; every mount
   const repo: Repo = { status: ACCEPTANCE, code: 0 };
   await load(repo);
   // The placeholder mount pushes the expansion too.
-  assert.deepEqual(mutations(), [{ kind: "setExpandedKeys", widgetKey: "git", keys: ["g:s", "g:c"] }]);
+  assert.deepEqual(mutations(), [{ kind: "setExpandedKeys", widgetKey: "git", keys: ["g:s", "g:c", "g:g"] }]);
   await fake.advance(200);
   await fake.widget("expand", { index: 0, key: "g:s", expanded: false });
   await fake.widget("select", { index: 5, key: "c:b.md" });
@@ -601,7 +689,7 @@ test("seeds: every spec carries the current selection and expansion; every mount
   await fake.advance(1000);
   assert.equal(fake.named("updateFloatingWidget").length, 1);
   assert.equal(lastShown().selectedIndex, 5);
-  assert.deepEqual(lastShown().expandedKeys, ["g:c"]);
+  assert.deepEqual(lastShown().expandedKeys, ["g:c", "g:g"]);
   assert.deepEqual(mutations(), [], "the index did not move");
 });
 
@@ -657,7 +745,7 @@ test("trust_changed during a first run: the stale run's failure does not cancel 
   blocked.resolve({ code: -1, stdout: "", stderr: "denied by workspace trust" });
   await fake.advance(1000);
   assert.equal(sectionUnmounts().length, 0);
-  assert.equal(fake.gitCalls().length, 3, "the retry ran");
+  assert.equal(statusRuns().length, 2, "the retry ran");
   assert.equal(lastMount().title, "Git · main ↑1 ↓0");
   assert.ok(hasFileRows(lastShown()));
   assertEveryMountHasOptions();
@@ -677,7 +765,7 @@ test("an unchanged status output is not parsed or rebuilt; a changed one updates
   fake.clear();
   await fake.emit("after_file_save", {});
   await fake.advance(1000);
-  assert.equal(fake.gitCalls().length, 1);
+  assert.equal(statusRuns().length, 1);
   assert.equal(signatures(), 0, "no tree built");
   assert.deepEqual(fake.widgetCalls(), []);
   repo.status = raw({ records: [untracked("new.txt")] });
@@ -685,7 +773,7 @@ test("an unchanged status output is not parsed or rebuilt; a changed one updates
   await fake.advance(1000);
   assert.ok(signatures() > 0);
   assert.equal(fake.named("updateFloatingWidget").length, 1);
-  assert.deepEqual(texts(lastShown()), ["Staged Changes 0", "Changes 1", "U new.txt"]);
+  assert.deepEqual(texts(lastShown()), ["Staged Changes 0", "Changes 1", "U new.txt", "Graph"]);
 });
 
 test("authority_changed: a click waits for the mode; palette View File still opens the file (root kept)", async () => {
@@ -712,8 +800,8 @@ test("directory rows (nested repository, submodule) give a status message, never
   fake.files.add("/repo/sub");
   fake.files.add("/repo/vendor/lib/");
   fake.files.add("/repo/vendor/lib");
-  assert.deepEqual(lastShown().itemKeys, ["g:s", "g:c", "c:sub", "c:vendor/lib/"]);
-  assert.deepEqual(texts(lastShown()).slice(2), ["M sub", "U lib  vendor"]);
+  assert.deepEqual(lastShown().itemKeys, ["g:s", "g:c", "c:sub", "c:vendor/lib/", "g:g"]);
+  assert.deepEqual(texts(lastShown()).slice(2), ["M sub", "U lib  vendor", "Graph"]);
   fake.clear();
   // Click, Enter and View File: a message each, and no git, buffer or file.
   await click(2, "c:sub");
@@ -740,7 +828,7 @@ test("a root file named `~more` in an overflowing group has its own key and open
   fake.contents.set("/repo/~more", "m\n");
   await click(2, "c:~more");
   await fake.advance(50);
-  assert.deepEqual(sourceTexts(), ["", "m"], "untracked: empty left side");
+  assert.deepEqual(lastPanes(), { left: null, right: "m\n" }, "untracked: one pane, the file");
   await fake.command("Git Sidebar: View File");
   assert.deepEqual(fake.named("openFile").map((c) => c.args[0]), ["/repo/~more"]);
 });
@@ -876,13 +964,13 @@ test("a deleted file whose path is now a directory: an empty right side, and Vie
   await fake.advance(200);
   fake.dirs.add("/repo/docs");
   fake.clear();
-  // Not refused as binary: the right side is empty (INV §9.4).
+  // Not refused as binary: the right side is empty (INV §9.4), so one pane.
   await click(2, "c:docs");
   await fake.advance(50);
-  assert.deepEqual(sourceTexts(), ["was a file", ""]);
+  assert.deepEqual(lastPanes(), { left: "was a file\n", right: null });
   assert.deepEqual(statuses(), [DIFF_HINT]);
-  // An empty side needs no line diff: the host is not sent the other side for it.
-  assert.equal(fake.named("computeLineDiff").length, 0);
+  // An empty side needs no line diff (R38 "One side").
+  assert.equal(fake.named("compareBuffers").length, 0);
   await fake.command("Git Sidebar: View File");
   assert.equal(fake.named("openFile").length, 0);
   assert.deepEqual(statuses(), [DIFF_HINT, "docs is a directory"]);
@@ -940,35 +1028,64 @@ test("a click on a file row opens one read-only side-by-side diff, never the fil
   assert.deepEqual(resolved(), [":0:b.md"]);
   assert.ok(fake.gitCalls().filter((p) => p.args.includes("cat-file")).every((p) => p.args.at(-1) === oidOf(":0:b.md")));
   assert.equal(fake.named("createVirtualBuffer").length, 2);
-  assert.equal(fake.named("createCompositeBuffer").length, 1);
+  assert.equal(groupOpts().length, 1);
   assert.equal(fake.named("openFile").length, 0);
-  // Read-only sources, hidden from the tabs; the trailing newline dropped.
+  // Read-only sources in the diff's mode, hidden from the tabs.
   for (const o of vbufOpts()) {
     assert.equal(o.readOnly, true);
     assert.equal(o.editingDisabled, true);
     assert.equal(o.hiddenFromTabs, true);
+    assert.equal(o.mode, "git-sidebar-diff");
   }
-  assert.deepEqual(sourceTexts(), ["# b", "# b\nchanged"]);
+  // The exact texts: `compareBuffers` keeps each line's newline (H17).
+  assert.deepEqual(sourceTexts(), ["# b\n", "# b\nchanged\n"]);
   // No space after the `:`: Fresh picks the grammar from the text after it (R21, INV §8 P26).
   assert.deepEqual(vbufOpts().map((o) => o.name), ["*Staged:b.md*", "*Working tree:b.md*"]);
-  const c = compositeOpts()[0];
-  assert.equal(c.name, "b.md (staged ↔ working tree)");
-  assert.equal(c.mode, "git-sidebar-diff");
-  assert.equal(c.layout.type, "side-by-side");
-  assert.deepEqual(c.sources.map((x) => [x.label, x.editable]), [["Staged", false], ["Working tree", false]]);
+  // One tab of two panes, each source borrowed under its header (R38).
+  const g = lastGroup();
+  const [left, right] = [g.panels.left, g.panels.right];
+  assert.deepEqual(groupOpts()[0], { name: "b.md (staged ↔ working tree)", mode: "", layout: JSON.parse(diffLayout(left, right)) });
+  assert.deepEqual(fake.named("setPanelContent").map((c) => c.args), [
+    [g.id, "leftHeader", [{ text: " Staged" }]],
+    [g.id, "rightHeader", [{ text: " Working tree" }]],
+  ]);
+  // Unwrapped (H7), and scrolled together (R38 "Together").
+  assert.deepEqual(fake.named("setLineWrap").map((c) => c.args), [
+    [left, g.panelSplits.left, false],
+    [right, g.panelSplits.right, false],
+  ]);
+  assert.deepEqual(fake.named("compareBuffers").map((c) => c.args), [[left, right]]);
+  assert.deepEqual(fake.named("createScrollSyncGroup").map((c) => c.args.slice(1)), [[g.panelSplits.left, g.panelSplits.right]]);
   assert.ok(fake.named("defineMode").length === 0, "the mode is defined once, at load");
-  // Shown once; the composite and its two sources are the plugin's only buffers.
-  assert.equal(shownBuffers().length, 1);
-  assert.equal(fake.openBuffers().size, 3);
-  assert.ok(fake.openBuffers().has(shownBuffers()[0]));
+  // The two sources and the group's two headers are the only buffers.
+  assert.deepEqual(fake.openBuffers(), new Set([left, right, ...g.owned]));
+  assert.equal(fake.activeBuffer, left, "the diff is the active tab");
   // The hint, once the view is shown (R20).
   assert.deepEqual(statuses(), [DIFF_HINT]);
-  assert.ok(fake.calls.findIndex((x) => x.name === "setStatus") > fake.calls.findIndex((x) => x.name === "showBuffer"));
+  assert.ok(fake.calls.findIndex((x) => x.name === "setStatus") > fake.calls.findIndex((x) => x.name === "createBufferGroup"));
 });
 
-test("the diff mode is defined at load, read-only, binding Enter only: Fresh's n, p, ], [, q and Esc fall through (R19, R20)", async () => {
+test("the diff mode is defined at load, read-only, binding every key of R20 and Enter (R19, R20, INV §8 P42 f)", async () => {
   await load({ status: ACCEPTANCE, code: 0 });
-  assert.deepEqual(fake.named("defineMode").map((c) => c.args), [["git-sidebar-diff", [["Enter", "gitSidebar_diffEnter"]], true]]);
+  assert.deepEqual(fake.named("defineMode").map((c) => c.args), [
+    [
+      "git-sidebar-diff",
+      [
+        ["Enter", "gitSidebar_diffEnter"],
+        ["n", "gitSidebar_nextChange"],
+        ["]", "gitSidebar_nextChange"],
+        ["p", "gitSidebar_prevChange"],
+        ["[", "gitSidebar_prevChange"],
+        ["q", "gitSidebar_diffClose"],
+        ["Escape", "gitSidebar_diffClose"],
+        ["Tab", "gitSidebar_diffSwitch"],
+        ["BackTab", "gitSidebar_diffSwitch"],
+        ["j", "scroll_down"],
+        ["k", "scroll_up"],
+      ],
+      true,
+    ],
+  ]);
 });
 
 test("Enter opens the same diff as a click; a Staged row compares HEAD with the index (R14)", async () => {
@@ -982,8 +1099,8 @@ test("Enter opens the same diff as a click; a Staged row compares HEAD with the 
   fake.clear();
   await click(1, "s:a.ts");
   await fake.advance(50);
-  assert.deepEqual(sourceTexts(), ["export const a = 1;\nexport const a2 = 2;", "export const a = 3;"]);
-  assert.equal(compositeOpts()[0].name, "a.ts (HEAD ↔ staged)");
+  assert.deepEqual(sourceTexts(), ["export const a = 1;\nexport const a2 = 2;\n", "export const a = 3;\n"]);
+  assert.equal(groupOpts()[0].name, "a.ts (HEAD ↔ staged)");
   // A rename's left side is the original path's HEAD version. The two sides
   // are read at once; each reads its size before its content.
   fake.clear();
@@ -995,48 +1112,60 @@ test("Enter opens the same diff as a click; a Staged row compares HEAD with the 
     ["blob", "HEAD:old.ts"],
     ["blob", ":0:moved.ts"],
   ]);
-  // Identical sides: an empty hunk list, never null (the host draws nothing with null).
-  const last = fake.named("createCompositeBuffer").at(-1)!.args[0] as { hunks: unknown; initialFocusHunk?: number };
-  assert.deepEqual(last.hunks, []);
-  assert.ok(!("initialFocusHunk" in last));
+  // Identical sides: two panes with nothing marked, no anchor, and the
+  // cursors left at the top.
+  assert.equal(groupOpts().length, 1);
+  for (const name of ["addOverlay", "addVirtualLine", "setLineIndicators", "setScrollbarMarkers", "setBufferCursor"]) assert.deepEqual(fake.named(name), [], name);
+  assert.deepEqual(fake.named("setScrollSyncAnchors").map((c) => c.args[1]), [[]]);
 });
 
-test("a replace keeps one diff view: the old composite and its sources are closed (R14, INV §9.4, P9 c)", async () => {
+test("a replace keeps one diff view, in the replaced one's split: its sources are closed, which closes its group (R14, R37, H4, INV §8 P42 d)", async () => {
   await loadAcceptance();
   await click(5, "c:b.md");
   await fake.advance(50);
+  const first = lastGroup();
   const firstView = fake.openBuffers();
-  assert.equal(firstView.size, 3);
+  assert.equal(firstView.size, 4, "two sources and the group's two headers");
+  // The diff sits in another split than the active one now.
+  fake.splits.push({ id: 4, x: 50, y: 0, width: 50, height: 30, buffer: 0, group: null });
+  fake.activeSplit = 4;
+  fake.clear();
   await click(4, "c:a.ts");
   await fake.advance(50);
-  // closeCompositeBuffer leaves the buffer open (as in Fresh): only the
-  // extra closeBuffer on the composite brings the set back to three.
-  assert.equal(fake.openBuffers().size, 3);
+  assert.equal(fake.openBuffers().size, 4);
   for (const id of firstView) assert.ok(!fake.openBuffers().has(id), `buffer ${id} of the first view closed`);
-  const closed = fake.named("closeBuffer").map((c) => c.args);
-  for (const id of firstView) assert.deepEqual(closed.find((a) => a[0] === id), [id, true]);
-  assert.ok(fake.named("closeCompositeBuffer").length === 1);
-  // Shown first, then the old one closed.
-  const order = fake.calls.map((c) => c.name).filter((n) => n === "showBuffer" || n === "closeCompositeBuffer");
-  assert.deepEqual(order, ["showBuffer", "showBuffer", "closeCompositeBuffer"]);
+  // Only its sources, once each; the group took its headers with it.
+  assert.deepEqual(fake.named("closeBuffer").map((c) => c.args), [
+    [first.panels.left, true],
+    [first.panels.right, true],
+  ]);
+  assert.equal(fake.groups.size, 1);
+  assert.equal(lastGroup().split, 0, "where the replaced diff was");
+  // Through a focus on the old diff's panel, then shown, then the old one closed (R14 one tab).
+  const order = fake.calls.map((c) => c.name).filter((n) => ["focusBufferGroupPanel", "focusSplit", "createBufferGroup", "closeBuffer"].includes(n));
+  assert.deepEqual(order, ["focusBufferGroupPanel", "createBufferGroup", "closeBuffer", "closeBuffer"]);
+  assert.deepEqual(fake.named("focusBufferGroupPanel")[0].args, [first.id, "left"]);
+  assert.deepEqual(fake.named("removeScrollSyncGroup"), [], "a sync group goes with its panes (H13)");
+  assert.deepEqual(fake.named("closeBufferGroup"), []);
 });
 
 test("a second click while the first diff is still being built: one view shown, the first build's buffers closed", async () => {
   await loadAcceptance();
   let release!: () => void;
-  fake.compositeGate = new Promise<void>((r) => (release = r));
+  fake.groupGate = new Promise<void>((r) => (release = r));
   await click(5, "c:b.md");
   await fake.advance(50);
-  assert.equal(fake.named("createCompositeBuffer").length, 1, "first composite pending");
-  fake.compositeGate = null;
+  assert.equal(groupOpts().length, 1, "first group pending");
+  fake.groupGate = null;
   await click(4, "c:a.ts");
   await fake.advance(50);
   release();
   await fake.advance(50);
-  assert.equal(shownBuffers().length, 1);
-  assert.equal(fake.openBuffers().size, 3);
-  assert.ok(fake.openBuffers().has(shownBuffers()[0]));
-  assert.deepEqual(sourceTexts().slice(2), ["export const a = 3;", "export const a = 4;"]);
+  // The first group was made late, and closed with its sources.
+  assert.equal(fake.groups.size, 1);
+  const g = [...fake.groups.values()][0];
+  assert.deepEqual(fake.openBuffers(), new Set([g.panels.left, g.panels.right, ...g.owned]));
+  assert.deepEqual(sourceTexts().slice(2), ["export const a = 3;\n", "export const a = 4;\n"]);
 });
 
 test("a later click on a refused row stops an earlier diff still being built: no view opens after its message (R14)", async () => {
@@ -1047,16 +1176,16 @@ test("a later click on a refused row stops an earlier diff still being built: no
   fake.contents.set("/repo/b.md", "# b\nchanged\n");
   fake.clear();
   let release!: () => void;
-  fake.compositeGate = new Promise<void>((r) => (release = r));
+  fake.groupGate = new Promise<void>((r) => (release = r));
   await click(2, "c:b.md");
   await fake.advance(50);
-  assert.equal(fake.named("createCompositeBuffer").length, 1, "first composite pending");
+  assert.equal(groupOpts().length, 1, "first group pending");
   await click(3, "c:vendor/lib/");
   release();
-  fake.compositeGate = null;
+  fake.groupGate = null;
   await fake.advance(50);
   assert.deepEqual(statuses(), ["vendor/lib is a directory (submodule or nested repository)"]);
-  assert.equal(shownBuffers().length, 0);
+  assert.equal(fake.groups.size, 0);
   assert.equal(fake.openBuffers().size, 0, "the first build's buffers are closed");
 });
 
@@ -1067,23 +1196,29 @@ test("select, select, activate on one row (a double-click): one set of git reads
   await fake.widget("activate", { index: 5, key: "c:b.md" });
   await fake.advance(50);
   assert.equal(catFiles().length, 2);
-  assert.equal(shownBuffers().length, 1);
-  assert.equal(fake.openBuffers().size, 3);
+  assert.equal(groupOpts().length, 1);
+  assert.equal(fake.openBuffers().size, 4);
   // Once built, a later click builds a fresh snapshot.
   await click(5, "c:b.md");
   await fake.advance(50);
   assert.equal(catFiles().length, 4);
-  assert.equal(fake.openBuffers().size, 3);
+  assert.equal(fake.openBuffers().size, 4);
 });
 
-test("closing the diff tab leaves no buffer behind (R14)", async () => {
+test("closing the diff tab (its × or Close Tab) leaves no buffer behind: its sources are closed once each (R14, H4, P41 m)", async () => {
   await loadAcceptance();
   const before = fake.openBuffers();
   await click(5, "c:b.md");
   await fake.advance(50);
-  await fake.closeTab(shownBuffers()[0]);
+  const g = lastGroup();
+  // The tab's close leaves the borrowed sources open: the plugin closes them.
+  await fake.closeGroupTab(g);
   await fake.advance(50);
   assert.deepEqual(fake.openBuffers(), before);
+  assert.deepEqual(fake.named("closeBuffer").map((c) => c.args), [
+    [g.panels.left, true],
+    [g.panels.right, true],
+  ]);
   // Nothing more is closed when an unrelated buffer closes.
   fake.clear();
   await fake.emit("buffer_closed", { buffer_id: 9999, window_id: 1 });
@@ -1142,20 +1277,21 @@ test("a working-tree file gone between its stat and its read diffs against an em
   await click(2, "c:new.txt");
   await fake.advance(50);
   assert.deepEqual(statuses(), [DIFF_HINT]);
-  assert.deepEqual(sourceTexts(), ["", ""]);
+  // Both sides empty: one pane, the right side's (R38 "One side").
+  assert.deepEqual(lastPanes(), { left: null, right: "" });
 });
 
-test("a composite the host refuses (a throw or rejection) leaves no source buffer behind (R14)", async () => {
+test("a group the host refuses (a throw or rejection) leaves no source buffer behind (R14)", async () => {
   await loadAcceptance();
   let fail!: (e: Error) => void;
-  fake.compositeGate = new Promise<void>((_, r) => (fail = r));
+  fake.groupGate = new Promise<void>((_, r) => (fail = r));
   await click(5, "c:b.md");
   await fake.advance(50);
-  assert.equal(fake.openBuffers().size, 2, "sources made, composite pending");
+  assert.equal(fake.openBuffers().size, 2, "sources made, group pending");
   fail(new Error("options do not match the type"));
   await fake.advance(50);
   assert.equal(fake.openBuffers().size, 0);
-  assert.equal(shownBuffers().length, 0);
+  assert.equal(fake.groups.size, 0);
   assert.ok(fake.named("debug").some((c) => String(c.args[0]).includes("openDiff threw")), "logged");
   assert.deepEqual(rejections, []);
 });
@@ -1171,19 +1307,19 @@ test("a git object that cannot be read gives git's reason and no buffer", async 
 test("authority_changed in the middle of a build leaves no buffers", async () => {
   await loadAcceptance();
   let release!: () => void;
-  fake.compositeGate = new Promise<void>((r) => (release = r));
+  fake.groupGate = new Promise<void>((r) => (release = r));
   await click(5, "c:b.md");
   await fake.advance(50);
-  assert.equal(fake.openBuffers().size, 2, "sources made, composite pending");
+  assert.equal(fake.openBuffers().size, 2, "sources made, group pending");
   // An attach: the label changes.
   fake.label = "Container:abc";
   await fake.emit("authority_changed", { label: fake.label });
   release();
   await fake.advance(50);
-  assert.equal(shownBuffers().length, 0);
+  assert.equal(fake.groups.size, 0);
   assert.equal(fake.openBuffers().size, 0);
   // Also when the change lands while git is reading.
-  fake.compositeGate = null;
+  fake.groupGate = null;
   fake.clear();
   await fake.advance(1000);
   await click(5, "c:b.md");
@@ -1206,7 +1342,7 @@ test("in a bind-mounted dev container, every git read of a diff runs on the host
     assert.equal(p.via, "host");
     assert.equal(p.cwd, "/repo");
   }
-  assert.equal(shownBuffers().length, 1);
+  assert.equal(fake.groups.size, 1);
 });
 
 test("volume workspace: a click, Enter or palette command runs no git (R13)", async () => {
@@ -1242,7 +1378,7 @@ test("palette: View File and View Diff act on the selected row; nothing selected
   assert.deepEqual(fake.named("openFile").map((c) => c.args[0]), ["/repo/b.md"]);
   await fake.command("Git Sidebar: View Diff");
   await fake.advance(50);
-  assert.equal(shownBuffers().length, 1);
+  assert.equal(groupOpts().length, 1);
   // gone.ts: "deleted", and no buffer.
   fake.clear();
   await fake.widget("select", { index: 6, key: "c:gone.ts" });
@@ -1257,7 +1393,7 @@ test("palette context: on while rows are shown, off under a notice, after giving
   assert.equal(fake.contextOn("git-sidebar-rows"), false, "the placeholder has no rows");
   await fake.advance(200);
   assert.equal(fake.contextOn("git-sidebar-rows"), true);
-  assert.ok([...fake.palette().values()].every((listed) => listed));
+  assert.deepEqual(listedNow(), [...ROW_COMMANDS, FOCUS].sort());
   fake.label = "Container:vol";
   await fake.emit("authority_changed", { label: fake.label });
   await fake.advance(1000);
@@ -1338,7 +1474,7 @@ test("rows show + under Changes and − under Staged, on files and non-empty gro
   await fake.advance(200);
   assert.deepEqual(
     lastShown().nodes.map((n) => n.action ?? null),
-    ["−", "−", "−", "+", "+", "+", "+", "+", "+"],
+    ["−", "−", "−", "+", "+", "+", "+", "+", "+", null],
   );
 });
 
@@ -1346,7 +1482,7 @@ test("conflicted rows have no button; a clean repository has no group buttons (R
   await load({ status: fixture("conflict"), code: 0 });
   await fake.advance(200);
   // g:s (empty), g:c (lists files), then three conflicted rows.
-  assert.deepEqual(lastShown().nodes.map((n) => n.action ?? null), [null, "+", null, null, null]);
+  assert.deepEqual(lastShown().nodes.map((n) => n.action ?? null), [null, "+", null, null, null, null]);
 });
 
 test("clean repository: no group buttons; Space on an empty group does nothing (R16)", async () => {
@@ -1383,7 +1519,7 @@ test("+ on b.md: exactly one literal add in the root, then b.md is listed under 
   assert.deepEqual(statuses(), []);
 });
 
-test("repeated Space works down Changes even as Staged grows; no group op runs (R15, R10, critique F1)", async () => {
+test("repeated Space works down Changes even as Staged grows; no group op runs (R15, R10, spec decisions)", async () => {
   const repo: Repo = { status: ACCEPTANCE, code: 0 };
   const staged: string[] = [];
   repo.onWrite = (c) => {
@@ -1644,12 +1780,22 @@ test("+ on Changes: a fresh status, then one literal add -A of every path; no to
   assert.deepEqual(mutations().filter((m) => m.kind === "setExpandedKeys").length, 1);
 });
 
-test("stage all covers paths past the 500-row cap (R16)", async () => {
+test("1,200 untracked files: 1,000 rows and `… 200 more`, kept over refreshes; stage all covers paths past the cap (R11, R16)", async () => {
   const records = manyUntracked(1200);
   const status = raw({ records });
   await load({ status, code: 0 });
   await fake.advance(200);
-  assert.equal(lastShown().itemKeys.at(-1), "more:c");
+  const drawn = () => texts(lastShown()).slice(lastShown().itemKeys.indexOf("g:c"), lastShown().itemKeys.indexOf("g:g"));
+  assert.equal(drawn().length, 1 + 1000 + 1);
+  assert.equal(drawn().at(-1), "… 200 more");
+  assert.equal(lastShown().itemKeys.at(-2), "more:c");
+  // Three refreshes later, the same rows (A11).
+  for (let i = 0; i < 3; i++) {
+    await fake.emit("after_file_save", {});
+    await fake.advance(1000);
+  }
+  assert.equal(drawn().length, 1 + 1000 + 1);
+  assert.equal(drawn().at(-1), "… 200 more");
   await fake.widget("activate", { index: 1, key: "g:c", via: "space" });
   await fake.advance(1000);
   const paths = writes().flatMap(pathsOf);
@@ -1757,24 +1903,36 @@ test("a group op across an authority change stops and only logs", async () => {
 /** The commands listed while the section shows rows (R18). */
 const ROW_COMMANDS = [
   "Git Sidebar: Commit…",
+  "Git Sidebar: Copy Commit ID",
+  "Git Sidebar: Copy Commit Message",
+  "Git Sidebar: Pull",
+  "Git Sidebar: Push",
   "Git Sidebar: Resolve Conflict",
   "Git Sidebar: Stage All",
   "Git Sidebar: Stage or Unstage",
   "Git Sidebar: Unstage All",
+  "Git Sidebar: View Commit",
   "Git Sidebar: View Diff",
   "Git Sidebar: View File",
 ];
 
-test("eight commands are registered: the row commands under the rows context, Focus under the shown one (R18, R22)", async () => {
+/** Listed while a section diff is the active tab, by its mode (R29). */
+const DIFF_COMMANDS = ["Git Sidebar: Next Change", "Git Sidebar: Previous Change"];
+
+test("the commands: row commands under the rows context, Focus under the shown one, Next and Previous Change under the diff's mode (R18, R22, R29)", async () => {
   await load({ status: ACCEPTANCE, code: 0 });
-  assert.equal(fake.palette().size, 8);
-  assert.deepEqual([...fake.palette().keys()].sort(), [...ROW_COMMANDS, FOCUS].sort());
+  assert.deepEqual([...fake.palette().keys()].sort(), [...ROW_COMMANDS, FOCUS, ...DIFF_COMMANDS].sort());
   for (const c of fake.named("registerCommand")) {
-    assert.equal(c.args[3], c.args[0] === FOCUS ? "git-sidebar-shown" : "git-sidebar-rows", String(c.args[0]));
+    const want = c.args[0] === FOCUS ? "git-sidebar-shown" : DIFF_COMMANDS.includes(String(c.args[0])) ? "git-sidebar-diff" : "git-sidebar-rows";
+    assert.equal(c.args[3], want, String(c.args[0]));
   }
   assert.equal(fake.named("registerCommand").find((c) => c.args[0] === FOCUS)!.args[2], "gitSidebar_focus");
+  assert.deepEqual(
+    DIFF_COMMANDS.map((n) => fake.named("registerCommand").find((c) => c.args[0] === n)!.args[2]),
+    ["gitSidebar_nextChange", "gitSidebar_prevChange"],
+  );
   await fake.advance(200);
-  assert.ok([...fake.palette().values()].every((listed) => listed));
+  assert.deepEqual(listedNow(), [...ROW_COMMANDS, FOCUS].sort());
 });
 
 test("with nothing selected, the row commands say so and run no git (R18, A18)", async () => {
@@ -1866,11 +2024,11 @@ test("right-click: a menu at the pointer listing the row's actions (R17, A17)", 
 });
 
 test("right-click on `… N more`, a notice or an empty group: no menu (R17)", async () => {
-  const records = manyUntracked(600);
+  const records = manyUntracked(1200);
   await load({ status: raw({ records }), code: 0 });
   await fake.advance(200);
   const keys = lastShown().itemKeys;
-  await rightClick(keys.length - 1, "more:c");
+  await rightClick(keys.indexOf("more:c"), "more:c");
   await rightClick(0, "g:s");
   await rightClick(0, "n:notice");
   assert.deepEqual(fake.named("mountFloatingWidget"), []);
@@ -1891,7 +2049,7 @@ test("menu choices do what the same action does elsewhere (R17)", async () => {
   await rightClick(1, "s:a.ts");
   await choose("diff");
   await fake.advance(50);
-  assert.equal(compositeOpts().at(-1)!.name, "a.ts (HEAD ↔ staged)");
+  assert.equal(groupOpts().at(-1)!.name, "a.ts (HEAD ↔ staged)");
   // Unstage All on the group.
   await rightClick(0, "g:s");
   await choose("unstageAll");
@@ -1992,7 +2150,7 @@ test("a group chunk that outlives its timeout is waited for; the rest still run,
   assert.deepEqual(statuses(), ["staged 0 of 5: git is still running after 60 s", "staged 5"]);
 });
 
-test("one text per side feeds its buffer and the line diff: a final-newline change is shown (R14, F3)", async () => {
+test("each source holds its exact text, so a final-newline change is shown (R14 final newline, H17, F3, INV §8 P42 i)", async () => {
   await load({ status: raw({ records: [mod(".M", "blank.txt"), mod(".M", "eol.txt")] }), code: 0, blobs: { ":0:blank.txt": "a\n", ":0:eol.txt": "a" } });
   await fake.advance(200);
   fake.files.add("/repo/blank.txt");
@@ -2000,32 +2158,46 @@ test("one text per side feeds its buffer and the line diff: a final-newline chan
   fake.files.add("/repo/eol.txt");
   fake.contents.set("/repo/eol.txt", "a\n");
   fake.clear();
-  const hunks = () => (fake.named("createCompositeBuffer").at(-1)!.args[0] as { hunks: unknown }).hunks;
   // keys: g:s g:c c:blank.txt c:eol.txt
   await click(2, "c:blank.txt");
   await fake.advance(50);
-  assert.deepEqual(fake.named("computeLineDiff").map((c) => c.args), [["a\n", "a\n\n"]]);
-  // The added blank line is in the right-hand buffer, and is the hunk.
-  assert.deepEqual(sourceTexts(), ["a", "a\n"]);
-  assert.deepEqual(hunks(), [{ oldStart: 1, oldCount: 0, newStart: 1, newCount: 1 }]);
+  // The added blank line is in the right-hand buffer, and is marked.
+  assert.deepEqual(sourceTexts(), ["a\n", "a\n\n"]);
+  let g = lastGroup();
+  assert.deepEqual(callsOn("setLineIndicators", g.panels.right), [[[1], "git-sidebar-diff", "+", 80, 200, 120, 10]]);
+  assert.deepEqual(callsOn("setLineIndicators", g.panels.left), []);
   fake.clear();
   await click(3, "c:eol.txt");
   await fake.advance(50);
-  assert.deepEqual(fake.named("computeLineDiff").map((c) => c.args), [["a", "a\n"]]);
-  assert.deepEqual(hunks(), [{ oldStart: 0, oldCount: 1, newStart: 0, newCount: 1 }], "not an empty diff");
+  // Only the final newline differs: line 1 is marked on both sides, not an empty diff.
+  g = lastGroup();
+  assert.deepEqual(callsOn("setLineIndicators", g.panels.left), [[[0], "git-sidebar-diff", "-", 220, 90, 90, 10]]);
+  assert.deepEqual(callsOn("setLineIndicators", g.panels.right), [[[0], "git-sidebar-diff", "+", 80, 200, 120, 10]]);
+  assert.deepEqual(callsOn("addOverlay", g.panels.left), [[ "git-sidebar-diff", 0, 1, { bg: "editor.diff_remove_bg", extendToLineEnd: true }]], "no span: only the terminator differs");
 });
 
-test("an untracked file's diff covers the empty side's phantom line, so the host draws no missing row (R14, INV §8 P22)", async () => {
+test("an untracked file's diff is one plain pane: one source, no line diff, no tint, gutter or scrollbar mark, no scroll sync (R38 One side, R39, A38, A39, INV §8 P42 b)", async () => {
   await load({ status: raw({ records: ["? new.txt"] }), code: 0 });
   await fake.advance(200);
   fake.files.add("/repo/new.txt");
   fake.contents.set("/repo/new.txt", "x\ny\n");
   fake.clear();
+  const before = fake.openBuffers();
   // keys: g:s g:c c:new.txt
   await click(2, "c:new.txt");
   await fake.advance(50);
-  const opts = fake.named("createCompositeBuffer").at(-1)!.args[0] as { hunks: unknown };
-  assert.deepEqual(opts.hunks, [{ oldStart: 0, oldCount: 1, newStart: 0, newCount: 2, ops: "++" }]);
+  assert.deepEqual(vbufOpts().map((o) => o.name), ["*Working tree:new.txt*"]);
+  const g = lastGroup();
+  assert.deepEqual(groupOpts()[0].layout, JSON.parse(diffLayout(null, g.panels.right)));
+  assert.deepEqual(fake.named("setPanelContent").map((c) => c.args), [[g.id, "header", [{ text: " Working tree" }]]]);
+  assert.deepEqual(fake.named("setLineWrap").map((c) => c.args), [[g.panels.right, g.panelSplits.right, false]]);
+  assert.deepEqual(decorationCalls(), []);
+  assert.equal(fake.activeBuffer, g.panels.right);
+  // Closed by `q`: no buffer left behind (R14).
+  await fake.fire("gitSidebar_diffClose");
+  await fake.advance(50);
+  assert.deepEqual(fake.openBuffers(), before);
+  assert.deepEqual(fake.named("closeBuffer").map((c) => c.args), [[g.panels.right, true]]);
 });
 
 test("a row whose name git can't be passed back: no button, and Space, the menu, the palette and the diff run no git for it (F6)", async () => {
@@ -2034,8 +2206,8 @@ test("a row whose name git can't be passed back: no button, and Space, the menu,
   await fake.advance(200);
   // keys: g:s s:s�.txt g:c c:caf�.txt
   const spec = lastShown();
-  assert.deepEqual(spec.itemKeys, ["g:s", `s:s�.txt`, "g:c", `c:${bad}`]);
-  assert.deepEqual(spec.nodes.map((n) => n.action ?? null), ["−", null, "+", null]);
+  assert.deepEqual(spec.itemKeys, ["g:s", `s:s�.txt`, "g:c", `c:${bad}`, "g:g"]);
+  assert.deepEqual(spec.nodes.map((n) => n.action ?? null), ["−", null, "+", null, null]);
   fake.clear();
   await fake.widget("activate", { index: 3, key: `c:${bad}`, via: "space" });
   await fake.widget("activate", { index: 1, key: `s:s�.txt`, via: "space" });
@@ -2075,7 +2247,7 @@ test("a Changes row on a symbolic link: no diff and no read through the link; a 
   await click(2, "s:staged-link");
   await fake.advance(50);
   assert.deepEqual(sourceTexts(), ["a.txt", "b.txt"]);
-  assert.equal(shownBuffers().length, 1);
+  assert.equal(groupOpts().length, 1);
 });
 
 test("a write queued behind a group op across an authority change says so, and runs no git while the mode is unknown (F8)", async () => {
@@ -2116,36 +2288,54 @@ test("a write queued behind a group op across an authority change says so, and r
   assert.equal(writes().length, 1);
 });
 
-test("a user's tab close drops the composite's state too; so does a source closing first (R14, F9)", async () => {
+test("a source closed from outside closes the group, and the plugin closes the other source, once (R14, H4, H14, F9, INV §8 P42 j)", async () => {
   await loadAcceptance();
   const before = fake.openBuffers();
   await click(5, "c:b.md");
   await fake.advance(50);
-  assert.equal(fake.compositeStates().size, 1);
-  await fake.closeTab(shownBuffers()[0]);
+  const g = lastGroup();
+  // Its group closes first, with the source already gone (P42 j); then the source's own close.
+  fake.clear();
+  await fake.closeTab(g.panels.left);
   await fake.advance(50);
   assert.deepEqual(fake.openBuffers(), before);
-  assert.deepEqual(fake.compositeStates(), new Set());
-  // A source closing first takes the composite, its state and the other source.
+  assert.deepEqual(fake.named("closeBuffer").map((c) => c.args), [[g.panels.right, true]]);
+  assert.equal(fake.groups.size, 0);
+  // The right one first: the left is closed.
   fake.clear();
   await click(4, "c:a.ts");
   await fake.advance(50);
-  const composite = shownBuffers()[0];
-  const sources = [...fake.openBuffers()].filter((id) => id !== composite && !before.has(id));
-  await fake.closeTab(sources[0]);
+  const h = lastGroup();
+  await fake.closeTab(h.panels.right);
   await fake.advance(50);
   assert.deepEqual(fake.openBuffers(), before);
-  assert.deepEqual(fake.compositeStates(), new Set());
-  assert.deepEqual(fake.named("closeCompositeBuffer").map((c) => c.args[0]), [composite]);
+  assert.deepEqual(fake.named("closeBuffer").map((c) => c.args), [[h.panels.left, true]]);
 });
 
-test("a replace drops the old composite's state (R14, F9)", async () => {
+test("`q` and Esc close the diff, each source once; the closes they bring find no view (R14, R20, H14)", async () => {
   await loadAcceptance();
+  const before = fake.openBuffers();
+  // `q`, then Esc on a new diff (A20): both are bound to this handler.
+  for (const key of ["gitSidebar_diffClose", "gitSidebar_diffClose"]) {
+    await click(5, "c:b.md");
+    await fake.advance(50);
+    const g = lastGroup();
+    fake.clear();
+    await fake.fire(key);
+    await fake.advance(50);
+    assert.deepEqual(fake.openBuffers(), before);
+    assert.deepEqual(fake.named("closeBuffer").map((c) => c.args), [
+      [g.panels.left, true],
+      [g.panels.right, true],
+    ]);
+  }
+  // With another tab active, the key is not the diff's: nothing closes.
   await click(5, "c:b.md");
   await fake.advance(50);
-  await click(4, "c:a.ts");
-  await fake.advance(50);
-  assert.deepEqual(fake.compositeStates(), new Set([shownBuffers()[1]]));
+  fake.activeBuffer = 1;
+  fake.clear();
+  await fake.fire("gitSidebar_diffClose");
+  assert.deepEqual(fake.named("closeBuffer"), []);
 });
 
 test("Space on a group with no action says nothing: the placeholder, and an empty group while the mode is unknown (R16, F10)", async () => {
@@ -2223,9 +2413,12 @@ test("load clears a rows context a previous load left set, before any rows (R18,
 // R19, R20: Enter in the diff
 // ---------------------------------------------------------------------------
 
-/** Enter in the diff, with the host's cursor info `lines` (right pane focused). */
-async function diffEnter(lines: (number | null)[] | null): Promise<void> {
-  fake.cursorInfo = lines === null ? null : { focusedPane: 1, paneCount: 2, lines };
+/** Enter in the last diff, the keyboard in its `side` pane with the cursor
+ *  on 0-based `line` (null: not known yet). */
+async function diffEnter(side: "left" | "right", line: number | null): Promise<void> {
+  const buffer = lastGroup().panels[side];
+  fake.activeBuffer = buffer;
+  fake.cursors.set(buffer, { position: 0, line });
   await fake.fire("gitSidebar_diffEnter");
   await fake.advance(50);
 }
@@ -2236,18 +2429,17 @@ test("Enter in a Changes diff opens the file at the working-tree line; the diff 
   await click(5, "c:b.md");
   await fake.advance(50);
   const view = fake.openBuffers();
-  assert.equal(view.size, 3);
-  // The added line 2: no left line, right line 1 (0-based).
-  await diffEnter([null, 1]);
+  assert.equal(view.size, 4);
+  // The added line 2, in the right pane (0-based 1).
+  await diffEnter("right", 1);
   assert.deepEqual(opened(), [["/repo/b.md", 2]]);
-  assert.deepEqual(fake.openBuffers(), view, "the composite and both sources stay open");
-  assert.equal(fake.named("closeBuffer").length + fake.named("closeCompositeBuffer").length, 0);
-  // A context row: both panes have a line, and the right one is opened.
+  assert.deepEqual(fake.openBuffers(), view, "both sources and the group stay open");
+  assert.equal(fake.named("closeBuffer").length, 0);
+  // A context line in the right pane: its own line.
   fake.clear();
-  await diffEnter([0, 0]);
+  await diffEnter("right", 0);
   assert.deepEqual(opened(), [["/repo/b.md", 1]]);
 });
-
 test("Enter on a removed line opens the right-hand line after it, not the file's last line (R19, A19)", async () => {
   await loadAcceptance({ blobs: { ...ACC_BLOBS, ":0:b.md": "# b\nold\nkeep1\nkeep2\n" } });
   fake.contents.set("/repo/b.md", "# b\nkeep1\nkeep2\n");
@@ -2255,15 +2447,28 @@ test("Enter on a removed line opens the right-hand line after it, not the file's
   await fake.advance(50);
   // Left line 1 (`old`) has no right line: the next one shown is `keep1`,
   // right line 1, where the file's last line would be 3.
-  await diffEnter([1, null]);
+  await diffEnter("left", 1);
   assert.deepEqual(opened(), [["/repo/b.md", 2]]);
 });
 
+test("Enter in the left pane opens the working-tree line facing the cursor's line (R19 Either pane, A19)", async () => {
+  await loadAcceptance({ blobs: { ...ACC_BLOBS, ":0:b.md": "# b\ntop\nkeep\n" } });
+  fake.contents.set("/repo/b.md", "# b\nnew1\nnew2\ntop\nkeep\n");
+  await click(5, "c:b.md");
+  await fake.advance(50);
+  // Line 0 faces line 0; `keep` (left 2) faces right 4, below the two added lines.
+  await diffEnter("left", 0);
+  await diffEnter("left", 2);
+  assert.deepEqual(opened(), [
+    ["/repo/b.md", 1],
+    ["/repo/b.md", 5],
+  ]);
+});
 test("Enter in a Staged diff opens the same line number in the file on disk (R19)", async () => {
   await loadAcceptance();
   await click(1, "s:a.ts");
   await fake.advance(50);
-  await diffEnter([0, 0]);
+  await diffEnter("right", 0);
   assert.deepEqual(opened(), [["/repo/a.ts", 1]]);
 });
 
@@ -2273,13 +2478,13 @@ test("Enter clamps to the lines the tab will show: the file on disk, or the open
   await fake.advance(50);
   // b.md on disk is now one line: line 2 would land on the host's line 1.
   fake.contents.set("/repo/b.md", "# b\n");
-  await diffEnter([null, 1]);
+  await diffEnter("right", 1);
   assert.deepEqual(opened(), [["/repo/b.md", 1]]);
   // Open in the editor with unsaved edits: that buffer's lines count, not the disk's.
   fake.clear();
   fake.contents.set("/repo/b.md", "1\n2\n3\n4\n5\n");
   fake.userBuffers.set("/repo/b.md", { id: 7, text: "only\ntwo" });
-  await diffEnter([null, 4]);
+  await diffEnter("right", 4);
   assert.deepEqual(opened(), [["/repo/b.md", 2]]);
   assert.deepEqual(fake.named("getBufferText").map((c) => c.args), [[7]]);
   assert.equal(fake.named("readFile").length, 0);
@@ -2287,24 +2492,24 @@ test("Enter clamps to the lines the tab will show: the file on disk, or the open
   fake.clear();
   fake.userBuffers.clear();
   fake.contents.set("/repo/b.md", "");
-  await diffEnter([null, 1]);
+  await diffEnter("right", 1);
   assert.deepEqual(opened(), [["/repo/b.md", 1]]);
   // A file that gives no text (not UTF-8): the line is passed as it is.
   fake.clear();
   fake.contents.set("/repo/b.md", undefined);
-  await diffEnter([null, 6]);
+  await diffEnter("right", 6);
   assert.deepEqual(opened(), [["/repo/b.md", 7]]);
   // Too large for a diff to read: not read here either, and the line is passed as it is.
   fake.clear();
   fake.contents.set("/repo/b.md", "1\n");
   fake.sizes.set("/repo/b.md", 6 * 1024 * 1024);
-  await diffEnter([null, 6]);
+  await diffEnter("right", 6);
   assert.deepEqual(opened(), [["/repo/b.md", 7]]);
   assert.equal(fake.named("readFile").length, 0);
   // An open buffer that large: its text is not fetched either.
   fake.clear();
   fake.userBuffers.set("/repo/b.md", { id: 7, text: "x".repeat(6 * 1024 * 1024) });
-  await diffEnter([null, 6]);
+  await diffEnter("right", 6);
   assert.deepEqual(opened(), [["/repo/b.md", 7]]);
   assert.equal(fake.named("getBufferText").length, 0);
 });
@@ -2314,42 +2519,155 @@ test("Enter in a deleted file's diff says it is deleted and opens nothing (R19, 
   await click(6, "c:gone.ts");
   await fake.advance(50);
   fake.clear();
-  await diffEnter([0, null]);
+  // One pane, the staged version: its lines face none in the working tree.
+  await diffEnter("left", 0);
   assert.equal(fake.named("openFile").length, 0);
   assert.equal(fake.named("readFile").length, 0, "View File's checks come before any read");
   assert.deepEqual(statuses(), ["gone.ts is deleted"]);
 });
 
-test("Enter does nothing without a composite cursor, after the view closed, or for a view replaced meanwhile (R19)", async () => {
+test("Enter does nothing with the cursor's line unknown, with another tab active, or after the view closed (R19)", async () => {
   await loadAcceptance();
   await click(5, "c:b.md");
   await fake.advance(50);
-  const composite = shownBuffers()[0];
+  const g = lastGroup();
   fake.clear();
-  await diffEnter(null);
+  await diffEnter("right", null);
+  assert.deepEqual(opened(), []);
+  // Another tab active (a key bound to the handler elsewhere).
+  fake.activeBuffer = 1;
+  await fake.fire("gitSidebar_diffEnter");
   assert.deepEqual(opened(), []);
   // The view closed by the user: nothing to act on.
-  await fake.closeTab(composite);
+  await fake.closeGroupTab(g);
   await fake.advance(50);
   fake.clear();
-  await diffEnter([null, 1]);
-  assert.deepEqual(opened(), []);
-  // Replaced while the host answered: the answer is for the old view.
-  await click(5, "c:b.md");
-  await fake.advance(50);
-  fake.clear();
-  let answer!: (v: unknown) => void;
-  fake.cursorInfo = new Promise((r) => (answer = r));
-  const pending = fake.fire("gitSidebar_diffEnter");
-  await click(1, "s:a.ts");
-  await fake.advance(50);
-  answer({ focusedPane: 1, paneCount: 2, lines: [null, 1] });
-  await pending;
-  await fake.advance(50);
+  fake.activeBuffer = g.panels.right;
+  await fake.fire("gitSidebar_diffEnter");
   assert.deepEqual(opened(), []);
   assert.deepEqual(fake.loudCalls().filter((c) => c.name !== "setStatus"), []);
 });
+// ---------------------------------------------------------------------------
+// R29: Next and Previous Change
+// ---------------------------------------------------------------------------
 
+/** b.md staged as six lines and changed on lines 2 and 6: two changes. */
+const TWO_CHANGES = { staged: "1\n2\n3\n4\n5\n6\n", disk: "1\nX\n3\n4\n5\nY\n" };
+/** Each pane's cursor byte in the last diff, left then right. */
+function cursorBytes(): (number | undefined)[] {
+  const g = lastGroup();
+  return [fake.cursors.get(g.panels.left)?.position, fake.cursors.get(g.panels.right)?.position];
+}
+
+test("Next and Previous Change are listed only while a section diff is the active tab (R29, R18, INV §8 P39 k)", async () => {
+  await loadAcceptance();
+  assert.ok(!DIFF_COMMANDS.some((n) => listedNow().includes(n)));
+  await click(5, "c:b.md");
+  await fake.advance(50);
+  assert.ok(DIFF_COMMANDS.every((n) => listedNow().includes(n)), "the diff's left source is the active buffer");
+  // b.md itself, a tab with no mode of the plugin's.
+  fake.activeBuffer = 1;
+  assert.ok(!DIFF_COMMANDS.some((n) => listedNow().includes(n)));
+});
+
+test("Next Change moves both cursors to each change, then says there is none; Previous Change back (R29, R20, A20, A29)", async () => {
+  await loadAcceptance({ blobs: { ...ACC_BLOBS, ":0:b.md": TWO_CHANGES.staged } });
+  fake.contents.set("/repo/b.md", TWO_CHANGES.disk);
+  await click(5, "c:b.md");
+  await fake.advance(50);
+  const g = lastGroup();
+  // Opened on the first change (R38 "Cursors").
+  assert.deepEqual(cursorBytes(), [2, 2]);
+  assert.deepEqual(fake.named("scrollToLineCenter").map((c) => c.args), [[g.panelSplits.left, g.panels.left, 1]]);
+  fake.clear();
+  await fake.command("Git Sidebar: Next Change");
+  assert.deepEqual(cursorBytes(), [10, 10]);
+  assert.deepEqual(fake.named("scrollToLineCenter").map((c) => c.args), [[g.panelSplits.left, g.panels.left, 5]], "brought into view in the focused pane");
+  assert.deepEqual(statuses(), [], "moving says nothing");
+  await fake.command("Git Sidebar: Next Change");
+  assert.deepEqual(cursorBytes(), [10, 10], "no wrap-around");
+  assert.deepEqual(statuses(), ["no next change"]);
+  await fake.command("Git Sidebar: Previous Change");
+  assert.deepEqual(cursorBytes(), [2, 2]);
+  await fake.command("Git Sidebar: Previous Change");
+  assert.deepEqual(cursorBytes(), [2, 2]);
+  assert.deepEqual(statuses(), ["no next change", "no previous change"]);
+  // `n` (a key bound to the handler) does the same, from the right pane too.
+  fake.activeBuffer = g.panels.right;
+  fake.clear();
+  await fake.fire("gitSidebar_nextChange");
+  assert.deepEqual(cursorBytes(), [10, 10]);
+  assert.deepEqual(fake.named("scrollToLineCenter").map((c) => c.args), [[g.panelSplits.right, g.panels.right, 5]]);
+});
+test("Next Change from the left pane reaches two insertions that share its jump (R29, R20)", async () => {
+  // Lines added above and below the one left line: both at left byte 0.
+  await loadAcceptance({ blobs: { ...ACC_BLOBS, ":0:b.md": "x\n" } });
+  fake.contents.set("/repo/b.md", "a\nx\nb\n");
+  await click(5, "c:b.md");
+  await fake.advance(50);
+  assert.deepEqual(cursorBytes(), [0, 0]);
+  fake.clear();
+  await fake.command("Git Sidebar: Next Change");
+  assert.deepEqual(cursorBytes(), [0, 4], "the second insertion");
+  assert.deepEqual(statuses(), []);
+  await fake.command("Git Sidebar: Next Change");
+  assert.deepEqual(statuses(), ["no next change"]);
+  await fake.command("Git Sidebar: Previous Change");
+  assert.deepEqual(cursorBytes(), [0, 0]);
+});
+test("Next Change outside a section diff says so and moves nothing (R29)", async () => {
+  await loadAcceptance();
+  await fake.fire("gitSidebar_nextChange");
+  await click(5, "c:b.md");
+  await fake.advance(50);
+  // Another tab active: the diff is open, but not the active tab.
+  fake.activeBuffer = 1;
+  fake.clear();
+  await fake.fire("gitSidebar_prevChange");
+  assert.deepEqual(statuses(), ["no diff from the Git section is the active tab"]);
+  assert.equal(fake.named("setBufferCursor").length + fake.named("scrollToLineCenter").length, 0);
+});
+test("Next Change with no section at all says so (R29)", async () => {
+  await load({ status: "", code: 128 }, { git: false });
+  await fake.advance(1000);
+  await fake.fire("gitSidebar_nextChange");
+  assert.deepEqual(statuses(), ["no diff from the Git section is the active tab"]);
+});
+
+test("a one-pane diff: n says there is no next change, p goes back to the top, Tab and Shift+Tab do nothing (R20, A20 Panes, R38 One side)", async () => {
+  await loadAcceptance();
+  fake.files.add("/repo/new/c.txt");
+  fake.contents.set("/repo/new/c.txt", "c1\nc2\nc3\n");
+  await click(7, "c:new/c.txt");
+  await fake.advance(50);
+  const g = lastGroup();
+  assert.deepEqual(lastPanes(), { left: null, right: "c1\nc2\nc3\n" });
+  fake.clear();
+  await fake.fire("gitSidebar_nextChange");
+  assert.deepEqual(statuses(), ["no next change"]);
+  fake.cursors.set(g.panels.right, { position: 6, line: 2 });
+  await fake.fire("gitSidebar_prevChange");
+  assert.equal(fake.cursors.get(g.panels.right)?.position, 0);
+  await fake.fire("gitSidebar_diffSwitch");
+  assert.deepEqual(fake.named("focusBufferGroupPanel"), []);
+  assert.equal(fake.activeBuffer, g.panels.right);
+});
+
+test("Tab and Shift+Tab move the keyboard to the other pane (R20, A20 Panes, INV §8 P42 f)", async () => {
+  await loadAcceptance();
+  await click(5, "c:b.md");
+  await fake.advance(50);
+  const g = lastGroup();
+  fake.clear();
+  await fake.fire("gitSidebar_diffSwitch");
+  assert.equal(fake.activeBuffer, g.panels.right);
+  await fake.fire("gitSidebar_diffSwitch");
+  assert.equal(fake.activeBuffer, g.panels.left);
+  assert.deepEqual(fake.named("focusBufferGroupPanel").map((c) => c.args), [
+    [g.id, "right"],
+    [g.id, "left"],
+  ]);
+});
 // ---------------------------------------------------------------------------
 // R22: Focus
 // ---------------------------------------------------------------------------
@@ -2563,7 +2881,7 @@ test("Resolve Conflict when the plugin list cannot be read still opens the file,
 const COMMIT = "Git Sidebar: Commit…";
 const prompts = () => fake.named("prompt").map((c) => c.args);
 /** The summary read after a commit, as `gitSince` shows it. */
-const HEAD_LOG = "--no-optional-locks log -1 --no-show-signature --format=%h%n%s HEAD";
+const HEAD_LOG = "--no-optional-locks log -1 --no-show-signature --format=%h%n%s HEAD --";
 /** Every git run's argv after the first commit, in order, statuses as `status`. */
 const gitSince = (from: number) =>
   fake.gitCalls().slice(from).map((p) => (p.args.includes("status") ? "status" : p.args.join(" ")));
@@ -2726,7 +3044,7 @@ test("in a bind-mounted dev container, the commit and its id read run on the hos
   fake.promptAnswers.push("first");
   await fake.command(COMMIT);
   await fake.advance(1000);
-  const runs = fake.gitCalls().filter((p) => p.args[0] === "commit" || p.args[1] === "log");
+  const runs = fake.gitCalls().filter((p) => p.args[0] === "commit" || (p.args[1] === "log" && !p.args.includes("--topo-order")));
   assert.deepEqual(runs.map((p) => [p.args[0] === "commit" ? "commit" : "log", p.via, p.cwd]), [
     ["commit", "host", "/repo"],
     ["log", "host", "/repo"],
@@ -2860,15 +3178,15 @@ test("the diff's hint does not replace a write's outcome sent while the diff was
   const lock = "fatal: Unable to create '/repo/.git/index.lock': File exists.";
   await loadAcceptance({ onWrite: () => ({ code: 128, stdout: "", stderr: lock }) });
   let release!: () => void;
-  fake.compositeGate = new Promise<void>((r) => (release = r));
+  fake.groupGate = new Promise<void>((r) => (release = r));
   await click(5, "c:b.md");
   await fake.advance(10);
   await fake.widget("activate", { index: 4, key: "c:a.ts", via: "space" });
   await fake.advance(50);
   release();
-  fake.compositeGate = null;
+  fake.groupGate = null;
   await fake.advance(50);
-  assert.equal(shownBuffers().length, 1, "the diff opened");
+  assert.equal(fake.groups.size, 1, "the diff opened");
   const said = statuses();
   assert.ok(!said.includes(DIFF_HINT), said.join(" | "));
   assert.match(said[said.length - 1], /^could not stage a\.ts: /);
@@ -2881,8 +3199,7 @@ test("the diff's hint waits while the keyboard is in the section, then shows onc
   await fake.widget("focus", {});
   await click(5, "c:b.md");
   await fake.advance(50);
-  const [composite] = shownBuffers();
-  assert.equal(fake.activeBuffer, composite, "the diff opened");
+  assert.equal(fake.activeBuffer, lastGroup().panels.left, "the diff opened");
   assert.deepEqual(statuses(), []);
   // A click into the diff: blur, then the chrome event (P25 e, P28 c).
   await fake.widget("blur", {});
@@ -2900,29 +3217,30 @@ test("a waiting hint shows on a tab change to its diff with the keyboard in the 
   await fake.widget("focus", {});
   await click(5, "c:b.md");
   await fake.advance(50);
-  const [composite] = shownBuffers();
+  const diff = lastGroup();
   // The keyboard goes to the explorer, then to another tab's editor.
   await chrome("explorer");
   fake.activeBuffer = 99;
   await switchTo(99, "/repo/README.md");
   await chrome("editor");
   assert.deepEqual(statuses(), []);
-  // Ctrl+PageDown back to the diff's tab: no chrome event, a tab change.
-  fake.activeBuffer = composite;
-  await fake.emit("active_buffer_changed", { window_id: 1, buffer_id: composite, previous: null, reason: "buffer" });
+  // Ctrl+PageDown back to the diff's tab: no chrome event, a tab change to
+  // its pane with the keyboard.
+  fake.activeBuffer = diff.panels.right;
+  await fake.emit("active_buffer_changed", { window_id: 1, buffer_id: diff.panels.right, previous: null, reason: "buffer" });
   assert.deepEqual(statuses(), [DIFF_HINT]);
   // A diff closed before the keyboard reached it gives no hint.
   fake.clear();
   await fake.widget("focus", {});
   await click(4, "c:a.ts");
   await fake.advance(50);
-  const [second] = shownBuffers();
-  await fake.emit("buffer_closed", { buffer_id: second, window_id: 1 });
+  const second = lastGroup();
+  await fake.closeGroupTab(second);
   await fake.advance(50);
   fake.activeBuffer = 99;
   await chrome("editor");
-  fake.activeBuffer = second;
-  await fake.emit("active_buffer_changed", { window_id: 1, buffer_id: second, previous: null, reason: "buffer" });
+  fake.activeBuffer = second.panels.left;
+  await fake.emit("active_buffer_changed", { window_id: 1, buffer_id: second.panels.left, previous: null, reason: "buffer" });
   assert.deepEqual(statuses(), []);
 });
 
@@ -2936,7 +3254,7 @@ test("a diff opened with the keyboard outside the section, as from the palette, 
   fake.clear();
   await fake.command("Git Sidebar: View Diff");
   await fake.advance(50);
-  assert.equal(shownBuffers().length, 1);
+  assert.equal(groupOpts().length, 1);
   assert.deepEqual(statuses(), [DIFF_HINT]);
   // Nothing waits: a later move into the editor says nothing more.
   await chrome("section", "git_sidebar", fake.panel);
@@ -3183,14 +3501,13 @@ test("closing an inactive window ends only its section: no buffer closes, and th
   // A diff open in B.
   await click(5, "c:b.md");
   await fake.advance(50);
-  assert.equal(shownBuffers().length, 1);
+  assert.equal(fake.groups.size, 1);
   await fake.switchWindow(1);
   await fake.advance(500);
   fake.clear();
   await fake.closeWindow(2);
   await fake.advance(50);
   assert.deepEqual(fake.named("closeBuffer"), []);
-  assert.deepEqual(fake.named("closeCompositeBuffer"), []);
   fake.clear();
   await fake.advance(30_000);
   assert.ok(fake.gitCalls().length >= 3, "A still polls");
@@ -3284,7 +3601,7 @@ test("a diff build overtaken by a switch opens nothing and leaves no buffers (R2
   await click(5, "c:b.md");
   await fake.switchWindow(2);
   await fake.advance(500);
-  assert.deepEqual(shownBuffers(), []);
+  assert.deepEqual(groupOpts(), []);
   assert.deepEqual(fake.named("createVirtualBuffer"), []);
   assert.equal(fake.openBuffers().size, 0);
 });
@@ -3413,24 +3730,22 @@ test("a diff build overtaken by a switch after its buffers exist closes them onc
   await loadWindows({ status: ACCEPTANCE, code: 0, blobs: ACC_BLOBS });
   acceptanceOnDisk();
   let release!: () => void;
-  fake.compositeGate = new Promise<void>((r) => (release = r));
+  fake.groupGate = new Promise<void>((r) => (release = r));
   await click(5, "c:b.md");
   await fake.advance(50);
-  assert.equal(fake.openBuffers().size, 2, "sources made, composite pending");
+  assert.equal(fake.openBuffers().size, 2, "sources made, group pending");
   await fake.switchWindow(2);
   await fake.advance(500);
   fake.clear();
   release();
   await fake.advance(50);
-  assert.deepEqual(shownBuffers(), []);
   assert.deepEqual(fake.named("closeBuffer"), [], "nothing closed from window 2");
-  assert.deepEqual(fake.named("closeCompositeBuffer"), []);
   await fake.switchWindow(1);
   await fake.advance(50);
-  assert.equal(fake.named("closeCompositeBuffer").length, 1);
+  assert.equal(fake.named("closeBuffer").length, 2, "both sources, which take the group");
   assert.equal(fake.openBuffers().size, 0);
-  assert.equal(fake.compositeStates().size, 0);
-  for (const c of [...fake.named("closeBuffer"), ...fake.named("closeCompositeBuffer")]) assert.equal(c.window, 1);
+  assert.equal(fake.groups.size, 0);
+  for (const c of fake.named("closeBuffer")) assert.equal(c.window, 1);
 });
 
 test("a diff tab closed just before a switch is cleaned up on the way back (R28, R14)", async () => {
@@ -3438,19 +3753,39 @@ test("a diff tab closed just before a switch is cleaned up on the way back (R28,
   acceptanceOnDisk();
   await click(5, "c:b.md");
   await fake.advance(50);
-  const [composite] = shownBuffers();
+  const g = lastGroup();
   // The host handles the switch before the plugin hears of the close.
   await fake.switchWindow(2);
   await fake.advance(500);
   fake.clear();
-  await fake.closeTab(composite);
+  await fake.closeGroupTab(g);
   await fake.advance(50);
-  assert.deepEqual(fake.named("closeCompositeBuffer"), []);
+  assert.deepEqual(fake.named("closeBuffer"), []);
   await fake.switchWindow(1);
   await fake.advance(50);
-  assert.deepEqual(fake.named("closeCompositeBuffer").map((c) => c.args[0]), [composite]);
+  assert.deepEqual(fake.named("closeBuffer").map((c) => c.args[0]), [g.panels.left, g.panels.right]);
   assert.equal(fake.openBuffers().size, 0);
-  assert.equal(fake.compositeStates().size, 0);
+});
+
+test("two windows' diffs share a group id, and Tab in each moves within its own (R28, R20, H13)", async () => {
+  await loadWindows({ status: ACCEPTANCE, code: 0, blobs: ACC_BLOBS }, { status: B_STATUS, code: 0, blobs: ACC_BLOBS });
+  acceptanceOnDisk();
+  acceptanceOnDisk("/b");
+  await click(5, "c:b.md");
+  await fake.advance(50);
+  const g1 = lastGroup();
+  await fake.switchWindow(2);
+  await fake.advance(500);
+  await click(5, "c:b.md");
+  await fake.advance(50);
+  const g2 = lastGroup();
+  assert.deepEqual([g1.window, g1.id, g2.window, g2.id], [1, 0, 2, 0]);
+  assert.equal(fake.groups.size, 2);
+  await fake.switchWindow(1);
+  await fake.advance(50);
+  fake.activeBuffer = g1.panels.left;
+  await fake.fire("gitSidebar_diffSwitch");
+  assert.equal(fake.activeBuffer, g1.panels.right);
 });
 
 test("on return, the diff hint waiting for its diff does not replace the messages that waited (R28, R20)", async () => {
@@ -3460,7 +3795,7 @@ test("on return, the diff hint waiting for its diff does not replace the message
   await fake.widget("focus", {});
   await click(5, "c:b.md");
   await fake.advance(50);
-  assert.equal(shownBuffers().length, 1);
+  assert.equal(fake.groups.size, 1);
   await fake.widget("action", { index: 5, key: "c:b.md" });
   await fake.advance(50);
   await fake.widget("blur", {});
@@ -3509,4 +3844,987 @@ test("a press on a section's panel handled after a switch to another window does
   assert.deepEqual(menuMounts(), []);
   assert.deepEqual(fake.named("createVirtualBuffer"), []);
   assert.deepEqual(statusesIn(2), []);
+});
+
+// ---------------------------------------------------------------------------
+// R30–R33: the Graph
+// ---------------------------------------------------------------------------
+
+const A30_LOG = recorded("log-a30.z");
+const A30 = parseLog(A30_LOG, 50, "origin/main").commits;
+const commitNamed = (subject: string) => A30.find((c) => c.subject === subject)!;
+const M = commitNamed("M");
+const C2 = commitNamed("c2");
+const hk = (id: string) => `h:${id}`;
+const hfk = (id: string, path: string) => `hf:${id}:${path}`;
+const okOut = (stdout: string): ProcOutcome => ({ code: 0, stdout, stderr: "" });
+/** The acceptance repository with A30's history, M's files, and the blobs
+ *  of M's files. */
+const graphRepo = (extra: Partial<Repo> = {}): Repo => ({
+  status: ACCEPTANCE,
+  code: 0,
+  blobs: { ...ACC_BLOBS, [`${M.id}:f1.txt`]: "f1\n", [`${M.id}:f2.txt`]: "f2\n" },
+  log: okOut(A30_LOG),
+  trees: { [M.id]: okOut(recorded("difftree-merge.z")) },
+  ...extra,
+});
+async function loadGraph(extra: Partial<Repo> = {}): Promise<Repo> {
+  const repo = graphRepo(extra);
+  await load(repo);
+  await fake.advance(200);
+  acceptanceOnDisk();
+  fake.clear();
+  return repo;
+}
+/** The active window's section as drawn now, whatever was cleared since. */
+const drawnNow = (panel = fake.panel) => fake.drawn.get(panel) as TreeSpec;
+const at = (key: string) => drawnNow().itemKeys.indexOf(key);
+const logRuns = () => fake.gitCalls().filter((p) => p.args[1] === "log" && p.args.includes("--topo-order"));
+const treeRuns = () => fake.gitCalls().filter((p) => p.args[1] === "diff-tree");
+/** The host's expand of `key`, as a click on it sends (INV §8 P39 g). */
+const expand = (key: string, expanded = true) => fake.widget("expand", { index: at(key), key, expanded });
+
+test("the Graph lists the branch's and its upstream's commits under its group, newest first, with lanes, badges and authors (R30, R31, A30)", async () => {
+  await load(graphRepo());
+  await fake.advance(200);
+  const keys = drawnNow().itemKeys;
+  assert.deepEqual(keys.slice(keys.indexOf("g:g") + 1), A30.map((c) => hk(c.id)));
+  assert.deepEqual(texts(drawnNow()).slice(keys.indexOf("g:g")), [
+    "Graph",
+    "●  main  c4  fixture",
+    "○─╮  origin/main  M  fixture",
+    "│ ●  feat  f2  fixture",
+    "│ ● f1  fixture",
+    "● │ c3  fixture",
+    "●─╯  v1a   v1  c2  fixture",
+    "● c1  fixture",
+  ]);
+  // HEAD and the upstream: the branch has one (R30).
+  assert.deepEqual(logRuns().map((p) => p.args.slice(-3)), [["HEAD", "@{upstream}", "--"]]);
+  // One update in place after the status's: no remount, no button on a Graph row.
+  assert.ok(drawnNow().nodes.slice(keys.indexOf("g:g")).every((n) => n.action === undefined));
+  assert.deepEqual(drawnNow().expandedKeys, ["g:s", "g:c", "g:g"]);
+});
+
+test("HEAD moving reads the log again, nothing moving reads none; a collapsed Graph reads nothing until expanded (R11, R30)", async () => {
+  const repo = await loadGraph();
+  assert.equal(logRuns().length, 0);
+  await fake.emit("after_file_save", {});
+  await fake.advance(1000);
+  assert.equal(logRuns().length, 0, "nothing moved");
+  repo.status = ACCEPTANCE.replace(/# branch\.oid \w+/, `# branch.oid ${"2".repeat(40)}`);
+  await fake.emit("after_file_save", {});
+  await fake.advance(1000);
+  assert.equal(logRuns().length, 1, "a commit made in a terminal");
+  // Collapsed: no Graph read at all.
+  await fake.widget("expand", { index: at("g:g"), key: "g:g", expanded: false });
+  fake.clear();
+  repo.status = ACCEPTANCE.replace(/# branch\.oid \w+/, `# branch.oid ${"3".repeat(40)}`);
+  await fake.emit("after_file_save", {});
+  await fake.advance(1000);
+  assert.deepEqual(fake.gitCalls().map((p) => p.args[1]), ["status"]);
+  // Expanded again: read now, though nothing moved since.
+  await fake.widget("expand", { index: at("g:g"), key: "g:g", expanded: true });
+  await fake.advance(1000);
+  assert.equal(logRuns().length, 1);
+});
+
+test("an expanded commit gone from the log is collapsed on the host too, so it comes back collapsed (R32, R30)", async () => {
+  const repo = await loadGraph();
+  await expand(hk(M.id));
+  await fake.advance(50);
+  fake.clear();
+  // A reset in a terminal: M is no longer listed; the title stays.
+  repo.log = okOut(recorded("log-line.z"));
+  repo.status = ACCEPTANCE.replace(/# branch\.oid \w+/, `# branch.oid ${"2".repeat(40)}`);
+  await fake.emit("after_file_save", {});
+  await fake.advance(1000);
+  assert.equal(logRuns().length, 1);
+  assert.deepEqual(mutations().filter((m) => m.kind === "setExpandedKeys").at(-1)!.keys, ["g:s", "g:c", "g:g"]);
+  assert.deepEqual(fake.named("mountSidebarSection"), [], "updated in place");
+});
+
+test("an unborn branch lists no commits, and runs no log (R30, A30)", async () => {
+  await load(graphRepo({ status: fixture("unborn") }));
+  await fake.advance(1000);
+  assert.equal(drawnNow().itemKeys.at(-1), "g:g");
+  assert.equal(logRuns().length, 0);
+});
+
+test("a click expands a commit and lists its files from its first parent, no buttons; collapsing it hides them (R32, A32)", async () => {
+  await loadGraph();
+  await expand(hk(M.id));
+  await fake.advance(50);
+  assert.deepEqual(treeRuns().map((p) => p.args.slice(-3)), [[`${M.id}^1`, M.id, "--"]]);
+  const i = at(hk(M.id));
+  assert.deepEqual(drawnNow().itemKeys.slice(i + 1, i + 3), [hfk(M.id, "f1.txt"), hfk(M.id, "f2.txt")]);
+  assert.deepEqual(texts(drawnNow()).slice(i + 1, i + 3), ["A f1.txt", "A f2.txt"]);
+  assert.ok(drawnNow().nodes.slice(i + 1, i + 3).every((n) => n.depth === 2 && n.action === undefined));
+  // Expanded again: read once.
+  await expand(hk(M.id), false);
+  await expand(hk(M.id));
+  await fake.advance(50);
+  assert.equal(treeRuns().length, 1);
+});
+
+test("a commit's files that cannot be read: none listed, git's reason said (R32)", async () => {
+  await loadGraph();
+  await expand(hk(C2.id));
+  await fake.advance(50);
+  assert.deepEqual(statuses(), [`could not list the files of ${C2.id.slice(0, 7)}: bad object`]);
+  assert.equal(drawnNow().itemKeys[at(hk(C2.id)) + 1], hk(commitNamed("c1").id));
+});
+
+test("Enter toggles a commit, which the host does not; Space on a Graph row does nothing (R30, R32, INV §8 P39 g)", async () => {
+  await loadGraph();
+  await fake.widget("activate", { index: at(hk(M.id)), key: hk(M.id) });
+  await fake.advance(50);
+  assert.deepEqual(mutations().filter((m) => m.kind === "setExpandedKeys").at(-1)!.keys, ["g:s", "g:c", "g:g", hk(M.id)]);
+  assert.ok(drawnNow().itemKeys.includes(hfk(M.id, "f1.txt")));
+  fake.clear();
+  for (const key of [hk(M.id), hfk(M.id, "f1.txt"), "g:g", "more:h"]) await fake.widget("activate", { index: at(key), key, via: "space" });
+  await fake.advance(1000);
+  assert.deepEqual(writes(), []);
+  assert.deepEqual(mutations(), []);
+  assert.deepEqual(statuses(), []);
+  await fake.widget("activate", { index: at(hk(M.id)), key: hk(M.id) });
+  assert.deepEqual(mutations().at(-1)!.keys, ["g:s", "g:c", "g:g"]);
+});
+
+test("a commit's file opens its diff by click or Enter, in the one diff tab shared with the status rows; closing leaves nothing (R32, R14, A32)", async () => {
+  await loadGraph();
+  await expand(hk(M.id));
+  await fake.advance(50);
+  await click(at(hfk(M.id, "f1.txt")), hfk(M.id, "f1.txt"));
+  await fake.advance(50);
+  // An added file: the left side is empty, so one pane, the commit's (A32).
+  const p7 = M.parents[0].slice(0, 7);
+  const i7 = M.id.slice(0, 7);
+  assert.deepEqual(lastPanes(), { left: null, right: fake.textOf(lastGroup().panels.right)! });
+  assert.deepEqual(groupOpts().map((o) => o.name), [`f1.txt (${p7} ↔ ${i7})`]);
+  assert.deepEqual(fake.named("setPanelContent").map((c) => c.args.slice(1)), [["header", [{ text: ` ${i7}` }]]]);
+  assert.deepEqual(vbufOpts().map((o) => [o.name, o.mode]), [[`*${i7}:f1.txt*`, "git-sidebar-diff"]]);
+  assert.equal(fake.openBuffers().size, 2, "the source and its header");
+  // A status row replaces it: still one diff tab, now two panes.
+  await click(5, "c:b.md");
+  await fake.advance(50);
+  assert.equal(fake.openBuffers().size, 4);
+  assert.equal(fake.groups.size, 1);
+  // Enter on the file opens the diff too, one pane again, in the same split.
+  await fake.widget("activate", { index: at(hfk(M.id, "f2.txt")), key: hfk(M.id, "f2.txt") });
+  await fake.advance(50);
+  assert.deepEqual(vbufOpts().at(-1)!.name, `*${i7}:f2.txt*`);
+  assert.equal(fake.openBuffers().size, 2);
+  assert.deepEqual(fake.groupsMade.map((g) => g.split), [0, 0, 0]);
+  await fake.closeGroupTab(lastGroup());
+  await fake.advance(50);
+  assert.equal(fake.openBuffers().size, 0, "no leftovers");
+  // Next Change works in it (R29): listed by its mode.
+  await fake.widget("activate", { index: at(hfk(M.id, "f1.txt")), key: hfk(M.id, "f1.txt") });
+  await fake.advance(50);
+  assert.ok(listedNow().includes("Git Sidebar: Next Change"));
+});
+
+test("View File and Enter in a commit file's diff open the working-tree file; a file gone from it says so (R7, R19, R32)", async () => {
+  await loadGraph();
+  await expand(hk(M.id));
+  await fake.advance(50);
+  fake.files.add("/repo/f1.txt");
+  fake.contents.set("/repo/f1.txt", "f1\nmore\n");
+  await rightClick(at(hfk(M.id, "f1.txt")), hfk(M.id, "f1.txt"));
+  assert.deepEqual(menuMounts().map((m) => m.labels), [["View Diff", "View File"]]);
+  await choose("file");
+  assert.deepEqual(fake.named("openFile").map((c) => c.args), [["/repo/f1.txt"]]);
+  // f2.txt is not in the working tree.
+  await fake.widget("select", { index: at(hfk(M.id, "f2.txt")), key: hfk(M.id, "f2.txt") });
+  await fake.command("Git Sidebar: View File");
+  assert.deepEqual(statuses(), ["f2.txt is deleted"]);
+  // Enter in the diff: the line with the same number in the file (R19).
+  await click(at(hfk(M.id, "f1.txt")), hfk(M.id, "f1.txt"));
+  await fake.advance(50);
+  fake.clear();
+  await diffEnter("right", 0);
+  assert.deepEqual(opened(), [["/repo/f1.txt", 1]]);
+});
+
+test("Load more: 50 commits, then 50 more on a click with the first new one selected; a second click while loading loads one page (R30, A30)", async () => {
+  const long = recorded("log-long.z");
+  await loadGraph({ log: okOut(long) });
+  const commits = () => drawnNow().itemKeys.filter((k) => k.startsWith("h:"));
+  assert.equal(commits().length, 50);
+  assert.equal(drawnNow().itemKeys.at(-1), "more:h");
+  assert.equal(texts(drawnNow()).at(-1), "Load more");
+  fake.clear();
+  await click(at("more:h"), "more:h");
+  await click(at("more:h"), "more:h");
+  await fake.advance(1000);
+  assert.deepEqual(logRuns().map((p) => p.args[p.args.indexOf("-n") + 1]), ["101"]);
+  assert.equal(commits().length, 51);
+  assert.ok(!drawnNow().itemKeys.includes("more:h"));
+  const first = parseLog(long, 100, null).commits[50];
+  assert.deepEqual(mutations().at(-1), { kind: "setSelectedIndex", widgetKey: "git", index: at(hk(first.id)) });
+  // Enter on Load more does the same; nothing more to load now.
+  fake.clear();
+  await fake.widget("activate", { index: 0, key: "more:h" });
+  await fake.advance(1000);
+  assert.deepEqual(logRuns(), []);
+});
+
+test("a status change keeps a selected commit selected and expanded, and its rows (R10, A30)", async () => {
+  const repo = await loadGraph();
+  await expand(hk(M.id));
+  await fake.advance(50);
+  await fake.widget("select", { index: at(hfk(M.id, "f1.txt")), key: hfk(M.id, "f1.txt") });
+  const before = at(hfk(M.id, "f1.txt"));
+  fake.clear();
+  // A file staged above it in a terminal: every Graph row moves down one.
+  repo.status = ACCEPTANCE.replace("# branch.ab +1 -0\0", `# branch.ab +1 -0\0${mod("A.", "0.txt")}\0`);
+  await fake.emit("after_file_save", {});
+  await fake.advance(1000);
+  assert.equal(at(hfk(M.id, "f1.txt")), before + 1);
+  assert.deepEqual(mutations(), [{ kind: "setSelectedIndex", widgetKey: "git", index: before + 1 }]);
+  assert.equal(treeRuns().length, 0, "its files were kept");
+});
+
+test("auto-reveal never selects a Graph row, even where an expanded commit lists the file (R23, A30)", async () => {
+  const tree = `:100644 100644 ${H} ${H} M\0a.ts\0`;
+  await loadGraph({ trees: { [M.id]: okOut(tree) } });
+  await expand(hk(M.id));
+  await fake.advance(50);
+  fake.bufferPaths.set(42, "/repo/a.ts");
+  fake.clear();
+  await fake.emit("active_buffer_changed", { window_id: 1, buffer_id: 42, previous: { window_id: 1, buffer_id: 0 }, reason: "tab" });
+  assert.deepEqual(mutations(), [{ kind: "setSelectedIndex", widgetKey: "git", index: at("c:a.ts") }]);
+});
+
+test("View Commit: a read-only tab of `git show`, named as a diff, with no mode; a later one replaces it; closing leaves nothing (R33, A33)", async () => {
+  const big = "x".repeat(5 * 1024 * 1024 + 1);
+  await loadGraph({ shows: { [M.id]: okOut(recorded("show-merge.txt")), [C2.id]: okOut(big), [commitNamed("c1").id]: okOut(recorded("show-root.txt")) } });
+  // From the palette, with a file of M selected (A33).
+  await expand(hk(M.id));
+  await fake.advance(50);
+  await fake.widget("select", { index: at(hfk(M.id, "f1.txt")), key: hfk(M.id, "f1.txt") });
+  await fake.command("Git Sidebar: View Commit");
+  await fake.advance(50);
+  const shows = () => fake.gitCalls().filter((p) => p.args[1] === "show");
+  assert.deepEqual(shows().map((p) => p.args.slice(-2)), [[M.id, "--"]]);
+  const [opts] = vbufOpts();
+  assert.equal(opts.name, `*${M.id.slice(0, 7)}:show.diff*`);
+  assert.equal(opts.readOnly, true);
+  assert.equal(opts.editingDisabled, true);
+  assert.equal(opts.mode, undefined, "not the diff's mode: Next Change acts on section diffs only");
+  assert.ok(sourceTexts()[0].startsWith(`commit ${M.id}\nMerge: `));
+  const first = shownBuffers().at(-1)!;
+  // From the menu, on the root commit: the first tab is replaced.
+  const c1 = commitNamed("c1");
+  await rightClick(at(hk(c1.id)), hk(c1.id));
+  assert.deepEqual(menuMounts().at(-1)!.labels, ["View Commit", "Copy Commit ID", "Copy Commit Message"]);
+  await choose("viewCommit");
+  await fake.advance(50);
+  assert.ok(fake.named("closeBuffer").some((c) => c.args[0] === first));
+  assert.equal(fake.openBuffers().size, 1);
+  await fake.closeTab(shownBuffers().at(-1)!);
+  await fake.advance(50);
+  assert.equal(fake.openBuffers().size, 0);
+  // Over 5 MiB: no tab, a message.
+  fake.clear();
+  await fake.widget("select", { index: at(hk(C2.id)), key: hk(C2.id) });
+  await fake.command("Git Sidebar: View Commit");
+  await fake.advance(50);
+  assert.deepEqual(statuses(), [`${C2.id.slice(0, 7)} is larger than 5 MiB; not shown`]);
+  assert.equal(vbufOpts().length, 0);
+  // Not a commit: a message.
+  await fake.widget("select", { index: 5, key: "c:b.md" });
+  await fake.command("Git Sidebar: View Commit");
+  assert.equal(statuses().at(-1), "View Commit needs a commit selected in the Graph");
+});
+
+test("Copy Commit ID and Copy Commit Message put the full id and message on the clipboard, and say so (R33, A33)", async () => {
+  await loadGraph({ messages: { [M.id]: okOut("Merge branch 'feat'\n\nThe body.\n\n") } });
+  await fake.widget("select", { index: at(hk(M.id)), key: hk(M.id) });
+  await fake.command("Git Sidebar: Copy Commit ID");
+  assert.equal(fake.clipboard, M.id);
+  assert.deepEqual(statuses(), [`copied the full id of ${M.id.slice(0, 7)}`]);
+  await rightClick(at(hk(M.id)), hk(M.id));
+  await choose("copyMessage");
+  await fake.advance(50);
+  assert.equal(fake.clipboard, "Merge branch 'feat'\n\nThe body.");
+  assert.equal(statuses().at(-1), `copied the message of ${M.id.slice(0, 7)}`);
+  const reads = fake.gitCalls().filter((p) => p.args.includes("--format=%B"));
+  assert.deepEqual(reads.map((p) => p.args), [["--no-optional-locks", "log", "-1", "--no-show-signature", "--format=%B", M.id, "--"]]);
+});
+
+test("a right-click on Load more opens no menu; on the Graph group, Pull and Push (R17, A17)", async () => {
+  await loadGraph({ log: okOut(recorded("log-long.z")) });
+  await rightClick(at("more:h"), "more:h");
+  assert.deepEqual(menuMounts(), []);
+  await rightClick(at("g:g"), "g:g");
+  assert.deepEqual(menuMounts().map((m) => m.labels), [["Pull", "Push"]]);
+});
+
+test("the Graph per window: each keeps its expanded commits; no git for B while A is active; a return reads the log again (R28, A28)", async () => {
+  const b: Repo = { ...graphRepo(), status: B_STATUS };
+  await loadWindows(graphRepo(), b);
+  await expand(hk(M.id));
+  await fake.advance(50);
+  await fake.switchWindow(2);
+  await fake.advance(500);
+  assert.ok(logRuns().some(inB), "B's log, in B");
+  await fake.widget("expand", { index: 0, key: hk(C2.id), expanded: true }, { panel: PANEL_B });
+  await fake.advance(50);
+  fake.clear();
+  await fake.switchWindow(1);
+  await fake.advance(500);
+  // A's Graph is as left, and read again on the return (R30).
+  assert.equal(logRuns().length, 1);
+  assert.ok(!fake.gitCalls().some(inB));
+  assert.ok(drawnNow(PANEL_A).itemKeys.includes(hfk(M.id, "f1.txt")));
+  assert.equal(treeRuns().length, 0, "A's files were kept");
+  // B's section, parked, still shows B's expanded commit.
+  assert.ok(drawnNow(PANEL_B).itemKeys.includes(hk(C2.id)));
+});
+
+test("a commit collapsed, then expanded again after another was, shows the files it kept (R32, INV §8 P36 d)", async () => {
+  const f2 = commitNamed("f2");
+  await loadGraph({ trees: { [M.id]: okOut(recorded("difftree-merge.z")), [f2.id]: okOut(`:000000 100644 ${H} ${H} A\0f2.txt\0`) } });
+  await expand(hk(M.id));
+  await fake.advance(50);
+  await expand(hk(M.id), false);
+  await expand(hk(f2.id));
+  await fake.advance(50);
+  assert.ok(!drawnNow().itemKeys.includes(hfk(M.id, "f1.txt")), "f2's redraw left M's rows out while M was collapsed");
+  await expand(hk(M.id));
+  await fake.advance(50);
+  const i = at(hk(M.id));
+  assert.deepEqual(drawnNow().itemKeys.slice(i + 1, i + 3), [hfk(M.id, "f1.txt"), hfk(M.id, "f2.txt")]);
+  assert.equal(treeRuns().length, 2, "M's files were kept, not read again");
+  // Enter toggles the same way.
+  await fake.widget("activate", { index: at(hk(M.id)), key: hk(M.id) });
+  await expand(hk(f2.id), false);
+  await fake.widget("activate", { index: at(hk(M.id)), key: hk(M.id) });
+  await fake.advance(50);
+  assert.ok(drawnNow().itemKeys.includes(hfk(M.id, "f1.txt")));
+});
+
+test("Copy Commit Message on output that is empty or not UTF-8 copies nothing, and says so (R33, INV §8 P17)", async () => {
+  await loadGraph({ messages: { [M.id]: okOut("") } });
+  await fake.widget("select", { index: at(hk(M.id)), key: hk(M.id) });
+  await fake.command("Git Sidebar: Copy Commit Message");
+  await fake.advance(50);
+  assert.equal(fake.clipboard, null);
+  assert.deepEqual(statuses(), [`nothing copied: the message of ${M.id.slice(0, 7)} is empty or not UTF-8`]);
+});
+
+test("under a notice, a Graph row's menu and the palette act on nothing: its rows went with the status rows (R13, R17, R18)", async () => {
+  await loadGraph({ inspect: VOLUME_INSPECT, pwd: VOLUME_PWD });
+  await expand(hk(M.id));
+  await fake.advance(50);
+  fake.files.add("/repo/f1.txt");
+  await fake.widget("select", { index: at(hk(M.id)), key: hk(M.id) });
+  await rightClick(at(hfk(M.id, "f1.txt")), hfk(M.id, "f1.txt"));
+  // Attached to a volume container while the menu is open: a notice.
+  fake.label = "Container:vol";
+  await fake.emit("authority_changed", { label: fake.label });
+  await fake.advance(1000);
+  assert.deepEqual(texts(lastShown()), [VOLUME_NOTICE]);
+  fake.clear();
+  await choose("file");
+  assert.deepEqual(fake.named("openFile"), []);
+  assert.deepEqual(statuses(), ["f1.txt is no longer listed"]);
+  // The palette, with the commit still selected.
+  await fake.command("Git Sidebar: Copy Commit ID");
+  await fake.command("Git Sidebar: View Commit");
+  await fake.advance(50);
+  assert.equal(fake.clipboard, null);
+  assert.deepEqual(fake.named("createVirtualBuffer"), []);
+  assert.equal(fake.gitCalls().length, 0);
+});
+
+/** The Graph's repository, with diff reads (a blob's id, size and text) or
+ *  `show` slowed to 2 s, as `slow` says when they run. */
+async function loadSlowGraph(slow: () => "diff" | "show" | null): Promise<void> {
+  const repo = graphRepo({ shows: { [M.id]: okOut(recorded("show-merge.txt")) } });
+  const base = repoScript(repo);
+  await load(repo, {
+    script: (c) => {
+      const r = base(c);
+      const diffRead = (c.args[0] === "rev-parse" && c.args[1] !== "--show-toplevel") || c.args.includes("cat-file");
+      if ((slow() === "diff" && diffRead) || (slow() === "show" && c.args[1] === "show")) return { result: r as ProcResult, ms: 2000 };
+      return r;
+    },
+  });
+  await fake.advance(200);
+  acceptanceOnDisk();
+  fake.clear();
+}
+const showTabs = () => vbufOpts().filter((o) => o.name.endsWith(":show.diff*"));
+
+test("View Commit asked after a diff still being built: the commit's tab opens, the diff does not (R14, R33)", async () => {
+  await loadSlowGraph(() => "diff");
+  await click(5, "c:b.md");
+  await fake.advance(10);
+  await fake.widget("select", { index: at(hk(M.id)), key: hk(M.id) });
+  await fake.command("Git Sidebar: View Commit");
+  await fake.advance(50);
+  assert.equal(showTabs().length, 1);
+  const tab = shownBuffers().at(-1)!;
+  // The diff's three reads (id, size, text) finish.
+  await fake.advance(10_000);
+  assert.deepEqual(groupOpts(), []);
+  assert.deepEqual(shownBuffers(), [tab], "the commit's tab stays the active one");
+  assert.deepEqual([...fake.openBuffers()], [tab], "the stale diff made no buffer");
+});
+
+test("a diff asked after a View Commit still reading: the diff opens, the commit's tab does not (R14, R33)", async () => {
+  await loadSlowGraph(() => "show");
+  await fake.widget("select", { index: at(hk(M.id)), key: hk(M.id) });
+  await fake.command("Git Sidebar: View Commit");
+  await fake.advance(10);
+  await click(5, "c:b.md");
+  await fake.advance(50);
+  assert.equal(groupOpts().length, 1);
+  await fake.advance(10_000);
+  assert.deepEqual(showTabs(), []);
+  assert.equal(fake.activeBuffer, lastGroup().panels.left, "the diff stays the active tab");
+  assert.equal(fake.openBuffers().size, 4, "the diff's sources and headers, nothing else");
+});
+
+// ---------------------------------------------------------------------------
+// R34–R36: Pull and Push
+// ---------------------------------------------------------------------------
+
+const PULL = "Git Sidebar: Pull";
+const PUSH = "Git Sidebar: Push";
+const ENV = ["LC_ALL=C", "GIT_TERMINAL_PROMPT=0", "GIT_ASKPASS=", "SSH_ASKPASS=false", "SSH_ASKPASS_REQUIRE=force"];
+const SSH = "GIT_SSH_COMMAND=ssh -o BatchMode=yes -o ConnectTimeout=10";
+const envRuns = () => fake.procs.filter((p) => p.program === "env");
+/** A clean branch `main` with no upstream (`ab` null), for Publish. */
+const NO_UPSTREAM = raw({ ab: null });
+
+test("Pull and Push run `env … git` with no prompts and batch ssh, against the upstream; then a refresh (R34, R35, R36, A34, A35)", async () => {
+  await loadAcceptance();
+  await fake.command(PULL);
+  await fake.advance(1000);
+  assert.deepEqual(envRuns().map((p) => [p.via, p.cwd, p.args]), [["target", "/repo", [...ENV, SSH, "git", "pull", "--tags", "--no-autostash", "origin", "refs/heads/main"]]]);
+  assert.deepEqual(statuses(), ["pulled from origin/main"]);
+  // Its reads came first, lock-free.
+  const reads = fake.gitCalls().filter((p) => ["for-each-ref", "config", "symbolic-ref"].includes(p.args[1]));
+  assert.deepEqual(reads.map((p) => p.args), [
+    ["--no-optional-locks", "for-each-ref", "--format=%(upstream:remotename)%00%(upstream:remoteref)", "refs/heads/main"],
+    ["--no-optional-locks", "config", "--get", "core.sshCommand"],
+    ["--no-optional-locks", "symbolic-ref", "-q", "HEAD"],
+  ]);
+  // The queue's refresh after it: the title and the Graph follow (R34).
+  assert.ok(statusRuns().length >= 1);
+  fake.clear();
+  await fake.advance(5000);
+  await fake.command(PUSH);
+  await fake.advance(1000);
+  assert.deepEqual(envRuns().map((p) => p.args.slice(ENV.length + 1)), [["git", "push", "origin", "refs/heads/main:refs/heads/main"]]);
+  assert.deepEqual(statuses(), ["pushed to origin/main"]);
+});
+
+test("Push sends the branch to an upstream of another name; the menu on the Graph group does what the palette does (R35, R17, A35)", async () => {
+  await loadAcceptance({ upstreamRef: { code: 0, stdout: "origin\0refs/heads/other\n", stderr: "" } });
+  await rightClick(9, "g:g");
+  await choose("push");
+  await fake.advance(1000);
+  assert.deepEqual(envRuns().map((p) => p.args.slice(-3)), [["push", "origin", "refs/heads/main:refs/heads/other"]]);
+  assert.deepEqual(statuses(), ["pushed to origin/other"]);
+});
+
+test("the user's ssh command is kept, with batch mode added; a program other than OpenSSH is left alone (R36)", async () => {
+  fake.env.set("GIT_SSH", "/usr/local/bin/ssh");
+  await loadAcceptance({ sshConfig: { code: 0, stdout: "ssh -i ~/.ssh/work\n", stderr: "" } });
+  await fake.command(PUSH);
+  await fake.advance(1000);
+  assert.ok(envRuns()[0].args.includes("GIT_SSH_COMMAND=ssh -i ~/.ssh/work -o BatchMode=yes -o ConnectTimeout=10"));
+  fake.env.set("GIT_SSH_COMMAND", "plink -batch");
+  fake.clear();
+  await fake.advance(5000);
+  await fake.command(PUSH);
+  await fake.advance(1000);
+  assert.deepEqual(envRuns()[0].args.slice(0, ENV.length + 1), [...ENV, "git"], "no GIT_SSH_COMMAND: plink keeps its own");
+});
+
+test("git's outcomes reach the status bar: up to date, rejected, credentials (R34–R36, A34–A36)", async () => {
+  const outcomes: ProcResult[] = [
+    { code: 0, stdout: "Already up to date.\n", stderr: "" },
+    { code: 1, stdout: "", stderr: "To ../o.git\n ! [rejected]        main -> main (fetch first)\nerror: failed to push some refs to '../o.git'\nhint: Updates were rejected\n" },
+    { code: 128, stdout: "", stderr: "fatal: could not read Username for 'http://h': terminal prompts disabled\n" },
+    { code: 1, stdout: "Auto-merging f\nCONFLICT (content): Merge conflict in f\n", stderr: "" },
+  ];
+  await loadAcceptance({ onRemote: () => outcomes.shift() });
+  for (const cmd of [PULL, PUSH, PUSH, PULL]) {
+    await fake.command(cmd);
+    await fake.advance(5000);
+  }
+  assert.deepEqual(statuses(), [
+    "already up to date with origin/main",
+    "push rejected, pull first: ! [rejected] main -> main (fetch first)",
+    "git needs credentials it can't ask for here: could not read Username for 'http://h': terminal prompts disabled",
+    "pulled from origin/main with conflicts: resolve them under Changes",
+  ]);
+});
+
+test("a push past 60 s is never killed: it says git is still running, then how it ended (R36, A36)", async () => {
+  await loadAcceptance({ onRemote: () => ({ result: { code: 0, stdout: "", stderr: "To o\n   a..b  main -> main\n" }, ms: 70_000 }) });
+  await fake.command(PUSH);
+  await fake.advance(61_000);
+  assert.deepEqual(statuses(), ["push: git is still running after 60 s"]);
+  assert.equal(fake.kills, 0);
+  await fake.advance(10_000);
+  assert.equal(fake.kills, 0);
+  assert.equal(statuses().at(-1), "pushed to origin/main");
+});
+
+test("a push queues behind a commit; a stage asked during it runs after it; a second push before the first is drawn is refused (R36, R26, A36)", async () => {
+  const order: string[] = [];
+  await loadAcceptance({
+    onWrite: (c) => {
+      order.push(c.args[0] === "commit" ? "commit" : "stage");
+      return { result: { code: 0, stdout: "", stderr: "" }, ms: 3000 };
+    },
+    onRemote: () => {
+      order.push("push");
+      return { result: { code: 0, stdout: "", stderr: "" }, ms: 3000 };
+    },
+  });
+  fake.promptAnswers.push("first");
+  await fake.command(COMMIT);
+  await fake.advance(10);
+  await fake.command(PUSH);
+  await fake.advance(10);
+  await fake.widget("action", { index: 5, key: "c:b.md", via: "click" });
+  await fake.command(PUSH);
+  assert.equal(statuses().at(-1), "a push is still finishing; try again in a moment");
+  await fake.advance(15_000);
+  assert.deepEqual(order, ["commit", "push", "stage"]);
+});
+
+test("detached HEAD, or a pull with no upstream: a message and no git (R34, R35, A34, A35)", async () => {
+  await loadAcceptance({ status: fixture("detached") });
+  await fake.command(PULL);
+  await fake.command(PUSH);
+  await fake.advance(1000);
+  assert.deepEqual(statuses(), ["HEAD is detached: check out a branch to pull", "HEAD is detached: check out a branch to push"]);
+  restartFake();
+  await loadAcceptance({ status: NO_UPSTREAM });
+  await fake.command(PULL);
+  await fake.advance(1000);
+  assert.deepEqual(statuses(), ["main has no upstream to pull from"]);
+  assert.deepEqual(envRuns(), []);
+  assert.deepEqual(fake.gitCalls().filter((p) => p.args[1] !== "status"), []);
+});
+
+test("Publish: one remote is asked about, and Enter publishes there as the upstream; Esc cancels; no remote opens no prompt (R35, A35)", async () => {
+  await loadAcceptance({ status: NO_UPSTREAM });
+  fake.startPromptAnswers.push("origin");
+  await fake.command(PUSH);
+  await fake.advance(1000);
+  assert.deepEqual(fake.named("startPrompt").map((c) => c.args), [["Publish main to: ", "git-sidebar-publish"]]);
+  assert.deepEqual(fake.suggestions, [{ id: "origin", text: "origin", value: "origin" }]);
+  assert.deepEqual(envRuns().map((p) => p.args.slice(-4)), [["push", "-u", "origin", "refs/heads/main:refs/heads/main"]]);
+  assert.deepEqual(statuses(), ["pushed to origin/main"]);
+  // Esc.
+  fake.clear();
+  await fake.advance(5000);
+  fake.startPromptAnswers.push(null);
+  await fake.command(PUSH);
+  await fake.advance(1000);
+  assert.deepEqual(envRuns(), []);
+  assert.deepEqual(statuses(), ["push cancelled"]);
+  // A typed name that is no remote.
+  fake.clear();
+  fake.startPromptAnswers.push("nowhere");
+  await fake.command(PUSH);
+  await fake.advance(1000);
+  assert.deepEqual(envRuns(), []);
+  assert.deepEqual(statuses(), ["nowhere is not a remote; push cancelled"]);
+  // No remote: no prompt.
+  restartFake();
+  await loadAcceptance({ status: NO_UPSTREAM, remotes: { code: 0, stdout: "", stderr: "" } });
+  await fake.command(PUSH);
+  await fake.advance(1000);
+  assert.deepEqual(fake.named("startPrompt"), []);
+  assert.deepEqual(statuses(), ["main has no upstream, and there is no remote to publish it to"]);
+});
+
+test("Publish with two remotes offers both, and publishes to the one picked; other prompts' answers are not its own (R35, A35, INV §8 P39 h)", async () => {
+  await loadAcceptance({ status: NO_UPSTREAM, remotes: { code: 0, stdout: "backup\norigin\n", stderr: "" } });
+  let answer!: (v: string | null) => void;
+  fake.startPromptAnswers.push(new Promise((r) => (answer = r)));
+  await fake.command(PUSH);
+  await fake.advance(100);
+  assert.deepEqual(fake.suggestions.map((x) => x.value), ["backup", "origin"]);
+  // Another plugin's prompt answering: not Publish's.
+  await fake.emit("prompt_confirmed", { prompt_type: "other", input: "origin", selected_index: 1 });
+  assert.deepEqual(envRuns(), []);
+  answer("backup");
+  await fake.advance(1000);
+  assert.deepEqual(envRuns().map((p) => p.args.slice(-4)), [["push", "-u", "backup", "refs/heads/main:refs/heads/main"]]);
+  assert.deepEqual(statuses(), ["pushed to backup/main"]);
+});
+
+test("in a bind-mounted dev container, Pull runs `env` on the host in the root (R13, R34)", async () => {
+  fake.label = "Container:abc";
+  await load({ status: ACCEPTANCE, code: 0, inspect: BIND_INSPECT, pwd: BIND_PWD });
+  await fake.advance(200);
+  await fake.command(PULL);
+  await fake.advance(1000);
+  assert.deepEqual(envRuns().map((p) => [p.via, p.cwd]), [["host", "/repo"]]);
+  assert.ok(fake.procs.filter((p) => p.program === "git").every((p) => p.via === "host"));
+});
+
+test("a push queued in B behind a slow commit does not run once A is active, and says so in B; a Publish answer given in A is not B's (R28, A36, INV §11.4)", async () => {
+  await loadInB(undefined, {
+    status: B_STATUS,
+    code: 0,
+    onWrite: () => ({ result: { code: 0, stdout: "", stderr: "" }, ms: 3000 }),
+  });
+  fake.promptAnswers.push("slow");
+  await fake.command(COMMIT);
+  await fake.advance(10);
+  await fake.command(PUSH);
+  await fake.advance(10);
+  await fake.switchWindow(1);
+  await fake.advance(5000);
+  assert.deepEqual(envRuns(), []);
+  await fake.switchWindow(2);
+  await fake.advance(500);
+  assert.ok(statusesIn(2).some((m) => m.includes("push: not run; another window became active before it started")), statusesIn(2).join(" | "));
+  // Publish asked in B, and a prompt answered after a switch to A: a
+  // prompt is its window's own, so that answer is A's, which has none open.
+  restartFake();
+  await loadInB(undefined, { status: B_STATUS.replace(/# branch\.upstream[^\0]*\0# branch\.ab[^\0]*\0/, ""), code: 0 });
+  let answer!: (v: string | null) => void;
+  fake.startPromptAnswers.push(new Promise((r) => (answer = r)));
+  await fake.command(PUSH);
+  await fake.advance(100);
+  await fake.switchWindow(1);
+  answer("origin");
+  await fake.advance(1000);
+  assert.deepEqual(envRuns(), []);
+  // Back in B, its prompt still waits; answered there, it publishes from B.
+  await fake.switchWindow(2);
+  await fake.advance(500);
+  assert.deepEqual(envRuns(), []);
+  await fake.emit("prompt_confirmed", { prompt_type: "git-sidebar-publish", input: "origin", selected_index: 0 });
+  await fake.advance(1000);
+  assert.deepEqual(envRuns().map((p) => [p.cwd, p.args.slice(-4)]), [["/b", ["push", "-u", "origin", "refs/heads/feature-b:refs/heads/feature-b"]]]);
+  assert.equal(statusesIn(2).at(-1), "pushed to origin/feature-b");
+});
+
+test("a pull queued while another branch is checked out runs nothing, and says so; a detached HEAD too (R34)", async () => {
+  let head: ProcOutcome = { code: 0, stdout: "refs/heads/main\n", stderr: "" };
+  await loadAcceptance({ onWrite: () => ({ result: { code: 0, stdout: "", stderr: "" }, ms: 3000 }), headRef: () => head });
+  fake.promptAnswers.push("first");
+  await fake.command(COMMIT);
+  await fake.advance(10);
+  await fake.command(PULL);
+  await fake.advance(10);
+  // Checked out in a terminal while the pull waits behind the commit: the
+  // status on screen still says main.
+  head = { code: 0, stdout: "refs/heads/other\n", stderr: "" };
+  await fake.advance(5000);
+  assert.deepEqual(envRuns(), []);
+  assert.ok(statuses().includes("pull not run: the checked-out branch is no longer main"), statuses().join(" | "));
+  fake.clear();
+  head = { code: 1, stdout: "", stderr: "" };
+  await fake.command(PULL);
+  await fake.advance(1000);
+  assert.deepEqual(envRuns(), []);
+  assert.deepEqual(statuses(), ["pull not run: the checked-out branch is no longer main"]);
+  // Back on main: it pulls.
+  fake.clear();
+  head = { code: 0, stdout: "refs/heads/main\n", stderr: "" };
+  await fake.command(PULL);
+  await fake.advance(1000);
+  assert.equal(envRuns().length, 1);
+});
+
+test("a trust change while the Publish prompt is open: nothing is pushed, and it says why (R35, R36)", async () => {
+  await loadAcceptance({ status: NO_UPSTREAM });
+  let answer!: (v: string | null) => void;
+  fake.startPromptAnswers.push(new Promise((r) => (answer = r)));
+  await fake.command(PUSH);
+  await fake.advance(100);
+  await fake.emit("trust_changed", { level: "trusted" });
+  await fake.advance(1000);
+  answer("origin");
+  await fake.advance(1000);
+  assert.deepEqual(envRuns(), []);
+  assert.ok(statuses().includes("push: not run; the workspace's authority or trust changed after it was asked for"), statuses().join(" | "));
+});
+
+test("Publish prompts are each window's own: Publish in A, then in B, and Enter back in A publishes A's branch (R35, R28, INV §11.4)", async () => {
+  const noUpstream = (st: string) => st.replace(/# branch\.upstream[^\0]*\0# branch\.ab[^\0]*\0/, "");
+  await loadWindows({ status: noUpstream(ACCEPTANCE), code: 0 }, { status: noUpstream(B_STATUS), code: 0 });
+  await fake.command(PUSH);
+  await fake.advance(100);
+  await fake.switchWindow(2);
+  await fake.advance(500);
+  await fake.command(PUSH);
+  await fake.advance(100);
+  assert.deepEqual(fake.named("startPrompt").map((c) => c.args[0]), ["Publish main to: ", "Publish feature-b to: "]);
+  await fake.switchWindow(1);
+  await fake.advance(500);
+  await fake.emit("prompt_confirmed", { prompt_type: "git-sidebar-publish", input: "origin", selected_index: 0 });
+  await fake.advance(1000);
+  assert.deepEqual(envRuns().map((p) => [p.cwd, p.args.slice(-4)]), [["/repo", ["push", "-u", "origin", "refs/heads/main:refs/heads/main"]]]);
+  assert.equal(statusesIn(1).at(-1), "pushed to origin/main");
+  assert.ok(!statusesIn(1).includes("push cancelled"));
+  // B's prompt is still B's: Esc there cancels it alone.
+  await fake.switchWindow(2);
+  await fake.advance(500);
+  await fake.emit("prompt_cancelled", { prompt_type: "git-sidebar-publish", input: "" });
+  await fake.advance(100);
+  assert.equal(statusesIn(2).at(-1), "push cancelled");
+  assert.equal(envRuns().length, 1);
+});
+
+// ---------------------------------------------------------------------------
+// R37–R39: where the diff opens, its panes and its marks
+// ---------------------------------------------------------------------------
+
+/** A37's layout: `a.ts` (buffer 7) open in the top split (0), then the dock
+ *  (split 6) below it, holding a terminal (buffer 50, which has a path,
+ *  H12), as the active split. Each focus is announced as the host does, so
+ *  the plugin tracks the top split. */
+async function withDock(): Promise<void> {
+  fake.bufferPaths.set(7, "/repo/a.ts");
+  fake.splitById(0)!.buffer = 7;
+  fake.splits.push({ id: 6, x: 0, y: 28, width: 100, height: 11, buffer: 0, group: null });
+  fake.addTerminal(50, 6);
+  await fake.clickSplit(0);
+  await fake.clickSplit(6);
+  fake.clear();
+}
+/** The order of the calls that place a section tab. */
+const placementOrder = () =>
+  fake.calls.map((c) => c.name).filter((n) => ["focusSplit", "focusBufferGroupPanel", "flush", "createBufferGroup", "createVirtualBuffer", "showBuffer"].includes(n));
+
+test("with the dock active, the diff opens in the split last used for a file, not the dock; the keyboard stays in the section (R37, A37, INV §8 P42 k)", async () => {
+  await loadAcceptance();
+  await withDock();
+  await click(5, "c:b.md");
+  await fake.advance(50);
+  // The terminal's split was the active one, but it showed no file.
+  assert.deepEqual(fake.named("focusSplit").map((c) => c.args), [[0]]);
+  // No frame between the focus and the group: it would announce a.ts (H16).
+  assert.deepEqual(placementOrder().filter((n) => n !== "createVirtualBuffer"), ["focusSplit", "createBufferGroup"]);
+  assert.equal(lastGroup().split, 0);
+  assert.equal(fake.splitById(6)!.buffer, 50, "the dock keeps its terminal");
+  assert.equal(fake.splitById(6)!.group, null);
+  assert.deepEqual(fake.named("floatingPanelControl"), [], "the keyboard is not moved");
+  // Replacing, from the dock again: where the replaced diff is, through its panel.
+  await fake.clickSplit(6);
+  fake.clear();
+  await click(1, "s:a.ts");
+  await fake.advance(50);
+  assert.deepEqual(placementOrder().filter((n) => n !== "createVirtualBuffer"), ["focusBufferGroupPanel", "createBufferGroup"]);
+  assert.equal(lastGroup().split, 0);
+  assert.equal(fake.groups.size, 1);
+  assert.equal(fake.splitById(6)!.buffer, 50);
+});
+
+test("no split tracked and no file shown: the top-left split; a tracked split that is gone is passed over unfocused (R37, INV §8 P42 e)", async () => {
+  await loadAcceptance();
+  // The dock is active and nothing else was ever shown: the top-left split.
+  fake.splits.push({ id: 6, x: 0, y: 28, width: 100, height: 11, buffer: 0, group: null });
+  fake.addTerminal(50, 6);
+  await fake.clickSplit(6);
+  await click(5, "c:b.md");
+  await fake.advance(50);
+  assert.deepEqual(fake.named("focusSplit").map((c) => c.args), [[0]]);
+  await fake.fire("gitSidebar_diffClose");
+  await fake.advance(50);
+  // A file in a right-hand split (3) was used last; then that split closed.
+  fake.bufferPaths.set(8, "/repo/b.md");
+  fake.splits.push({ id: 3, x: 50, y: 0, width: 50, height: 26, buffer: 8, group: null });
+  fake.bufferPaths.set(7, "/repo/a.ts");
+  fake.splitById(0)!.buffer = 7;
+  await fake.clickSplit(3);
+  fake.splits = fake.splits.filter((x) => x.id !== 3);
+  await fake.clickSplit(6);
+  fake.clear();
+  await click(5, "c:b.md");
+  await fake.advance(50);
+  // The first pane showing a file; no focus on split 3 (a WARN, P42 e).
+  assert.deepEqual(fake.named("focusSplit").map((c) => c.args), [[0]]);
+  assert.equal(lastGroup().split, 0);
+});
+
+test("the target split's own tab announced while the diff is placed moves neither the selection nor the tracked split (R23, R37, H16, INV §8 P42 d)", async () => {
+  await loadAcceptance();
+  await withDock();
+  // From the palette, with b.md selected and the keyboard outside the section.
+  await fake.widget("select", { index: 5, key: "c:b.md" });
+  let release!: () => void;
+  fake.groupGate = new Promise<void>((r) => (release = r));
+  fake.clear();
+  await fake.command("Git Sidebar: View Diff");
+  await fake.advance(50);
+  assert.equal(groupOpts().length, 1, "being placed");
+  // The host announces a.ts, the target's own tab, during the placement.
+  await fake.emit("active_buffer_changed", { window_id: 1, buffer_id: 7, previous: { window_id: 1, buffer_id: 50 }, reason: "buffer" });
+  release();
+  fake.groupGate = null;
+  await fake.advance(50);
+  assert.deepEqual(selects(), [], "a.ts's row is not selected");
+  // The tracked split stays the top one: a second diff from the dock goes there.
+  await fake.clickSplit(6);
+  fake.splits.push({ id: 9, x: 50, y: 0, width: 50, height: 26, buffer: 0, group: null });
+  await fake.fire("gitSidebar_diffClose");
+  await fake.advance(50);
+  fake.clear();
+  await click(4, "c:a.ts");
+  await fake.advance(50);
+  assert.equal(lastGroup().split, 0);
+});
+
+test("a one-pane and a two-pane diff replace each other in the same split, through a panel the old one shows (R37, R38 One side, INV §8 P42 l)", async () => {
+  await loadAcceptance();
+  fake.files.add("/repo/new/c.txt");
+  fake.contents.set("/repo/new/c.txt", "c\n");
+  await withDock();
+  // keys: g:s s:a.ts s:moved.ts g:c c:a.ts c:b.md c:gone.ts c:new/c.txt c:new/d.txt
+  const steps: [number, string, string | null][] = [
+    [7, "c:new/c.txt", null],
+    [5, "c:b.md", "right"],
+    [6, "c:gone.ts", "left"],
+    [4, "c:a.ts", "left"],
+  ];
+  for (const [index, key, panel] of steps) {
+    await fake.clickSplit(6);
+    const prev = fake.groupsMade.at(-1);
+    fake.clear();
+    await click(index, key);
+    await fake.advance(50);
+    assert.deepEqual(
+      fake.named("focusBufferGroupPanel").map((c) => c.args),
+      panel === null ? [] : [[prev!.id, panel]],
+      key,
+    );
+    assert.equal(fake.groups.size, 1, key);
+  }
+  assert.deepEqual(fake.groupsMade.map((g) => [g.split, Object.keys(g.panels).sort()]), [
+    [0, ["header", "right"]],
+    [0, ["left", "leftHeader", "right", "rightHeader"]],
+    [0, ["header", "left"]],
+    [0, ["left", "leftHeader", "right", "rightHeader"]],
+  ]);
+  assert.equal(fake.splitById(6)!.buffer, 50, "the dock untouched");
+});
+
+test("a deleted file's diff is one plain pane of the staged version; the tab's × and a source closed from outside leave nothing (R38 One side, R39, R14, A14, A38)", async () => {
+  await loadAcceptance();
+  const before = fake.openBuffers();
+  await click(6, "c:gone.ts");
+  await fake.advance(50);
+  const g = lastGroup();
+  assert.deepEqual(groupOpts()[0].layout, JSON.parse(diffLayout(g.panels.left, null)));
+  assert.deepEqual(fake.named("setPanelContent").map((c) => c.args.slice(1)), [["header", [{ text: " Staged" }]]]);
+  assert.deepEqual(decorationCalls(), []);
+  assert.deepEqual(fake.named("setBufferCursor"), []);
+  await fake.closeGroupTab(g);
+  await fake.advance(50);
+  assert.deepEqual(fake.openBuffers(), before);
+  assert.deepEqual(fake.named("closeBuffer").map((c) => c.args), [[g.panels.left, true]]);
+  // Its source closed from outside: the group goes with it, nothing to close twice.
+  await click(6, "c:gone.ts");
+  await fake.advance(50);
+  fake.clear();
+  await fake.closeTab(lastGroup().panels.left);
+  await fake.advance(50);
+  assert.deepEqual(fake.openBuffers(), before);
+  assert.deepEqual(fake.named("closeBuffer"), []);
+});
+
+test("a two-change diff: tints, highlighted parts, - and + gutter marks, a red and a green scrollbar mark per change, an anchor per change (R38, R39, A38, A39)", async () => {
+  await loadAcceptance({ blobs: { ...ACC_BLOBS, ":0:b.md": TWO_CHANGES.staged } });
+  fake.contents.set("/repo/b.md", TWO_CHANGES.disk);
+  await click(5, "c:b.md");
+  await fake.advance(50);
+  const { left, right } = lastGroup().panels;
+  const NS = "git-sidebar-diff";
+  const line = (bg: string) => ({ bg, extendToLineEnd: true });
+  assert.deepEqual(callsOn("addOverlay", left), [
+    [NS, 2, 3, line("editor.diff_remove_bg")],
+    [NS, 10, 11, line("editor.diff_remove_bg")],
+    [NS, 2, 3, { bg: "editor.diff_remove_highlight_bg" }],
+    [NS, 10, 11, { bg: "editor.diff_remove_highlight_bg" }],
+  ]);
+  assert.deepEqual(callsOn("addOverlay", right), [
+    [NS, 2, 3, line("editor.diff_add_bg")],
+    [NS, 10, 11, line("editor.diff_add_bg")],
+    [NS, 2, 3, { bg: "editor.diff_add_highlight_bg" }],
+    [NS, 10, 11, { bg: "editor.diff_add_highlight_bg" }],
+  ]);
+  assert.deepEqual(callsOn("setLineIndicators", left), [[[1, 5], NS, "-", 220, 90, 90, 10]]);
+  assert.deepEqual(callsOn("setLineIndicators", right), [[[1, 5], NS, "+", 80, 200, 120, 10]]);
+  assert.deepEqual(callsOn("setScrollbarMarkers", left), [
+    [
+      NS,
+      [
+        { position: 2, end: 3, color: [220, 90, 90] },
+        { position: 10, end: 11, color: [220, 90, 90] },
+      ],
+    ],
+  ]);
+  assert.deepEqual(callsOn("setScrollbarMarkers", right), [
+    [
+      NS,
+      [
+        { position: 2, end: 3, color: [80, 200, 120] },
+        { position: 10, end: 11, color: [80, 200, 120] },
+      ],
+    ],
+  ]);
+  assert.deepEqual(fake.named("addVirtualLine"), [], "no side has more lines than the other");
+  assert.deepEqual(fake.named("setScrollSyncAnchors").map((c) => c.args), [
+    [
+      1,
+      [
+        [2, 2],
+        [6, 6],
+      ],
+    ],
+  ]);
+});
+
+test("View Commit opens outside the dock, and a later one where the first was, even after its split showed another tab (R33, R37, H15)", async () => {
+  await loadGraph({ shows: { [M.id]: okOut("commit M\n"), [C2.id]: okOut("commit c2\n") } });
+  await withDock();
+  await fake.widget("select", { index: at(hk(M.id)), key: hk(M.id) });
+  await fake.command("Git Sidebar: View Commit");
+  await fake.advance(50);
+  assert.deepEqual(placementOrder(), ["focusSplit", "createVirtualBuffer", "showBuffer"]);
+  assert.deepEqual(fake.named("focusSplit").map((c) => c.args), [[0]]);
+  const first = shownBuffers()[0];
+  // Split 0 shows a.ts again; a right-hand split with b.md was used last; the dock is active.
+  fake.splitById(0)!.buffer = 7;
+  fake.bufferPaths.set(8, "/repo/b.md");
+  fake.splits.push({ id: 3, x: 50, y: 0, width: 50, height: 26, buffer: 8, group: null });
+  await fake.clickSplit(3);
+  await fake.clickSplit(6);
+  fake.clear();
+  await fake.widget("select", { index: at(hk(C2.id)), key: hk(C2.id) });
+  await fake.command("Git Sidebar: View Commit");
+  await fake.advance(50);
+  assert.deepEqual(fake.named("focusSplit").map((c) => c.args), [[0]], "where the replaced tab was");
+  assert.deepEqual(fake.named("closeBuffer").map((c) => c.args), [[first, true]]);
+  assert.equal(fake.splitById(6)!.buffer, 50);
+});
+
+test("a commit's deleted file: one pane, the parent's version (R32, R38 One side, A32)", async () => {
+  const parent = M.parents[0];
+  await loadGraph({ trees: { [M.id]: okOut(recorded("difftree-delete.z")) }, blobs: { ...ACC_BLOBS, [`${parent}:two.txt`]: "two\n" } });
+  await expand(hk(M.id));
+  await fake.advance(50);
+  await click(at(hfk(M.id, "two.txt")), hfk(M.id, "two.txt"));
+  await fake.advance(50);
+  assert.deepEqual(lastPanes(), { left: "two\n", right: null });
+  assert.deepEqual(fake.named("setPanelContent").map((c) => c.args.slice(1)), [["header", [{ text: ` ${parent.slice(0, 7)}` }]]]);
+  assert.deepEqual(decorationCalls(), []);
 });

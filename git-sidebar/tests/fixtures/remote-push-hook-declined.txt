@@ -1,0 +1,7 @@
+rc 1
+--- stdout
+--- stderr
+remote: remote: nope from the hook        
+To ../push.git
+ ! [remote rejected] topic -> topic (pre-receive hook declined)
+error: failed to push some refs to '../push.git'

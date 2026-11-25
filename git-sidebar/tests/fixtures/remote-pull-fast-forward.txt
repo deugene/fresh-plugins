@@ -1,0 +1,12 @@
+rc 0
+--- stdout
+Updating b020a98..76c56db
+Fast-forward
+ theirs1.txt | 1 +
+ 1 file changed, 1 insertion(+)
+ create mode 100644 theirs1.txt
+--- stderr
+From ../pull
+ * branch            main       -> FETCH_HEAD
+ * [new tag]         t1         -> t1
+   b020a98..76c56db  main       -> origin/main

@@ -1,0 +1,5 @@
+rc 0
+--- stdout
+--- stderr
+To ../push.git
+ * [new branch]      main -> other

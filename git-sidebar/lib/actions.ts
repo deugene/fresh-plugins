@@ -1,17 +1,21 @@
 // What a row offers: its button (R5, R15, R16), its right-click menu (R17)
-// and what the palette commands act on (R18), Resolve Conflict (R25)
-// included. The button, Space, the menu
-// and the palette all ask here, so they cannot disagree about a row.
+// and what the palette commands act on (R18), Resolve Conflict (R25), the
+// Graph's commit commands (R33) and Pull and Push (R34, R35) included. The
+// button, Space, the menu and the palette all ask here, so they cannot
+// disagree about a row. A Graph row has no button and no write: `rowAction`
+// reads only the status rows' `EntryMap`, which holds no Graph row.
 
 import { trimSlash } from "./git.ts";
+import { commitKey, commitOf, GRAPH_KEY, graphKind, type GraphRows } from "./graph.ts";
 import { passable } from "./stage.ts";
-import { unpassable, type Entry, type Status } from "./status.ts";
+import { badName, dirReason, nameReason, type Status } from "./status.ts";
 import { CHANGES_KEY, rowKind, STAGED_KEY, type EntryMap } from "./view.ts";
 
 /** U+2212, the minus sign: the same width as `+` in a terminal font. */
 export const MINUS = "−";
 
-export type ActionKind = "stage" | "unstage" | "stageAll" | "unstageAll";
+const ACTION_KINDS = ["stage", "unstage", "stageAll", "unstageAll"] as const;
+export type ActionKind = (typeof ACTION_KINDS)[number];
 
 /** A row's action, or `none` with the message to show for it (null:
  *  nothing to say, as for an empty group or the `… N more` row). */
@@ -26,22 +30,6 @@ const BUTTON_LABEL: Record<ActionKind, "+" | typeof MINUS> = {
   stageAll: "+",
   unstageAll: MINUS,
 };
-
-/** Why a row whose name git can't be passed back is refused (`unpassable`). */
-export function nameReason(path: string): string {
-  return `${path}: the name is not valid UTF-8, so git can't be passed it back`;
-}
-
-/** The name `nameReason` gives for `e`: its path, or its original path when
- *  only that one is not UTF-8 (a rename or copy from such a name). */
-export function badName(e: Entry): string {
-  return e.orig !== undefined && !unpassable(e.path) && unpassable(e.orig) ? e.orig : trimSlash(e.path);
-}
-
-/** Why a directory row (a submodule or nested repository) is refused. */
-export function dirReason(path: string): string {
-  return `${path} is a directory (submodule or nested repository)`;
-}
 
 /** What the section shows when no row action can run: no status rows. */
 export const NO_ROWS = "the Git section shows no files";
@@ -72,9 +60,23 @@ export function buttonLabel(key: string, status: Status | null, entries: EntryMa
   return a.kind === "none" ? null : BUTTON_LABEL[a.kind];
 }
 
+/** View Commit, the copies, Pull and Push (R33–R35): menu choices and
+ *  palette commands both, routed alike (`isGraphCommand`). One list for
+ *  both types and the check, so none can miss one. */
+const GRAPH_COMMANDS = ["viewCommit", "copyId", "copyMessage", "pull", "push"] as const;
+export type GraphCommand = (typeof GRAPH_COMMANDS)[number];
+const GRAPH_COMMAND_SET: ReadonlySet<string> = new Set<GraphCommand>(GRAPH_COMMANDS);
+
+export function isGraphCommand(c: string): c is GraphCommand {
+  return GRAPH_COMMAND_SET.has(c);
+}
+
 /** A menu item: a view, the row's button action, Resolve Conflict on a
- *  conflicted row (R25), or Commit… on Staged Changes (R26). */
-export type MenuChoice = "diff" | "file" | "resolve" | "commit" | ActionKind;
+ *  conflicted row (R25), Commit… on Staged Changes (R26), a commit's View
+ *  Commit and copies (R33), or Pull and Push on the Graph group (R34, R35).
+ *  One list, so the type and `menuChoice`'s set cannot disagree. */
+const MENU_CHOICE_LIST = ["diff", "file", "resolve", "commit", ...GRAPH_COMMANDS, ...ACTION_KINDS] as const;
+export type MenuChoice = (typeof MENU_CHOICE_LIST)[number];
 
 export interface MenuItem {
   choice: MenuChoice;
@@ -95,13 +97,37 @@ export function conflicted(key: string, entries: EntryMap): boolean {
   return listed !== undefined && listed.group === "changes" && listed.entry.marker === "!";
 }
 
+/** The items of a commit's menu (R17, R33). Their labels also name the
+ *  palette commands when no commit is selected. */
+const COMMIT_ITEMS = [
+  { choice: "viewCommit", label: "View Commit" },
+  { choice: "copyId", label: "Copy Commit ID" },
+  { choice: "copyMessage", label: "Copy Commit Message" },
+] as const satisfies readonly MenuItem[];
+/** What View Commit and the copies say without a commit to act on (R18). */
+const COMMIT_NAME = Object.fromEntries(COMMIT_ITEMS.map((i) => [i.choice, i.label])) as Record<(typeof COMMIT_ITEMS)[number]["choice"], string>;
+const REMOTE_ITEMS: MenuItem[] = [
+  { choice: "pull", label: "Pull" },
+  { choice: "push", label: "Push" },
+];
+
 /** The right-click menu of the row `key` (R17): View Diff, View File and
  *  the row's action on a file row, Resolve Conflict on a conflicted one
  *  (R25); the action alone on a group row, and Commit… on Staged Changes
- *  while it lists a file (R26); nothing on any other row or a group with no
- *  action. */
-export function menuItems(key: string, status: Status | null, entries: EntryMap): MenuItem[] {
+ *  while it lists a file (R26); Pull and Push on the Graph group (R34,
+ *  R35); View Commit and the copies on a commit, View Diff and View File on
+ *  a commit's file (R33, R32); nothing on any other row, Load more and a
+ *  cap row included, or a group with no action. */
+export function menuItems(key: string, status: Status | null, entries: EntryMap, graph: GraphRows): MenuItem[] {
   if (status === null) return [];
+  if (key === GRAPH_KEY) return [...REMOTE_ITEMS];
+  const g = graphKind(key);
+  if (g !== null) {
+    if (!graph.has(key)) return [];
+    if (g.kind === "commit") return [...COMMIT_ITEMS];
+    if (g.kind === "commitFile") return [{ choice: "diff", label: "View Diff" }, { choice: "file", label: "View File" }];
+    return [];
+  }
   const action = rowAction(key, status, entries);
   const items: MenuItem[] = [];
   if (entries.has(key)) {
@@ -115,7 +141,7 @@ export function menuItems(key: string, status: Status | null, entries: EntryMap)
   return items;
 }
 
-export type PaletteCommand = "viewDiff" | "viewFile" | "toggle" | "stageAll" | "unstageAll" | "resolve" | "commit";
+export type PaletteCommand = "viewDiff" | "viewFile" | "toggle" | "stageAll" | "unstageAll" | "resolve" | "commit" | GraphCommand;
 
 /** What a palette command acts on (R18): a row key, or the message to
  *  show instead. */
@@ -126,10 +152,24 @@ export const NOTHING_SELECTED = "no row is selected in the Git section";
 export const NOT_SHOWN = "the Git section is not shown";
 export const NOTHING_STAGED = "nothing staged to commit";
 
-export function paletteTarget(cmd: PaletteCommand, selectedKey: string | null, status: Status | null, entries: EntryMap): PaletteTarget {
+export function paletteTarget(
+  cmd: PaletteCommand,
+  selectedKey: string | null,
+  status: Status | null,
+  entries: EntryMap,
+  graph: GraphRows,
+): PaletteTarget {
   if (status === null) return { ok: false, message: NO_ROWS };
   // Commit… acts on Staged Changes whichever row is selected (R18, R26).
   if (cmd === "commit") return status.staged.length > 0 ? { ok: true, key: STAGED_KEY } : { ok: false, message: NOTHING_STAGED };
+  // Pull and Push act on the branch whichever row is selected (R18, R34, R35).
+  if (cmd === "pull" || cmd === "push") return { ok: true, key: GRAPH_KEY };
+  if (cmd === "viewCommit" || cmd === "copyId" || cmd === "copyMessage") {
+    // The selected commit, or a selected commit file's commit (R18, R33).
+    const commit = selectedKey === null ? null : commitOf(selectedKey, graph);
+    if (commit === null) return { ok: false, message: `${COMMIT_NAME[cmd]} needs a commit selected in the Graph` };
+    return { ok: true, key: commitKey(commit.id) };
+  }
   if (cmd === "stageAll" || cmd === "unstageAll") {
     // Whichever row is selected (R18).
     const key = cmd === "stageAll" ? CHANGES_KEY : STAGED_KEY;
@@ -142,7 +182,9 @@ export function paletteTarget(cmd: PaletteCommand, selectedKey: string | null, s
   }
   const isFile = entries.has(selectedKey);
   if (cmd === "viewDiff" || cmd === "viewFile") {
-    if (!isFile) return { ok: false, message: `${cmd === "viewDiff" ? "View Diff" : "View File"} needs a file row selected` };
+    // A commit's file too (R18, R32).
+    const commitFile = graphKind(selectedKey)?.kind === "commitFile" && graph.has(selectedKey);
+    if (!isFile && !commitFile) return { ok: false, message: `${cmd === "viewDiff" ? "View Diff" : "View File"} needs a file row selected` };
     return { ok: true, key: selectedKey };
   }
   if (!isFile) return { ok: false, message: "Stage or Unstage needs a file row selected; use Stage All or Unstage All for a group" };
@@ -153,7 +195,7 @@ export function paletteTarget(cmd: PaletteCommand, selectedKey: string | null, s
 
 /** A menu button's widget key, and the choice it stands for. */
 const MENU_KEY_PREFIX = "menu:";
-const MENU_CHOICES: ReadonlySet<string> = new Set<MenuChoice>(["diff", "file", "resolve", "commit", ...(Object.keys(BUTTON_LABEL) as ActionKind[])]);
+const MENU_CHOICES: ReadonlySet<string> = new Set<MenuChoice>(MENU_CHOICE_LIST);
 
 export function menuChoice(widgetKey: string): MenuChoice | null {
   if (!widgetKey.startsWith(MENU_KEY_PREFIX)) return null;

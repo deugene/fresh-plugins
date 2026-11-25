@@ -1,0 +1,6 @@
+rc 0
+--- stdout
+branch 'topic' set up to track 'origin/topic'.
+--- stderr
+To ../push.git
+ * [new branch]      topic -> topic

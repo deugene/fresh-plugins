@@ -1,0 +1,6 @@
+rc 0
+--- stdout
+Current branch main is up to date.
+--- stderr
+From ../pull
+ * branch            main       -> FETCH_HEAD

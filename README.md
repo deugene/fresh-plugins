@@ -4,7 +4,7 @@ Plugins for the [Fresh](https://github.com/sinelaw/fresh) editor. Each directory
 
 | Plugin | Description | Install from URL |
 |---|---|---|
-| [git-sidebar](git-sidebar/) | Git section in the file-explorer sidebar: the branch, Staged Changes and Changes, kept current, in every Orchestrator window; stage, unstage, commit, side-by-side diff that opens the file at its line | `https://github.com/deugene/fresh-plugins#git-sidebar` |
+| [git-sidebar](git-sidebar/) | Git section in the file-explorer sidebar: the branch, Staged Changes, Changes and a commit graph like VS Code's, kept current, in every Orchestrator window; stage, unstage, commit, pull and push, side-by-side diffs that open the file at its line | `https://github.com/deugene/fresh-plugins#git-sidebar` |
 | [image-viewer](image-viewer/) | An image file opens as the picture in its own tab, drawn in coloured half-block cells: PNG, JPEG, GIF, BMP and WebP, zoom from fit to 800%, keyboard panning, and its bytes on `b`. Uses ffmpeg, ImageMagick or macOS sips | `https://github.com/deugene/fresh-plugins#image-viewer` |
 
 ## Install

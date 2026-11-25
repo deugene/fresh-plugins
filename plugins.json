@@ -3,11 +3,11 @@
   "schema_version": 1,
   "packages": {
     "git-sidebar": {
-      "description": "Git section in the file-explorer sidebar: the branch, Staged Changes and Changes, kept current",
+      "description": "Git section in the file-explorer sidebar: the branch, Staged Changes, Changes and a commit graph, kept current; stage, commit, pull and push",
       "repository": "https://github.com/deugene/fresh-plugins#git-sidebar",
       "license": "MIT",
-      "keywords": ["git", "sidebar", "status", "staged", "changes"],
-      "latest_version": "0.1.0",
+      "keywords": ["git", "sidebar", "status", "staged", "changes", "graph", "push", "pull"],
+      "latest_version": "0.2.0",
       "fresh_min_version": "0.5.9"
     },
     "image-viewer": {
