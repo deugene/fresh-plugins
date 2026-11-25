@@ -1,0 +1,2 @@
+  pixelWidth: 400
+  pixelHeight: 300

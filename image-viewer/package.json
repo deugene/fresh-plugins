@@ -1,0 +1,22 @@
+{
+  "$schema": "https://raw.githubusercontent.com/sinelaw/fresh/main/crates/fresh-editor/plugins/schemas/package.schema.json",
+  "name": "image-viewer",
+  "version": "0.1.0",
+  "description": "Shows an image file in its own tab as coloured half-block cells, with zoom and keyboard panning",
+  "license": "MIT",
+  "type": "plugin",
+  "repository": "https://github.com/deugene/fresh-plugins#image-viewer",
+  "keywords": ["image", "viewer", "png", "jpeg", "preview"],
+  "fresh": {
+    "min_version": "0.5.9",
+    "min_api_version": 2,
+    "entry": "image_viewer.ts"
+  },
+  "scripts": {
+    "check": "tsc -p . && node --test tests/*.test.ts && fresh --check-plugin image_viewer.ts"
+  },
+  "devDependencies": {
+    "@types/node": "~24",
+    "typescript": "~5.9.0"
+  }
+}

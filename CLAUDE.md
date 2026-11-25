@@ -25,7 +25,16 @@ These come from how Fresh installs and loads packages (`docs/investigations/git-
 - `fresh --check-plugin` bundles but does not typecheck. `tsc` is the type check.
 - An unhandled promise rejection kills the plugin runtime. Every event handler and async entry point must catch and log errors.
 
-A new plugin also needs its own README and a row in the root README table (name, description, install URL).
+A new plugin also needs its own README, a row in the root README table (name, description, install URL) and an entry in the root `plugins.json` (see Registry).
+
+## Registry
+
+The repo is also a Fresh package registry: users add its URL to `packages.sources` and install from **Package: Packages**. Fresh clones the source repo (`--depth 1`, under `plugins/packages/.index/`) and reads `plugins.json` from its root, so:
+
+- `plugins.json` stays at the repo root. Every plugin has an entry, keyed by its `package.json` `name`: an installed package matches its entry by that name, and a mismatch lists the plugin twice.
+- An entry mirrors its `package.json` (description, repository, license, keywords, `latest_version` = `version`, `fresh_min_version` = `fresh.min_version`). Each plugin's `tests/manifest.test.ts` enforces that, so it passes only inside this repo.
+- Bump `version` and `latest_version` together when installed users should be offered the change: `↑` shows only when `latest_version` is newer than the installed `version`.
+- Never force-push or rewrite `main`. Fresh updates its clone with `git pull --ff-only` only, and keeps reading the stale clone when that fails.
 
 ## Specs and requirement IDs
 

@@ -59,7 +59,9 @@ A **Git** section in [Fresh](https://github.com/sinelaw/fresh)'s file-explorer s
 
 ## Install
 
-In Fresh, run **Package: Install from URL** and enter:
+With `https://github.com/deugene/fresh-plugins` added to **Settings → Packages → Sources** (see the [root README](../README.md#install)), run **Package: Packages**, select git-sidebar and choose **Install**.
+
+Or run **Package: Install from URL** and enter:
 
 ```
 https://github.com/deugene/fresh-plugins#git-sidebar

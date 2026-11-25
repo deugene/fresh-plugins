@@ -40,3 +40,19 @@ test("exactly one top-level .ts, and its stem is not a built-in plugin name", ()
   assert.ok(!BUILT_IN.includes(stem), stem);
   assert.equal(pkg.fresh.entry, top[0]);
 });
+
+test("the repo's registry lists the package with its manifest's fields (R12)", () => {
+  // Fresh reads plugins.json from the root of its clone of a package source,
+  // and matches an installed package to its entry by the manifest's name.
+  // `↑` shows when latest_version is newer than the installed version.
+  const registry = JSON.parse(readFileSync(new URL("../plugins.json", dir), "utf8"));
+  assert.equal(registry.schema_version, 1);
+  assert.deepEqual(registry.packages[pkg.name], {
+    description: pkg.description,
+    repository: pkg.repository,
+    license: pkg.license,
+    keywords: pkg.keywords,
+    latest_version: pkg.version,
+    fresh_min_version: pkg.fresh.min_version,
+  });
+});

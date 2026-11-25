@@ -1,0 +1,22 @@
+{
+  "$schema": "https://raw.githubusercontent.com/sinelaw/fresh-plugins-registry/main/schemas/registry.schema.json",
+  "schema_version": 1,
+  "packages": {
+    "git-sidebar": {
+      "description": "Git section in the file-explorer sidebar: the branch, Staged Changes and Changes, kept current",
+      "repository": "https://github.com/deugene/fresh-plugins#git-sidebar",
+      "license": "MIT",
+      "keywords": ["git", "sidebar", "status", "staged", "changes"],
+      "latest_version": "0.1.0",
+      "fresh_min_version": "0.5.9"
+    },
+    "image-viewer": {
+      "description": "Shows an image file in its own tab as coloured half-block cells, with zoom and keyboard panning",
+      "repository": "https://github.com/deugene/fresh-plugins#image-viewer",
+      "license": "MIT",
+      "keywords": ["image", "viewer", "png", "jpeg", "preview"],
+      "latest_version": "0.1.0",
+      "fresh_min_version": "0.5.9"
+    }
+  }
+}

@@ -1,0 +1,22 @@
+Input #0, gif, from 'WORK/truncated.gif':
+  Duration: N/A, start: 0.000000, bitrate: N/A
+  Stream #0:0: Video: gif, bgra, 400x300, 100 tbr, 100 tbn
+Stream mapping:
+  Stream #0:0 -> #0:0 (gif (native) -> wrapped_avframe (native))
+[vist#0:0/gif @ 0x0] [dec:gif @ 0x0] Error submitting packet to decoder: Invalid data found when processing input
+[vist#0:0/gif @ 0x0] [dec:gif @ 0x0] Decode error rate 1 exceeds maximum 0.666667
+[vist#0:0/gif @ 0x0] [dec:gif @ 0x0] Task finished with error: Error number -1145393733 occurred
+[vist#0:0/gif @ 0x0] [dec:gif @ 0x0] Terminating thread with error: Error number -1145393733 occurred
+[Parsed_showinfo_0 @ 0x0] config in time_base: 1/100, frame_rate: 100/1
+[Parsed_showinfo_0 @ 0x0] config out time_base: 0/0, frame_rate: 0/0
+[vf#0:0 @ 0x0] No filtered frames for output stream, trying to initialize anyway.
+Output #0, null, to 'pipe:':
+  Metadata:
+    encoder         : Lavf63.16.100
+  Stream #0:0: Video: wrapped_avframe, bgra(progressive), 400x300, q=2-31, 200 kb/s, 100 fps, 100 tbn
+    Metadata:
+      encoder         : Lavc63.24.100 wrapped_avframe
+[out#0/null @ 0x0] video:0KiB audio:0KiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: unknown
+[out#0/null @ 0x0] Output file is empty, nothing was encoded(check -ss / -t / -frames parameters if used)
+frame=    0 fps=0.0 q=0.0 Lsize=N/A time=N/A bitrate=N/A speed=0 elapsed=0:00:00.00    
+Conversion failed!

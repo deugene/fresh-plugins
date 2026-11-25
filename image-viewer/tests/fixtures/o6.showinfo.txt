@@ -1,0 +1,20 @@
+Input #0, image2, from 'IMG/o6.jpg':
+  Duration: 00:00:00.04, start: 0.000000, bitrate: 596 kb/s
+  Stream #0:0: Video: mjpeg (Baseline), yuvj444p(pc, bt470bg/unknown/unknown), 400x300, 25 fps, 25 tbr, 25 tbn
+Stream mapping:
+  Stream #0:0 -> #0:0 (mjpeg (native) -> wrapped_avframe (native))
+[Parsed_showinfo_0 @ 0x0] config in time_base: 1/25, frame_rate: 25/1
+[Parsed_showinfo_0 @ 0x0] config out time_base: 0/0, frame_rate: 0/0
+[Parsed_showinfo_0 @ 0x0] n:   0 pts:      0 pts_time:0       duration:      1 duration_time:0.04    fmt:yuvj444p cl:center sar:0/1 s:300x400 i:P iskey:1 type:I checksum:2FFB13EE plane_checksum:[418223E0 711F726A 1B7F7D95] mean:[52 170 181] stdev:[23.5 85.5 74.0]
+[Parsed_showinfo_0 @ 0x0]   side data - EXIF metadata: (14 bytes)
+[Parsed_showinfo_0 @ 0x0] color_range:pc color_space:bt470bg color_primaries:unknown color_trc:unknown
+Output #0, null, to 'pipe:':
+  Metadata:
+    encoder         : Lavf63.16.100
+  Stream #0:0: Video: wrapped_avframe, yuvj444p(pc, bt470bg/unknown/unknown, progressive), 300x400, q=2-31, 200 kb/s, 25 fps, 25 tbn
+    Metadata:
+      encoder         : Lavc63.24.100 wrapped_avframe
+    Side data:
+      EXIF metadata: (14 bytes)
+[out#0/null @ 0x0] video:0KiB audio:0KiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: unknown
+frame=    1 fps=0.0 q=-0.0 Lsize=N/A time=00:00:00.04 bitrate=N/A speed=0 elapsed=0:00:00.00    

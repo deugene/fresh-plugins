@@ -156,9 +156,10 @@ So users run `git status` in a terminal, or open Review Diff and close it again.
 The plugin shall:
 - have its own README;
 - install through **Package: Install from URL**, both from `<repo-url>#<plugin-dir>` and from a local path;
+- be listed in the root `plugins.json`, keyed by its manifest name, so it also installs from **Package: Packages** once `https://github.com/deugene/fresh-plugins` is a package source;
 - ship with a single command that runs type checking, unit tests, manifest validation and a plugin bundle check, all of which pass.
 
-The repository shall be initialised as a local git repository with no remote.
+The repository shall be a git repository published at `https://github.com/deugene/fresh-plugins`, whose `main` is never rewritten (Fresh updates its registry clone with `git pull --ff-only` only).
 
 **R13.** WHILE the window is attached to a dev container whose workspace is bind-mounted from the host, the section shall show the same title, groups and rows as for the same workspace opened locally, and R14–R18 shall behave as they do locally. It shall meet R8 and R9 for changes made inside the container, both git commands and edits. It shall do so whether or not the image has git. WHEN the window attaches or detaches, the section shall keep its position, collapsed state and height, and shall show current status within 5 s. WHERE the container's workspace is a container volume rather than a host bind mount, the section shall never show the host folder's git status. IF Fresh cannot open files that exist only in the volume, THEN the section shall show a single notice row saying the sources are in a container volume.
 
@@ -329,7 +330,7 @@ Failure cases:
 - SSH remote workspaces (best effort, unverified).
 - A host without git while attached to a dev container.
 - User settings, and palette commands other than R18's.
-- Creating the GitHub repository, publishing to the plugin registry, and CI.
+- Publishing to the official plugin registry, and CI.
 
 ## Constraints
 
@@ -451,7 +452,8 @@ Open Fresh on it with the plugin installed.
 **A12.** (R12)
 - The one check command exits 0.
 - Install from the local path with `#<plugin-dir>`: after a restart, the section appears.
-- `git status` in the repository shows it initialised, and `git remote` prints nothing.
+- With the repository as a package source, Package: Packages lists git-sidebar once. Install from there: after a restart, the section appears.
+- `git status` in the repository shows it initialised, and `git remote -v` names `deugene/fresh-plugins`.
 - The root README lists the plugin with its install URL.
 
 **A13.** (R13) The fixture is created under `$HOME` (colima shares only `$HOME`). Its `.devcontainer/devcontainer.json` uses image `mcr.microsoft.com/devcontainers/base:debian` with `postCreateCommand: git config --global --add safe.directory '*'`. Run `devcontainer up`, then "Dev Container: Attach" in Fresh.

@@ -1,0 +1,6 @@
+#!/bin/sh
+# Stands in for ffmpeg in A14: appends its PID to $IV_FAKE_PIDS (default
+# /tmp/iv-fake-ffmpeg.pids), then becomes `sleep 30` in the same process,
+# so the PID names the very process the plugin must kill (A14).
+echo $$ >> "${IV_FAKE_PIDS:-/tmp/iv-fake-ffmpeg.pids}"
+exec sleep 30

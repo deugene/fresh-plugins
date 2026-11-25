@@ -1,0 +1,4 @@
+[in#0 @ 0x0] Format not on whitelist 'png_pipe,apng,image2'
+[in#0 @ 0x0] Error opening input: Invalid argument
+Error opening input file IMG/ppm.png.
+Error opening input files: Invalid argument

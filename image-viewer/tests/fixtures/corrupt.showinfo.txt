@@ -1,0 +1,22 @@
+[png @ 0x0] Invalid PNG signature 0x7468697320697320.
+[in#0/image2 @ 0x0] Could not find codec parameters for stream 0 (Video: png, none): unspecified size
+Consider increasing the value for the 'analyzeduration' (0) and 'probesize' (5000000) options
+Input #0, image2, from 'IMG/corrupt.png':
+  Duration: 00:00:00.04, start: 0.000000, bitrate: 3 kb/s
+  Stream #0:0: Video: png, none, 25 fps, 25 tbr, 25 tbn
+Stream mapping:
+  Stream #0:0 -> #0:0 (png (native) -> wrapped_avframe (native))
+[png @ 0x0] Invalid PNG signature 0x7468697320697320.
+[vist#0:0/png @ 0x0] [dec:png @ 0x0] Decoding error: Invalid data found when processing input
+[vist#0:0/png @ 0x0] [dec:png @ 0x0] Decode error rate 1 exceeds maximum 0.666667
+[vf#0:0 @ 0x0] Cannot determine format of input 0:0 after EOF
+[vf#0:0 @ 0x0] Task finished with error: Invalid data found when processing input
+[vf#0:0 @ 0x0] Terminating thread with error: Invalid data found when processing input
+[vost#0:0/wrapped_avframe @ 0x0] [enc:wrapped_avframe @ 0x0] Could not open encoder before EOF
+[vost#0:0/wrapped_avframe @ 0x0] Task finished with error: Invalid argument
+[vost#0:0/wrapped_avframe @ 0x0] Terminating thread with error: Invalid argument
+[vist#0:0/png @ 0x0] [dec:png @ 0x0] Task finished with error: Error number -1145393733 occurred
+[vist#0:0/png @ 0x0] [dec:png @ 0x0] Terminating thread with error: Error number -1145393733 occurred
+[out#0/null @ 0x0] Nothing was written into output file, because at least one of its streams received no packets.
+frame=    0 fps=0.0 q=0.0 Lsize=       0KiB time=N/A bitrate=N/A speed=0 elapsed=0:00:00.00    
+Conversion failed!

@@ -1,0 +1,17 @@
+Input #0, png_pipe, from 'IMG/quadrants.png':
+  Duration: N/A, bitrate: N/A
+  Stream #0:0: Video: png, rgb24(pc, gbr/unknown/unknown), 400x300, 25 fps, 25 tbr, 25 tbn
+Stream mapping:
+  Stream #0:0 -> #0:0 (png (native) -> wrapped_avframe (native))
+[Parsed_showinfo_0 @ 0x0] config in time_base: 1/25, frame_rate: 25/1
+[Parsed_showinfo_0 @ 0x0] config out time_base: 0/0, frame_rate: 0/0
+[Parsed_showinfo_0 @ 0x0] n:   0 pts:      0 pts_time:0       duration:      1 duration_time:0.04    fmt:rgb24 cl:unspecified sar:0/1 s:400x300 i:P iskey:1 type:I checksum:9DB183EA plane_checksum:[9DB183EA] mean:[127] stdev:[127.5]
+[Parsed_showinfo_0 @ 0x0] color_range:pc color_space:gbr color_primaries:unknown color_trc:unknown
+Output #0, null, to 'pipe:':
+  Metadata:
+    encoder         : Lavf63.16.100
+  Stream #0:0: Video: wrapped_avframe, rgb24(pc, gbr/unknown/unknown, progressive), 400x300, q=2-31, 200 kb/s, 25 fps, 25 tbn
+    Metadata:
+      encoder         : Lavc63.24.100 wrapped_avframe
+[out#0/null @ 0x0] video:0KiB audio:0KiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: unknown
+frame=    1 fps=0.0 q=-0.0 Lsize=N/A time=00:00:00.04 bitrate=N/A speed=0 elapsed=0:00:00.00    

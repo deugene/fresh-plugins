@@ -1,0 +1,12 @@
+[mjpeg @ 0x0] Codec (mjpeg) not on whitelist 'png,apng'
+[in#0/image2 @ 0x0] Failed to open codec in avformat_find_stream_info
+[mjpeg @ 0x0] Codec (mjpeg) not on whitelist 'png,apng'
+[in#0/image2 @ 0x0] Could not find codec parameters for stream 0 (Video: mjpeg, none): unspecified size
+Consider increasing the value for the 'analyzeduration' (0) and 'probesize' (5000000) options
+Input #0, image2, from 'IMG/mis.png':
+  Duration: 00:00:00.04, start: 0.000000, bitrate: 690 kb/s
+  Stream #0:0: Video: mjpeg, none, 25 fps, 25 tbr, 25 tbn
+[mjpeg @ 0x0] Codec (mjpeg) not on whitelist 'png,apng'
+[vist#0:0/mjpeg @ 0x0] [dec:mjpeg @ 0x0] Error while opening decoder: Invalid argument
+Error opening output file -.
+Error opening output files: Invalid argument
